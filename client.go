@@ -90,7 +90,7 @@ func connectAndForward(localPort, serverAddr, clientPort, proxyURL string, useTL
 		readTimeout       = 60 * time.Second
 		writeTimeout      = 10 * time.Second
 		connReadLimit     = 1024 * 1024
-		bufferSize        = 4096
+		bufferSize        = 1024 * 1024
 	)
 
 	scheme := "ws"
@@ -120,7 +120,7 @@ func connectAndForward(localPort, serverAddr, clientPort, proxyURL string, useTL
 		if err != nil {
 			log.Printf("Failed to connect to local application on port %s: %v", localPort, err)
 			conn.Close()
-			return
+			continue
 		}
 
 		done := make(chan struct{})
