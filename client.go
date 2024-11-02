@@ -341,7 +341,7 @@ func main() {
 		go serveFolderLocally(*folderPath, *localPort)
 	}
 
-	serverURL := fmt.Sprintf("https://%s:%s/register_client", *serverAddr, rp)
+	serverURL := fmt.Sprintf("https://%s:%d/register_client", *serverAddr, rp)
 	proxyURL, clientPort := registerClient(serverURL, *useTLS)
 
 	if proxyURL != "" && clientPort != "" && *useProxy == false {
