@@ -13,18 +13,19 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 var (
-	rp    int
-	debug bool
+	rp       int
+	debug    bool
+	clientID string
 )
 
 type RegisterResponse struct {
+	UDID            string `json:"udid"`
 	ProxyURLTLS     string `json:"proxy_url_tls"`
 	ProxyURLNoTLS   string `json:"proxy_url_notls"`
 	ClientPortTLS   string `json:"client_port_tls"`
@@ -63,7 +64,7 @@ func serveFolderLocally(folderPath string, localPort string) {
 			http.NotFound(w, r)
 			return
 		}
-		if fileInfo.Size() > 100*1024*1024*1024 { // Limit: 100 GB
+		if fileInfo.Size() > 100*1024*1024*1024 { // Fifile size lmit: 100 GB
 			http.Error(w, "File is too large", http.StatusForbidden)
 			return
 		}
@@ -73,6 +74,9 @@ func serveFolderLocally(folderPath string, localPort string) {
 			w.Header().Set("Cache-Control", "public, max-age=86400")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("X-Frame-Options", "DENY")
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
 			w.Header().Set("X-XSS-Protection", "1; mode=block")
 		}
 		fileServer.ServeHTTP(w, r)
@@ -87,10 +91,7 @@ func serveFolderLocally(folderPath string, localPort string) {
 func connectAndForward(localPort, serverAddr, clientPort, proxyURL string, useTLS bool) {
 	const (
 		reconnectInterval = 1 * time.Second
-		readTimeout       = 60 * time.Second
-		writeTimeout      = 10 * time.Second
 		connReadLimit     = 1024 * 1024
-		bufferSize        = 1024 * 1024
 	)
 
 	scheme := "ws"
@@ -116,71 +117,83 @@ func connectAndForward(localPort, serverAddr, clientPort, proxyURL string, useTL
 		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		conn.SetWriteDeadline(time.Now().Add(120 * time.Second))
 
-		localConn, err := net.Dial("tcp", localPort)
-		if err != nil {
-			log.Printf("Failed to connect to local application on port %s: %v", localPort, err)
-			conn.Close()
-			continue
-		}
-
-		done := make(chan struct{})
-		closeOnce := sync.Once{}
-
-		closeDone := func() {
-			closeOnce.Do(func() {
-				close(done)
-				conn.Close()
-				localConn.Close()
-			})
-		}
+		log.Printf("Control connection established")
 
 		go func() {
-			defer closeDone()
 			for {
-				conn.SetReadDeadline(time.Now().Add(readTimeout))
 				_, msg, err := conn.ReadMessage()
 				if err != nil {
 					if debug {
-						log.Printf("Error reading from WebSocket: %v", err)
+						log.Printf("Error reading from control WebSocket: %v", err)
 					}
 					return
 				}
-				_, err = localConn.Write(msg)
-				if err != nil {
-					log.Printf("Error writing to local connection: %v", err)
-					return
+
+				var controlMsg map[string]string
+				if err := json.Unmarshal(msg, &controlMsg); err != nil {
+					log.Printf("Invalid control message: %v", err)
+					continue
+				}
+
+				if controlMsg["type"] == "new_connection" {
+					connectionID := controlMsg["connectionID"]
+					useTLSStr := controlMsg["useTLS"]
+					useTLSConn := useTLSStr == "true"
+					go establishNewWebSocketConnection(localPort, serverAddr, clientPort, connectionID, useTLSConn)
 				}
 			}
 		}()
 
-		go func() {
-			defer closeDone()
-			buffer := make([]byte, bufferSize)
-			for {
-				localConn.SetReadDeadline(time.Now().Add(readTimeout))
-				n, err := localConn.Read(buffer)
-				if err != nil {
-					if debug {
-						log.Printf("Error reading from local application: %v", err)
-					}
-					return
-				}
-				conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-				err = conn.WriteMessage(websocket.BinaryMessage, buffer[:n])
-				if err != nil {
-					if debug {
-						log.Printf("Error writing to WebSocket: %v", err)
-					}
-					return
-				}
-			}
-		}()
-
-		<-done
-		if debug {
-			log.Printf("Disconnected. Reconnecting...")
-		}
+		select {}
 	}
+}
+
+func establishNewWebSocketConnection(localPort, serverAddr, clientPort, connectionID string, useTLS bool) {
+	scheme := "ws"
+	if useTLS {
+		scheme = "wss"
+	}
+
+	wsURL := url.URL{
+		Scheme: scheme,
+		Host:   fmt.Sprintf("%s:%s", serverAddr, clientPort),
+		Path:   "/client_ws",
+		RawQuery: url.Values{
+			"connectionID": {connectionID},
+			"clientID":     {clientID},
+		}.Encode(),
+	}
+
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL.String(), nil)
+	if err != nil {
+		log.Printf("Failed to establish new WebSocket connection: %v", err)
+		return
+	}
+
+	localConn, err := net.Dial("tcp", localPort)
+	if err != nil {
+		log.Printf("Failed to connect to local application: %v", err)
+		wsConn.Close()
+		return
+	}
+
+	log.Printf("New WebSocket connection established for connectionID %s", connectionID)
+
+	go func() {
+		defer wsConn.Close()
+		defer localConn.Close()
+
+		done := make(chan struct{})
+		go func() {
+			io.Copy(localConn, wsConn.UnderlyingConn())
+			done <- struct{}{}
+		}()
+		go func() {
+			io.Copy(wsConn.UnderlyingConn(), localConn)
+			done <- struct{}{}
+		}()
+		<-done
+	}()
 }
 
 func registerClient(serverURL string, useTLS bool) (string, string) {
@@ -219,6 +232,8 @@ func registerClient(serverURL string, useTLS bool) (string, string) {
 			continue
 		}
 
+		clientID = res.UDID
+
 		proxyURL := res.ProxyURLTLS
 		clientPort := res.ClientPortTLS
 		if !useTLS {
@@ -240,8 +255,8 @@ func registerClient(serverURL string, useTLS bool) (string, string) {
 	return "", ""
 }
 
-func startLocalProxy(port int) {
-	localAddr := fmt.Sprintf("127.0.0.1:%d", port)
+func startLocalProxy(port int, host string) {
+	localAddr := fmt.Sprintf("%s:%d", host, port)
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -258,9 +273,14 @@ func startLocalProxy(port int) {
 			log.Printf("Proxying request: %s %s", r.Method, r.URL.String())
 		}
 
-		r.RequestURI = ""
-		r.URL.Host = r.Host
+		if r.URL.Host == "" {
+			r.URL.Host = r.Host
+		}
 		r.URL.Scheme = "http"
+		r.Host = r.URL.Host
+
+		r.RequestURI = ""
+
 		r.Header.Del("Connection")
 		r.Header.Del("Proxy-Connection")
 		r.Header.Del("Transfer-Encoding")
@@ -287,11 +307,9 @@ func startLocalProxy(port int) {
 		}
 		w.WriteHeader(resp.StatusCode)
 
-		limitedReader := io.LimitedReader{R: resp.Body, N: 10 * 1024 * 1024}
-		if _, err := io.Copy(w, &limitedReader); err != nil {
-			if debug {
-				log.Printf("Error copying response body: %v", err)
-			}
+		_, copyErr := io.Copy(w, resp.Body)
+		if copyErr != nil && debug {
+			log.Printf("Error copying response body: %v", copyErr)
 		}
 	})
 
@@ -345,7 +363,7 @@ func main() {
 	proxyURL, clientPort := registerClient(serverURL, *useTLS)
 
 	if proxyURL != "" && clientPort != "" && *useProxy == false {
-		connectAndForward(*localPort, *serverAddr, clientPort, proxyURL, *useTLS)
+		go connectAndForward(*localPort, *serverAddr, clientPort, proxyURL, *useTLS)
 		log.Printf("Proxy URL: %s", proxyURL)
 	}
 
@@ -354,12 +372,12 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to find a free port: %v", err)
 		}
+		go startLocalProxy(port, *localPort)
 		*localPort = fmt.Sprintf("127.0.0.1:%d", port)
-
-		go startLocalProxy(port)
-		connectAndForward(*localPort, *serverAddr, clientPort, proxyURL, *useTLS)
+		go connectAndForward(*localPort, *serverAddr, clientPort, proxyURL, *useTLS)
 		select {}
 	}
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 	<-stop

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -31,6 +32,8 @@ type clientInfo struct {
 	clientListenerNoTLS *http.Server
 	cancelFunc          context.CancelFunc
 	lastActivity        time.Time
+	connMutex           sync.Mutex
+	wsConnChan          chan *websocket.Conn
 }
 
 var (
@@ -125,7 +128,9 @@ func closeClientConnections(clientID string, client *clientInfo) {
 	client.cancelFunc()
 
 	releasePorts(client.portTLS, client.portNoTLS, client.clientPortTLS, client.clientPortNoTLS)
+	clientsMutex.Lock()
 	delete(clients, clientID)
+	clientsMutex.Unlock()
 	if debug {
 		log.Printf("Resources released for client %s on ports TLS: %d, non-TLS: %d", clientID, client.portTLS, client.portNoTLS)
 	}
@@ -174,6 +179,7 @@ func registerClientHandler(w http.ResponseWriter, r *http.Request) {
 		clientPortNoTLS: clientPortNoTLS,
 		cancelFunc:      cancel,
 		lastActivity:    time.Now(),
+		wsConnChan:      make(chan *websocket.Conn),
 	}
 
 	clientID := udid
@@ -231,7 +237,7 @@ func waitForProxyConnectionTLS(ctx context.Context, client *clientInfo, proxyPor
 	defer listener.Close()
 
 	log.Printf("Secure proxy server listening on port %d (TLS)", proxyPort)
-	acceptConnections(ctx, listener, client, handleTLSProxyConnection)
+	acceptConnections(ctx, listener, client, handleNewProxyConnectionTLS)
 }
 
 func waitForProxyConnectionNoTLS(ctx context.Context, client *clientInfo, proxyPort int) {
@@ -244,10 +250,10 @@ func waitForProxyConnectionNoTLS(ctx context.Context, client *clientInfo, proxyP
 	defer listener.Close()
 
 	log.Printf("Proxy server listening on port %d (non-TLS)", proxyPort)
-	acceptConnections(ctx, listener, client, handleNonTLSProxyConnection)
+	acceptConnections(ctx, listener, client, handleNewProxyConnectionNoTLS)
 }
 
-func acceptConnections(ctx context.Context, listener net.Listener, client *clientInfo, handleFunc func(net.Conn, *websocket.Conn)) {
+func acceptConnections(ctx context.Context, listener net.Listener, client *clientInfo, handleFunc func(net.Conn, *clientInfo)) {
 	var wg sync.WaitGroup
 
 	for {
@@ -278,132 +284,127 @@ func acceptConnections(ctx context.Context, listener net.Listener, client *clien
 				}
 			}
 
-			clientsMutex.Lock()
-			wsConn := client.conn
-			clientsMutex.Unlock()
-
-			if wsConn != nil {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					handleFunc(proxyConn, wsConn)
-				}()
-			} else {
-				proxyConn.Close()
-			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				handleFunc(proxyConn, client)
+			}()
 		}
 	}
 }
 
-func handleTLSProxyConnection(proxyConn net.Conn, wsConn *websocket.Conn) {
+func handleNewProxyConnectionTLS(proxyConn net.Conn, client *clientInfo) {
+	connectionID := uuid.New().String()
 	defer proxyConn.Close()
-	defer wsConn.Close()
 
-	done := make(chan struct{})
-	closeOnce := sync.Once{}
-
-	closeDone := func() {
-		closeOnce.Do(func() { close(done) })
+	message := map[string]string{
+		"type":         "new_connection",
+		"connectionID": connectionID,
+		"useTLS":       "true",
+	}
+	client.connMutex.Lock()
+	err := client.conn.WriteJSON(message)
+	client.connMutex.Unlock()
+	if err != nil {
+		log.Printf("Failed to send new_connection message: %v", err)
+		return
 	}
 
-	go func() {
-		defer closeDone()
-		for {
-			_, msg, err := wsConn.ReadMessage()
-			if err != nil {
-				if debug {
-					log.Printf("Error reading from WebSocket (TLS): %v", err)
-				}
-				return
-			}
-			if _, err := proxyConn.Write(msg); err != nil {
-				if debug {
-					log.Printf("Error writing to proxy connection (TLS): %v", err)
-				}
-				return
-			}
-		}
-	}()
-
-	go func() {
-		defer closeDone()
-		buffer := make([]byte, 4096)
-		for {
-			n, err := proxyConn.Read(buffer)
-			if err != nil {
-				if debug {
-					log.Printf("Error reading from proxy (TLS): %v", err)
-				}
-				return
-			}
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buffer[:n]); err != nil {
-				if debug {
-					log.Printf("Error writing to WebSocket (TLS): %v", err)
-				}
-				return
-			}
-		}
-	}()
-
-	<-done
-	if debug {
-		log.Printf("Data forwarding complete for TLS port %s", proxyConn.LocalAddr())
+	select {
+	case wsConn := <-client.wsConnChan:
+		handleProxyWebSocketConnection(proxyConn, wsConn)
+	case <-time.After(30 * time.Second):
+		log.Printf("Timeout waiting for client WebSocket connection")
 	}
 }
 
-func handleNonTLSProxyConnection(proxyConn net.Conn, wsConn *websocket.Conn) {
+func handleNewProxyConnectionNoTLS(proxyConn net.Conn, client *clientInfo) {
+	connectionID := uuid.New().String()
 	defer proxyConn.Close()
-	defer wsConn.Close()
 
-	done := make(chan struct{})
-	closeOnce := sync.Once{}
-
-	closeDone := func() {
-		closeOnce.Do(func() { close(done) })
+	message := map[string]string{
+		"type":         "new_connection",
+		"connectionID": connectionID,
+		"useTLS":       "false",
+	}
+	client.connMutex.Lock()
+	err := client.conn.WriteJSON(message)
+	client.connMutex.Unlock()
+	if err != nil {
+		log.Printf("Failed to send new_connection message: %v", err)
+		return
 	}
 
+	select {
+	case wsConn := <-client.wsConnChan:
+		handleProxyWebSocketConnection(proxyConn, wsConn)
+	case <-time.After(30 * time.Second):
+		log.Printf("Timeout waiting for client WebSocket connection")
+	}
+}
+
+func handleProxyWebSocketConnection(proxyConn net.Conn, wsConn *websocket.Conn) {
+	defer wsConn.Close()
+	defer proxyConn.Close()
+
+	done := make(chan struct{})
+
 	go func() {
-		defer closeDone()
-		for {
-			_, msg, err := wsConn.ReadMessage()
-			if err != nil {
-				if debug {
-					log.Printf("Error reading from WebSocket (non-TLS): %v", err)
-				}
-				return
-			}
-			if _, err := proxyConn.Write(msg); err != nil {
-				if debug {
-					log.Printf("Error writing to proxy connection (non-TLS): %v", err)
-				}
-				return
-			}
-		}
+		defer func() {
+			done <- struct{}{}
+		}()
+		io.Copy(proxyConn, wsConn.UnderlyingConn())
 	}()
 
 	go func() {
-		defer closeDone()
-		buffer := make([]byte, 4096)
-		for {
-			n, err := proxyConn.Read(buffer)
-			if err != nil {
-				if debug {
-					log.Printf("Error reading from proxy (non-TLS): %v", err)
-				}
-				return
-			}
-			if err := wsConn.WriteMessage(websocket.BinaryMessage, buffer[:n]); err != nil {
-				if debug {
-					log.Printf("Error writing to WebSocket (non-TLS): %v", err)
-				}
-				return
-			}
-		}
+		defer func() {
+			done <- struct{}{}
+		}()
+		io.Copy(wsConn.UnderlyingConn(), proxyConn)
 	}()
 
 	<-done
 	if debug {
-		log.Printf("Data forwarding complete for non-TLS port %s", proxyConn.LocalAddr())
+		log.Printf("Data forwarding complete for connection %s", proxyConn.LocalAddr())
+	}
+}
+
+func clientWebSocketHandler(w http.ResponseWriter, r *http.Request) {
+	if debug {
+		log.Printf("Received request on /client_ws endpoint: %v", r)
+	}
+
+	connectionID := r.URL.Query().Get("connectionID")
+	clientID := r.URL.Query().Get("clientID")
+	if connectionID == "" || clientID == "" {
+		log.Printf("Missing connectionID or clientID")
+		http.Error(w, "Missing connectionID or clientID", http.StatusBadRequest)
+		return
+	}
+
+	wsConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade to WebSocket: %v", err)
+		return
+	}
+
+	clientsMutex.Lock()
+	client, exists := clients[clientID]
+	clientsMutex.Unlock()
+	if !exists {
+		log.Printf("Client not found: %s", clientID)
+		wsConn.Close()
+		return
+	}
+
+	select {
+	case client.wsConnChan <- wsConn:
+		if debug {
+			log.Printf("Accepted new WebSocket connection for client %s, connectionID %s", clientID, connectionID)
+		}
+	default:
+		log.Printf("No proxy connection waiting for client %s, connectionID %s", clientID, connectionID)
+		wsConn.Close()
 	}
 }
 
@@ -448,7 +449,7 @@ func waitForClientConnection(ctx context.Context, clientPort int, useTLS bool, u
 		}
 		clientsMutex.Unlock()
 		if debug {
-			log.Printf("WebSocket client connected on port %d", clientPort)
+			log.Printf("Control WebSocket client connected on port %d", clientPort)
 		}
 
 		go func() {
@@ -466,11 +467,25 @@ func waitForClientConnection(ctx context.Context, clientPort int, useTLS bool, u
 						return
 					}
 				case <-ctx.Done():
+					wsConn.Close()
 					return
 				}
 			}
 		}()
+
+		for {
+			_, _, err := wsConn.ReadMessage()
+			if err != nil {
+				if debug {
+					log.Printf("Control WebSocket connection closed: %v", err)
+				}
+				wsConn.Close()
+				return
+			}
+		}
 	})
+
+	mux.HandleFunc("/client_ws", clientWebSocketHandler)
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", clientPort),
@@ -488,7 +503,7 @@ func waitForClientConnection(ctx context.Context, clientPort int, useTLS bool, u
 			}
 			server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 			log.Printf("Secure WebSocket server listening on port %d", clientPort)
-			if err := server.ListenAndServeTLS(certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("Failed to start TLS client server on port %d: %v", clientPort, err)
 			}
 		} else {
@@ -500,7 +515,7 @@ func waitForClientConnection(ctx context.Context, clientPort int, useTLS bool, u
 	}()
 
 	<-ctx.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Error shutting down client server on port %d: %v", clientPort, err)
@@ -527,6 +542,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/register_client", registerClientHandler)
+	mux.HandleFunc("/client_ws", clientWebSocketHandler)
 
 	tlsServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", rp),
@@ -538,7 +554,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("listening on port %d...", rp)
+		log.Printf("Listening on port %d...", rp)
 		if err := tlsServer.ListenAndServeTLS("", ""); err != nil {
 			log.Fatalf("Failed to start TLS server: %v", err)
 		}
