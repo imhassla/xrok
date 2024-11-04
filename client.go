@@ -120,11 +120,14 @@ func connectAndForward(localPort, serverAddr, clientPort, proxyURL string, useTL
 		log.Printf("Control connection established")
 
 		go func() {
+			defer conn.Close()
 			for {
 				_, msg, err := conn.ReadMessage()
 				if err != nil {
-					if debug {
-						log.Printf("Error reading from control WebSocket: %v", err)
+					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+						log.Printf("WebSocket connection closed normally: %v", err)
+					} else {
+						log.Printf("Error reading from WebSocket: %v", err)
 					}
 					return
 				}
