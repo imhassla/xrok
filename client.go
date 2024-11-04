@@ -117,7 +117,9 @@ func connectAndForward(localPort, serverAddr, clientPort, proxyURL string, useTL
 		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
 		conn.SetWriteDeadline(time.Now().Add(120 * time.Second))
 
-		log.Printf("Control connection established")
+		if debug {
+			log.Printf("Control connection established")
+		}
 
 		go func() {
 			defer conn.Close()
@@ -126,10 +128,13 @@ func connectAndForward(localPort, serverAddr, clientPort, proxyURL string, useTL
 				if err != nil {
 					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 						log.Printf("WebSocket connection closed normally: %v", err)
+						return
 					} else {
-						log.Printf("Error reading from WebSocket: %v", err)
+						if debug {
+							log.Printf("Error reading from WebSocket: %v", err)
+						}
+						break
 					}
-					return
 				}
 
 				var controlMsg map[string]string
@@ -147,7 +152,15 @@ func connectAndForward(localPort, serverAddr, clientPort, proxyURL string, useTL
 			}
 		}()
 
-		select {}
+		for {
+			if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				if debug {
+					log.Printf("Lost connection, attempting to reconnect...")
+				}
+				break
+			}
+			time.Sleep(3 * time.Second)
+		}
 	}
 }
 
@@ -179,8 +192,9 @@ func establishNewWebSocketConnection(localPort, serverAddr, clientPort, connecti
 		wsConn.Close()
 		return
 	}
-
-	log.Printf("New WebSocket connection established for connectionID %s", connectionID)
+	if debug {
+		log.Printf("New WebSocket connection established for connectionID %s", connectionID)
+	}
 
 	go func() {
 		defer wsConn.Close()
@@ -367,7 +381,6 @@ func main() {
 
 	if proxyURL != "" && clientPort != "" && *useProxy == false {
 		go connectAndForward(*localPort, *serverAddr, clientPort, proxyURL, *useTLS)
-		log.Printf("Proxy URL: %s", proxyURL)
 	}
 
 	if *useProxy && proxyURL != "" {

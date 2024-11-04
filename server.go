@@ -306,7 +306,9 @@ func handleNewProxyConnectionTLS(proxyConn net.Conn, client *clientInfo) {
 	err := client.conn.WriteJSON(message)
 	client.connMutex.Unlock()
 	if err != nil {
-		log.Printf("Failed to send new_connection message: %v", err)
+		if debug {
+			log.Printf("Failed to send new_connection message: %v", err)
+		}
 		return
 	}
 
@@ -331,7 +333,9 @@ func handleNewProxyConnectionNoTLS(proxyConn net.Conn, client *clientInfo) {
 	err := client.conn.WriteJSON(message)
 	client.connMutex.Unlock()
 	if err != nil {
-		log.Printf("Failed to send new_connection message: %v", err)
+		if debug {
+			log.Printf("Failed to send new_connection message: %v", err)
+		}
 		return
 	}
 
