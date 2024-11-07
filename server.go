@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -19,19 +21,26 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type SerializableClientInfo struct {
+	UDID            string
+	PortTLS         int
+	PortNoTLS       int
+	ClientPortTLS   int
+	ClientPortNoTLS int
+	LastActivity    time.Time
+	ConnectionType  string
+	ConnectionID    string
+	Registered      bool
+}
+
 type clientInfo struct {
-	udid                string
+	SerializableClientInfo
 	conn                *websocket.Conn
-	portTLS             int
-	portNoTLS           int
-	clientPortTLS       int
-	clientPortNoTLS     int
 	listenerTLS         net.Listener
 	listenerNoTLS       net.Listener
 	clientListenerTLS   *http.Server
 	clientListenerNoTLS *http.Server
 	cancelFunc          context.CancelFunc
-	lastActivity        time.Time
 	connMutex           sync.Mutex
 	wsConnChan          chan *websocket.Conn
 }
@@ -55,6 +64,9 @@ var (
 	basePortNoTLS       = 4000
 	baseClientPortTLS   = 7000
 	baseClientPortNoTLS = 9000
+
+	stateFile = "state.dat"
+	logFile   = "server.log"
 )
 
 func setupFlags() {
@@ -125,14 +137,16 @@ func closeClientConnections(clientID string, client *clientInfo) {
 		}
 	}
 
-	client.cancelFunc()
+	if client.cancelFunc != nil {
+		client.cancelFunc()
+	}
 
-	releasePorts(client.portTLS, client.portNoTLS, client.clientPortTLS, client.clientPortNoTLS)
+	releasePorts(client.PortTLS, client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
 	clientsMutex.Lock()
 	delete(clients, clientID)
 	clientsMutex.Unlock()
 	if debug {
-		log.Printf("Resources released for client %s on ports TLS: %d, non-TLS: %d", clientID, client.portTLS, client.portNoTLS)
+		log.Printf("Resources released for client %s on ports TLS: %d, non-TLS: %d", clientID, client.PortTLS, client.PortNoTLS)
 	}
 }
 
@@ -142,12 +156,14 @@ func monitorClientActivity(clientID string, client *clientInfo) {
 
 	for range ticker.C {
 		clientsMutex.Lock()
-		if time.Since(client.lastActivity) > inactivityTimeout {
+		if time.Since(client.LastActivity) > inactivityTimeout {
 			if debug {
-				log.Printf("Client on ports %d (TLS) and %d (non-TLS) inactive, closing connections", client.clientPortTLS, client.clientPortNoTLS)
+				log.Printf("Client on ports %d (TLS) and %d (non-TLS) inactive, closing connections", client.ClientPortTLS, client.ClientPortNoTLS)
 			}
 
-			client.cancelFunc()
+			if client.cancelFunc != nil {
+				client.cancelFunc()
+			}
 
 			go func() {
 				closeClientConnections(clientID, client)
@@ -172,14 +188,18 @@ func registerClientHandler(w http.ResponseWriter, r *http.Request) {
 	udid := uuid.New().String()
 
 	client := &clientInfo{
-		udid:            udid,
-		portTLS:         portTLS,
-		portNoTLS:       portNoTLS,
-		clientPortTLS:   clientPortTLS,
-		clientPortNoTLS: clientPortNoTLS,
-		cancelFunc:      cancel,
-		lastActivity:    time.Now(),
-		wsConnChan:      make(chan *websocket.Conn),
+		SerializableClientInfo: SerializableClientInfo{
+			UDID:            udid,
+			PortTLS:         portTLS,
+			PortNoTLS:       portNoTLS,
+			ClientPortTLS:   clientPortTLS,
+			ClientPortNoTLS: clientPortNoTLS,
+			LastActivity:    time.Now(),
+			ConnectionType:  connectionType,
+			Registered:      true,
+		},
+		cancelFunc: cancel,
+		wsConnChan: make(chan *websocket.Conn),
 	}
 
 	clientID := udid
@@ -187,10 +207,10 @@ func registerClientHandler(w http.ResponseWriter, r *http.Request) {
 	switch connectionType {
 	case "tls":
 		go waitForProxyConnectionTLS(ctx, client, portTLS)
-		go waitForClientConnection(ctx, client.clientPortTLS, true, clientID)
+		go waitForClientConnection(ctx, client, clientPortTLS, true, clientID)
 	case "non-tls":
 		go waitForProxyConnectionNoTLS(ctx, client, portNoTLS)
-		go waitForClientConnection(ctx, client.clientPortNoTLS, false, clientID)
+		go waitForClientConnection(ctx, client, clientPortNoTLS, false, clientID)
 	default:
 		http.Error(w, "Invalid connection_type parameter", http.StatusBadRequest)
 		return
@@ -201,6 +221,7 @@ func registerClientHandler(w http.ResponseWriter, r *http.Request) {
 	clientsMutex.Unlock()
 
 	go monitorClientActivity(clientID, client)
+	saveState()
 
 	response := map[string]string{
 		"udid":              udid,
@@ -306,9 +327,7 @@ func handleNewProxyConnectionTLS(proxyConn net.Conn, client *clientInfo) {
 	err := client.conn.WriteJSON(message)
 	client.connMutex.Unlock()
 	if err != nil {
-		if debug {
-			log.Printf("Failed to send new_connection message: %v", err)
-		}
+		log.Printf("Failed to send new_connection message: %v", err)
 		return
 	}
 
@@ -333,9 +352,7 @@ func handleNewProxyConnectionNoTLS(proxyConn net.Conn, client *clientInfo) {
 	err := client.conn.WriteJSON(message)
 	client.connMutex.Unlock()
 	if err != nil {
-		if debug {
-			log.Printf("Failed to send new_connection message: %v", err)
-		}
+		log.Printf("Failed to send new_connection message: %v", err)
 		return
 	}
 
@@ -412,7 +429,7 @@ func clientWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func waitForClientConnection(ctx context.Context, clientPort int, useTLS bool, udid string) {
+func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort int, useTLS bool, udid string) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -441,16 +458,8 @@ func waitForClientConnection(ctx context.Context, clientPort int, useTLS bool, u
 		}
 
 		clientsMutex.Lock()
-		client, exists := clients[udid]
-		if exists {
-			client.conn = wsConn
-			client.lastActivity = time.Now()
-		} else {
-			log.Printf("Client not found for UDID %s when setting up WebSocket", udid)
-			wsConn.Close()
-			clientsMutex.Unlock()
-			return
-		}
+		client.conn = wsConn
+		client.LastActivity = time.Now()
 		clientsMutex.Unlock()
 		if debug {
 			log.Printf("Control WebSocket client connected on port %d", clientPort)
@@ -499,6 +508,12 @@ func waitForClientConnection(ctx context.Context, clientPort int, useTLS bool, u
 		IdleTimeout:  300 * time.Second,
 	}
 
+	if useTLS {
+		client.clientListenerTLS = server
+	} else {
+		client.clientListenerNoTLS = server
+	}
+
 	go func() {
 		if useTLS {
 			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -530,7 +545,95 @@ func waitForClientConnection(ctx context.Context, clientPort int, useTLS bool, u
 	}
 }
 
+func saveState() {
+	clientsMutex.Lock()
+	defer clientsMutex.Unlock()
+
+	state := struct {
+		Clients   map[string]SerializableClientInfo
+		UsedPorts map[int]bool
+	}{
+		Clients:   make(map[string]SerializableClientInfo),
+		UsedPorts: make(map[int]bool),
+	}
+
+	for id, client := range clients {
+		state.Clients[id] = client.SerializableClientInfo
+	}
+
+	portMutex.Lock()
+	for port, used := range usedPorts {
+		state.UsedPorts[port] = used
+	}
+	portMutex.Unlock()
+
+	file, err := os.Create(stateFile)
+	if err != nil {
+		log.Printf("Failed to create state file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	encoder := gob.NewEncoder(file)
+	if err := encoder.Encode(state); err != nil {
+		log.Printf("Failed to encode state: %v", err)
+	}
+}
+
+func loadState() {
+	file, err := os.Open(stateFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Failed to open state file: %v", err)
+		}
+		return
+	}
+	defer file.Close()
+
+	state := struct {
+		Clients   map[string]SerializableClientInfo
+		UsedPorts map[int]bool
+	}{}
+
+	decoder := gob.NewDecoder(file)
+	if err := decoder.Decode(&state); err != nil {
+		log.Printf("Failed to decode state: %v", err)
+		return
+	}
+
+	clientsMutex.Lock()
+	for id, clientData := range state.Clients {
+		client := &clientInfo{
+			SerializableClientInfo: clientData,
+			wsConnChan:             make(chan *websocket.Conn),
+		}
+		clients[id] = client
+
+		ctx, cancel := context.WithCancel(context.Background())
+		client.cancelFunc = cancel
+
+		switch client.ConnectionType {
+		case "tls":
+			go waitForProxyConnectionTLS(ctx, client, client.PortTLS)
+			go waitForClientConnection(ctx, client, client.ClientPortTLS, true, id)
+		case "non-tls":
+			go waitForProxyConnectionNoTLS(ctx, client, client.PortNoTLS)
+			go waitForClientConnection(ctx, client, client.ClientPortNoTLS, false, id)
+		}
+
+		go monitorClientActivity(id, client)
+	}
+	clientsMutex.Unlock()
+
+	portMutex.Lock()
+	for port, used := range state.UsedPorts {
+		usedPorts[port] = used
+	}
+	portMutex.Unlock()
+}
+
 func main() {
+	setupLogging()
 	setupFlags()
 	flag.Parse()
 
@@ -539,6 +642,24 @@ func main() {
 	}
 
 	initCertificates()
+	loadState()
+
+	for {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic: %v", r)
+					saveState()
+					log.Printf("Restarting server...")
+				}
+			}()
+			runServer()
+		}()
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func runServer() {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		log.Fatalf("Failed to load main certificate: %v", err)
@@ -559,10 +680,20 @@ func main() {
 
 	go func() {
 		log.Printf("Listening on port %d...", rp)
-		if err := tlsServer.ListenAndServeTLS("", ""); err != nil {
+		if err := tlsServer.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("Failed to start TLS server: %v", err)
 		}
 	}()
 
 	select {}
+}
+
+func setupLogging() {
+	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		fmt.Printf("Failed to open log file %s: %v", logFile, err)
+		os.Exit(1)
+	}
+	log.SetOutput(file)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 }
