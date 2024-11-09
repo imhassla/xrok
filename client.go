@@ -119,14 +119,13 @@ func serveFolderLocally(ctx context.Context, folderPath string, localPort string
 func connectAndForward(ctx context.Context, state *clientState, wg *sync.WaitGroup) {
 	defer wg.Done()
 	const (
-		reconnectInterval = 1 * time.Second
+		reconnectInterval = 6 * time.Second
 		connReadLimit     = 1024 * 1024
+		connTimeout       = 3 * time.Second
 	)
 
-	scheme := "ws"
-	if state.UseTLS {
-		scheme = "wss"
-	}
+	scheme := "wss"
+
 	u := url.URL{Scheme: scheme, Host: fmt.Sprintf("%s:%s", state.ServerAddr, state.ClientPort), Path: "/ws"}
 
 	for {
@@ -136,7 +135,8 @@ func connectAndForward(ctx context.Context, state *clientState, wg *sync.WaitGro
 		default:
 		}
 
-		conn, resp, err := websocket.DefaultDialer.Dial(u.String(), nil)
+		dialer := websocket.Dialer{HandshakeTimeout: connTimeout}
+		conn, resp, err := dialer.Dial(u.String(), nil)
 		if err != nil {
 			if resp != nil {
 				log.Printf("WebSocket connection failed with status: %d %s", resp.StatusCode, resp.Status)
@@ -148,68 +148,74 @@ func connectAndForward(ctx context.Context, state *clientState, wg *sync.WaitGro
 		}
 
 		conn.SetReadLimit(connReadLimit)
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
-		conn.SetWriteDeadline(time.Now().Add(120 * time.Second))
-
 		if debug {
 			log.Printf("Control connection established")
 		}
 
-		go func() {
-			defer conn.Close()
-			for {
-				_, msg, err := conn.ReadMessage()
-				if err != nil {
-					if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-						log.Printf("WebSocket connection closed normally: %v", err)
-						return
-					} else {
-						if debug {
-							log.Printf("Error reading from WebSocket: %v", err)
-						}
-						break
-					}
-				}
+		handleWebSocketConnection(ctx, conn, state)
+		conn.Close()
+		time.Sleep(reconnectInterval)
+	}
+}
 
-				var controlMsg map[string]string
-				if err := json.Unmarshal(msg, &controlMsg); err != nil {
-					log.Printf("Invalid control message: %v", err)
-					continue
-				}
+func handleWebSocketConnection(ctx context.Context, conn *websocket.Conn, state *clientState) {
+	const (
+		writeWait = 10 * time.Second
+	)
+	conn.SetPingHandler(func(appData string) error {
+		if debug {
+			log.Printf("Received ping from server")
+		}
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeWait))
+	})
 
-				if controlMsg["type"] == "new_connection" {
-					connectionID := controlMsg["connectionID"]
-					useTLSStr := controlMsg["useTLS"]
-					useTLSConn := useTLSStr == "true"
-					go establishNewWebSocketConnection(ctx, state, connectionID, useTLSConn)
-				}
-			}
-		}()
+	conn.SetPongHandler(func(appData string) error {
+		if debug {
+			log.Printf("Received pong from server")
+		}
+		return nil
+	})
 
+	go func() {
 		for {
-			select {
-			case <-ctx.Done():
-				conn.Close()
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("Error reading from WebSocket: %v", err)
 				return
-			default:
 			}
 
-			if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-				if debug {
-					log.Printf("Lost connection, attempting to reconnect...")
-				}
-				break
+			var controlMsg map[string]string
+			if err := json.Unmarshal(msg, &controlMsg); err != nil {
+				log.Printf("Invalid control message: %v", err)
+				continue
 			}
-			time.Sleep(3 * time.Second)
+
+			if controlMsg["type"] == "new_connection" {
+				connectionID := controlMsg["connectionID"]
+				useTLSStr := controlMsg["useTLS"]
+				useTLSConn := useTLSStr == "true"
+				go establishNewWebSocketConnection(ctx, state, connectionID, useTLSConn)
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+			return
+		default:
+			if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				log.Printf("Lost connection, attempting to reconnect...")
+				return
+			}
+			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
 func establishNewWebSocketConnection(ctx context.Context, state *clientState, connectionID string, useTLS bool) {
-	scheme := "ws"
-	if useTLS {
-		scheme = "wss"
-	}
+	scheme := "wss"
 
 	wsURL := url.URL{
 		Scheme: scheme,
@@ -221,44 +227,46 @@ func establishNewWebSocketConnection(ctx context.Context, state *clientState, co
 		}.Encode(),
 	}
 
-	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL.String(), nil)
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	wsConn, _, err := dialer.Dial(wsURL.String(), nil)
 	if err != nil {
-		log.Printf("Failed to establish new WebSocket connection: %v", err)
+		log.Printf("Failed to establish new WebSocket connection for connectionID %s: %v", connectionID, err)
 		return
 	}
 
 	localConn, err := net.Dial("tcp", state.LocalPort)
 	if err != nil {
-		log.Printf("Failed to connect to local application: %v", err)
+		log.Printf("Failed to connect to local application for connectionID %s: %v", connectionID, err)
 		wsConn.Close()
 		return
 	}
-	if debug {
-		log.Printf("New WebSocket connection established for connectionID %s", connectionID)
-	}
 
+	log.Printf("New WebSocket connection established for connectionID %s", connectionID)
+	handleDataForwarding(wsConn, localConn, connectionID)
+}
+
+func handleDataForwarding(wsConn *websocket.Conn, localConn net.Conn, connectionID string) {
+	defer wsConn.Close()
+	defer localConn.Close()
+
+	done := make(chan struct{})
 	go func() {
-		defer wsConn.Close()
-		defer localConn.Close()
-
-		done := make(chan struct{})
-		go func() {
-			io.Copy(localConn, wsConn.UnderlyingConn())
-			done <- struct{}{}
-		}()
-		go func() {
-			io.Copy(wsConn.UnderlyingConn(), localConn)
-			done <- struct{}{}
-		}()
-		select {
-		case <-done:
-		case <-ctx.Done():
-		}
+		io.Copy(localConn, wsConn.UnderlyingConn())
+		done <- struct{}{}
 	}()
+	go func() {
+		io.Copy(wsConn.UnderlyingConn(), localConn)
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+		log.Printf("Data forwarding completed for connectionID %s", connectionID)
+	}
 }
 
 func registerClient(state *clientState) bool {
 	const maxRetries = 3
+	const writeWait = 10 * time.Second
 	const backoffFactor = 500 * time.Millisecond
 
 	connectionType := "tls"
@@ -269,7 +277,7 @@ func registerClient(state *clientState) bool {
 	log.Printf("Registering client at %s with connection type %s", state.ServerAddr, connectionType)
 	fullURL := fmt.Sprintf("https://%s:%d/register_client?connection_type=%s", state.ServerAddr, rp, connectionType)
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 
 	var res RegisterResponse
 	for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -309,7 +317,6 @@ func registerClient(state *clientState) bool {
 			continue
 		}
 
-		// Print the proxy URL to the console
 		fmt.Printf("Proxy URL: %s\n", state.ProxyURL)
 		return true
 	}
@@ -324,12 +331,12 @@ func startLocalProxy(ctx context.Context, port int, host string, wg *sync.WaitGr
 	localAddr := fmt.Sprintf("%s:%d", host, port)
 
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			DisableKeepAlives:   false,
 			MaxIdleConns:        1000,
 			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     60 * time.Second,
+			IdleConnTimeout:     120 * time.Second,
 		},
 	}
 

@@ -58,7 +58,7 @@ var (
 	connLimiter              = make(chan struct{}, maxConcurrentConnections)
 	usedPorts                = make(map[int]bool)
 	portMutex                sync.Mutex
-	inactivityTimeout        = 5 * time.Minute
+	inactivityTimeout        = 2000 * time.Minute
 
 	basePortTLS         = 3000
 	basePortNoTLS       = 4000
@@ -262,19 +262,30 @@ func waitForProxyConnectionTLS(ctx context.Context, client *clientInfo, proxyPor
 }
 
 func waitForProxyConnectionNoTLS(ctx context.Context, client *clientInfo, proxyPort int) {
+	log.Printf("Initializing non-TLS proxy listener on port %d", proxyPort)
+
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", proxyPort))
 	if err != nil {
-		log.Printf("Error listening on port %d (non-TLS): %v", proxyPort, err)
+		log.Printf("Error initializing non-TLS listener on port %d: %v", proxyPort, err)
 		return
 	}
-	client.listenerNoTLS = listener
-	defer listener.Close()
 
-	log.Printf("Proxy server listening on port %d (non-TLS)", proxyPort)
+	client.listenerNoTLS = listener
+	defer func() {
+		if err := listener.Close(); err != nil {
+			log.Printf("Error closing non-TLS listener on port %d: %v", proxyPort, err)
+		} else {
+			log.Printf("Non-TLS listener on port %d closed successfully", proxyPort)
+		}
+	}()
+
+	log.Printf("Non-TLS proxy server successfully listening on port %d", proxyPort)
+
 	acceptConnections(ctx, listener, client, handleNewProxyConnectionNoTLS)
 }
 
 func acceptConnections(ctx context.Context, listener net.Listener, client *clientInfo, handleFunc func(net.Conn, *clientInfo)) {
+	log.Printf("Starting to accept connections on port %d", listener.Addr().(*net.TCPAddr).Port)
 	var wg sync.WaitGroup
 
 	for {
@@ -293,18 +304,15 @@ func acceptConnections(ctx context.Context, listener net.Listener, client *clien
 			if err != nil {
 				select {
 				case <-ctx.Done():
-					if debug {
-						log.Printf("Listener for port %d already canceled, exit loop", listener.Addr().(*net.TCPAddr).Port)
-					}
+					log.Printf("Listener for port %d already canceled, exit loop", listener.Addr().(*net.TCPAddr).Port)
 					return
 				default:
-					if debug {
-						log.Printf("Failed to accept connection on port %d: %v", listener.Addr().(*net.TCPAddr).Port, err)
-					}
+					log.Printf("Failed to accept connection on port %d: %v", listener.Addr().(*net.TCPAddr).Port, err)
 					continue
 				}
 			}
 
+			log.Printf("Accepted connection on port %d for client %s", listener.Addr().(*net.TCPAddr).Port, client.UDID)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -323,9 +331,21 @@ func handleNewProxyConnectionTLS(proxyConn net.Conn, client *clientInfo) {
 		"connectionID": connectionID,
 		"useTLS":       "true",
 	}
+
 	client.connMutex.Lock()
+	defer client.connMutex.Unlock()
+
+	// Update client's last activity
+	clientsMutex.Lock()
+	client.LastActivity = time.Now()
+	clientsMutex.Unlock()
+
+	if client.conn == nil {
+		log.Printf("WebSocket connection for client %s is not established, aborting connection ID %s", client.UDID, connectionID)
+		return
+	}
+
 	err := client.conn.WriteJSON(message)
-	client.connMutex.Unlock()
 	if err != nil {
 		log.Printf("Failed to send new_connection message: %v", err)
 		return
@@ -333,7 +353,12 @@ func handleNewProxyConnectionTLS(proxyConn net.Conn, client *clientInfo) {
 
 	select {
 	case wsConn := <-client.wsConnChan:
-		handleProxyWebSocketConnection(proxyConn, wsConn)
+		if wsConn == nil {
+			log.Printf("Received nil WebSocket connection for connectionID %s, aborting", connectionID)
+			return
+		}
+		// Pass the client to handleProxyWebSocketConnection
+		handleProxyWebSocketConnection(proxyConn, wsConn, client)
 	case <-time.After(30 * time.Second):
 		log.Printf("Timeout waiting for client WebSocket connection")
 	}
@@ -341,92 +366,118 @@ func handleNewProxyConnectionTLS(proxyConn net.Conn, client *clientInfo) {
 
 func handleNewProxyConnectionNoTLS(proxyConn net.Conn, client *clientInfo) {
 	connectionID := uuid.New().String()
-	defer proxyConn.Close()
+	defer func() {
+		if err := proxyConn.Close(); err != nil {
+			if debug {
+				log.Printf("Error closing proxy connection with ID %s: %v", connectionID, err)
+			}
+		}
+	}()
 
-	message := map[string]string{
-		"type":         "new_connection",
-		"connectionID": connectionID,
-		"useTLS":       "false",
-	}
+	log.Printf("Setting up new non-TLS proxy connection with ID: %s", connectionID)
+
 	client.connMutex.Lock()
-	err := client.conn.WriteJSON(message)
-	client.connMutex.Unlock()
-	if err != nil {
-		log.Printf("Failed to send new_connection message: %v", err)
+	defer client.connMutex.Unlock()
+
+	// Update client's last activity
+	clientsMutex.Lock()
+	client.LastActivity = time.Now()
+	clientsMutex.Unlock()
+
+	if client.conn == nil {
+		log.Printf("WebSocket connection for client %s is not established, aborting connection ID %s", client.UDID, connectionID)
 		return
 	}
 
+	err := client.conn.WriteJSON(map[string]string{
+		"type":         "new_connection",
+		"connectionID": connectionID,
+		"useTLS":       "false",
+	})
+	if err != nil {
+		log.Printf("Failed to send new_connection message for non-TLS connection ID %s: %v", connectionID, err)
+		return
+	}
+
+	log.Printf("Awaiting WebSocket connection for connectionID %s", connectionID)
+
 	select {
 	case wsConn := <-client.wsConnChan:
-		handleProxyWebSocketConnection(proxyConn, wsConn)
-	case <-time.After(30 * time.Second):
-		log.Printf("Timeout waiting for client WebSocket connection")
+		if wsConn == nil {
+			log.Printf("Received nil WebSocket connection for connectionID %s, aborting", connectionID)
+			return
+		}
+		log.Printf("Non-TLS WebSocket connection established for connectionID %s", connectionID)
+		// Pass the client to handleProxyWebSocketConnection
+		handleProxyWebSocketConnection(proxyConn, wsConn, client)
+	case <-time.After(60 * time.Second):
+		log.Printf("Timeout waiting for non-TLS WebSocket connection for ID %s", connectionID)
 	}
 }
 
-func handleProxyWebSocketConnection(proxyConn net.Conn, wsConn *websocket.Conn) {
+func handleProxyWebSocketConnection(proxyConn net.Conn, wsConn *websocket.Conn, client *clientInfo) {
 	defer wsConn.Close()
 	defer proxyConn.Close()
 
 	done := make(chan struct{})
+	errChan := make(chan error, 2)
 
 	go func() {
-		defer func() {
-			done <- struct{}{}
-		}()
-		io.Copy(proxyConn, wsConn.UnderlyingConn())
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := wsConn.UnderlyingConn().Read(buf)
+			if n > 0 {
+				if _, writeErr := proxyConn.Write(buf[:n]); writeErr != nil {
+					errChan <- fmt.Errorf("error writing to proxy connection: %w", writeErr)
+					return
+				}
+				// Update client's last activity
+				clientsMutex.Lock()
+				client.LastActivity = time.Now()
+				clientsMutex.Unlock()
+			}
+			if err != nil {
+				if err != io.EOF {
+					errChan <- fmt.Errorf("error reading from WebSocket: %w", err)
+				}
+				break
+			}
+		}
+		done <- struct{}{}
 	}()
 
 	go func() {
-		defer func() {
-			done <- struct{}{}
-		}()
-		io.Copy(wsConn.UnderlyingConn(), proxyConn)
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := proxyConn.Read(buf)
+			if n > 0 {
+				if _, writeErr := wsConn.UnderlyingConn().Write(buf[:n]); writeErr != nil {
+					errChan <- fmt.Errorf("error writing to WebSocket: %w", writeErr)
+					return
+				}
+				// Update client's last activity
+				clientsMutex.Lock()
+				client.LastActivity = time.Now()
+				clientsMutex.Unlock()
+			}
+			if err != nil {
+				if err != io.EOF {
+					errChan <- fmt.Errorf("error reading from proxy connection: %w", err)
+				}
+				break
+			}
+		}
+		done <- struct{}{}
 	}()
-
-	<-done
-	if debug {
-		log.Printf("Data forwarding complete for connection %s", proxyConn.LocalAddr())
-	}
-}
-
-func clientWebSocketHandler(w http.ResponseWriter, r *http.Request) {
-	if debug {
-		log.Printf("Received request on /client_ws endpoint: %v", r)
-	}
-
-	connectionID := r.URL.Query().Get("connectionID")
-	clientID := r.URL.Query().Get("clientID")
-	if connectionID == "" || clientID == "" {
-		log.Printf("Missing connectionID or clientID")
-		http.Error(w, "Missing connectionID or clientID", http.StatusBadRequest)
-		return
-	}
-
-	wsConn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Failed to upgrade to WebSocket: %v", err)
-		return
-	}
-
-	clientsMutex.Lock()
-	client, exists := clients[clientID]
-	clientsMutex.Unlock()
-	if !exists {
-		log.Printf("Client not found: %s", clientID)
-		wsConn.Close()
-		return
-	}
 
 	select {
-	case client.wsConnChan <- wsConn:
-		if debug {
-			log.Printf("Accepted new WebSocket connection for client %s, connectionID %s", clientID, connectionID)
-		}
-	default:
-		log.Printf("No proxy connection waiting for client %s, connectionID %s", clientID, connectionID)
-		wsConn.Close()
+	case <-done:
+		log.Printf("Data forwarding completed between WebSocket and proxy connection")
+	case err := <-errChan:
+		log.Printf("Data forwarding encountered an error: %v", err)
 	}
+
+	log.Printf("Closing connection between WebSocket and proxy")
 }
 
 func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort int, useTLS bool, udid string) {
@@ -466,19 +517,23 @@ func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort
 		}
 
 		go func() {
-			ticker := time.NewTicker(30 * time.Second)
+			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
 
 			for {
 				select {
 				case <-ticker.C:
 					if err := wsConn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-						if debug {
-							log.Printf("Error sending ping: %v", err)
-						}
+						log.Printf("Error sending ping: %v", err)
 						wsConn.Close()
 						return
 					}
+					if debug {
+						log.Printf("Ping sent successfully")
+					}
+					clientsMutex.Lock()
+					client.LastActivity = time.Now()
+					clientsMutex.Unlock()
 				case <-ctx.Done():
 					wsConn.Close()
 					return
@@ -487,13 +542,18 @@ func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort
 		}()
 
 		for {
-			_, _, err := wsConn.ReadMessage()
+			msgType, _, err := wsConn.ReadMessage()
 			if err != nil {
 				if debug {
 					log.Printf("Control WebSocket connection closed: %v", err)
 				}
 				wsConn.Close()
 				return
+			}
+			if msgType == websocket.PongMessage {
+				clientsMutex.Lock()
+				client.LastActivity = time.Now()
+				clientsMutex.Unlock()
 			}
 		}
 	})
@@ -503,9 +563,9 @@ func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", clientPort),
 		Handler:      mux,
-		ReadTimeout:  120 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  300 * time.Second,
+		ReadTimeout:  5 * time.Minute,
+		WriteTimeout: 5 * time.Minute,
+		IdleTimeout:  5 * time.Minute,
 	}
 
 	if useTLS {
@@ -515,22 +575,16 @@ func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort
 	}
 
 	go func() {
-		if useTLS {
-			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-			if err != nil {
-				log.Fatalf("Failed to load certificate for port %d: %v", clientPort, err)
-			}
-			server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
-			log.Printf("Secure WebSocket server listening on port %d", clientPort)
-			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("Failed to start TLS client server on port %d: %v", clientPort, err)
-			}
-		} else {
-			log.Printf("Non-secure WebSocket server listening on port %d", clientPort)
-			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("Failed to start non-TLS client server on port %d: %v", clientPort, err)
-			}
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			log.Fatalf("Failed to load certificate for port %d: %v", clientPort, err)
 		}
+		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+		log.Printf("Secure WebSocket server listening on port %d", clientPort)
+		if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("Failed to start TLS client server on port %d: %v", clientPort, err)
+		}
+
 	}()
 
 	<-ctx.Done()
@@ -656,6 +710,55 @@ func main() {
 			runServer()
 		}()
 		time.Sleep(1 * time.Second)
+	}
+}
+
+func clientWebSocketHandler(w http.ResponseWriter, r *http.Request) {
+	if debug {
+		log.Printf("Received request on /client_ws endpoint: %v", r)
+	}
+
+	connectionID := r.URL.Query().Get("connectionID")
+	clientID := r.URL.Query().Get("clientID")
+	if connectionID == "" || clientID == "" {
+		log.Printf("Missing connectionID or clientID in request")
+		http.Error(w, "Missing connectionID or clientID", http.StatusBadRequest)
+		return
+	}
+
+	// Protocol and header check before WebSocket upgrade
+	if r.Header.Get("Upgrade") != "websocket" {
+		http.Error(w, "400 Bad Request - WebSocket upgrade required", http.StatusBadRequest)
+		return
+	}
+
+	wsConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Failed to upgrade to WebSocket: %v", err)
+		return
+	}
+
+	log.Printf("Upgraded to WebSocket on /client_ws for connectionID: %s, clientID: %s", connectionID, clientID)
+
+	clientsMutex.Lock()
+	client, exists := clients[clientID]
+	clientsMutex.Unlock()
+	if !exists {
+		log.Printf("Client not found: %s", clientID)
+		wsConn.Close()
+		return
+	}
+
+	select {
+	case client.wsConnChan <- wsConn:
+		log.Printf("Accepted new WebSocket connection for client %s, connectionID %s", clientID, connectionID)
+		// Update client's last activity
+		clientsMutex.Lock()
+		client.LastActivity = time.Now()
+		clientsMutex.Unlock()
+	default:
+		log.Printf("No proxy connection waiting for client %s, connectionID %s", clientID, connectionID)
+		wsConn.Close()
 	}
 }
 
