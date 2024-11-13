@@ -38,6 +38,7 @@ Example using Let's Encrypt with Certbot:
 ```bash
 sudo apt-get install certbot
 sudo certbot certonly --standalone -d yourdomain.com
+sudo certbot certonly --manual --preferred-challenges=dns -d "yourdomain.com, *.yourdomain.com"
 ```
 Certificates will be saved in `/etc/letsencrypt/live/yourdomain.com/`.
 
