@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -182,15 +183,19 @@ func registerClientHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	portTLS, portNoTLS, clientPortTLS, clientPortNoTLS := generatePorts()
+	customID := r.URL.Query().Get("id")
+
+	_, portNoTLS, clientPortTLS, clientPortNoTLS := generatePorts()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	udid := uuid.New().String()
+	clientID := customID
+	if clientID == "" {
+		clientID = uuid.New().String()
+	}
 
 	client := &clientInfo{
 		SerializableClientInfo: SerializableClientInfo{
-			UDID:            udid,
-			PortTLS:         portTLS,
+			UDID:            clientID,
 			PortNoTLS:       portNoTLS,
 			ClientPortTLS:   clientPortTLS,
 			ClientPortNoTLS: clientPortNoTLS,
@@ -202,11 +207,17 @@ func registerClientHandler(w http.ResponseWriter, r *http.Request) {
 		wsConnChan: make(chan *websocket.Conn),
 	}
 
-	clientID := udid
+	clientsMutex.Lock()
+	if _, exists := clients[clientID]; exists && customID != "" {
+		clientsMutex.Unlock()
+		http.Error(w, "Client ID already exists", http.StatusConflict)
+		return
+	}
+	clients[clientID] = client
+	clientsMutex.Unlock()
 
 	switch connectionType {
 	case "tls":
-		go waitForProxyConnectionTLS(ctx, client, portTLS)
 		go waitForClientConnection(ctx, client, clientPortTLS, true, clientID)
 	case "non-tls":
 		go waitForProxyConnectionNoTLS(ctx, client, portNoTLS)
@@ -216,21 +227,17 @@ func registerClientHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientsMutex.Lock()
-	clients[clientID] = client
-	clientsMutex.Unlock()
-
 	go monitorClientActivity(clientID, client)
 	saveState()
 
 	response := map[string]string{
-		"udid":              udid,
+		"udid":              clientID,
 		"client_port_tls":   strconv.Itoa(clientPortTLS),
 		"client_port_notls": strconv.Itoa(clientPortNoTLS),
 	}
 
 	if connectionType == "tls" || connectionType == "both" {
-		response["proxy_url_tls"] = fmt.Sprintf("https://%s:%d", domain, portTLS)
+		response["proxy_url_tls"] = fmt.Sprintf("https://%s.%s", clientID, domain)
 	}
 	if connectionType == "non-tls" || connectionType == "both" {
 		response["proxy_url_notls"] = fmt.Sprintf("%s:%d", domain, portNoTLS)
@@ -242,7 +249,15 @@ func registerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func waitForProxyConnectionTLS(ctx context.Context, client *clientInfo, proxyPort int) {
+func extractClientIDFromHost(host string) string {
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0] // The client ID assumed to be the first part of the domain
+}
+
+func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		log.Printf("Failed to load certificate for port %d: %v", proxyPort, err)
@@ -254,11 +269,54 @@ func waitForProxyConnectionTLS(ctx context.Context, client *clientInfo, proxyPor
 		log.Printf("Error listening on port %d (TLS): %v", proxyPort, err)
 		return
 	}
-	client.listenerTLS = listener
 	defer listener.Close()
 
 	log.Printf("Secure proxy server listening on port %d (TLS)", proxyPort)
-	acceptConnections(ctx, listener, client, handleNewProxyConnectionTLS)
+
+	for {
+		proxyConn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("Failed to accept connection on port %d: %v", proxyPort, err)
+				continue
+			}
+		}
+
+		go func(conn net.Conn) {
+			defer conn.Close()
+
+			tlsConn, ok := conn.(*tls.Conn)
+			if !ok {
+				log.Printf("Connection is not a TLS connection")
+				return
+			}
+
+			if err := tlsConn.Handshake(); err != nil {
+				log.Printf("TLS handshake failed: %v", err)
+				return
+			}
+
+			clientID := extractClientIDFromHost(tlsConn.ConnectionState().ServerName)
+			if clientID == "" {
+				log.Printf("ClientID not found in subdomain")
+				return
+			}
+
+			clientsMutex.Lock()
+			client, exists := clients[clientID]
+			clientsMutex.Unlock()
+
+			if !exists {
+				log.Printf("Client not found for subdomain: %s", clientID)
+				return
+			}
+
+			handleNewProxyConnectionTLS(tlsConn, client)
+		}(proxyConn)
+	}
 }
 
 func waitForProxyConnectionNoTLS(ctx context.Context, client *clientInfo, proxyPort int) {
@@ -335,7 +393,6 @@ func handleNewProxyConnectionTLS(proxyConn net.Conn, client *clientInfo) {
 	client.connMutex.Lock()
 	defer client.connMutex.Unlock()
 
-	// Update client's last activity
 	clientsMutex.Lock()
 	client.LastActivity = time.Now()
 	clientsMutex.Unlock()
@@ -668,7 +725,6 @@ func loadState() {
 
 		switch client.ConnectionType {
 		case "tls":
-			go waitForProxyConnectionTLS(ctx, client, client.PortTLS)
 			go waitForClientConnection(ctx, client, client.ClientPortTLS, true, id)
 		case "non-tls":
 			go waitForProxyConnectionNoTLS(ctx, client, client.PortNoTLS)
@@ -697,6 +753,10 @@ func main() {
 
 	initCertificates()
 	loadState()
+
+	go func() {
+		waitForProxyConnectionTLS(context.Background(), 443)
+	}()
 
 	for {
 		func() {
