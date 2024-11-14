@@ -87,6 +87,7 @@ The client will set up a local HTTP proxy server. You can configure your applica
 - `--folder`: The path to the local directory to publish.
 - `--proxy`: Use a local HTTP proxy to handle requests.
 - `--tls`: Use TLS for connections (default is true).
+- `--id`: Use custom id(subdomain) for TLS proxy URL.
 - `--debug`: Enable debug logging.
 - `--rp`: The port for client registration on the server (must match the `-rp` port on the server, default is 7645).
 
