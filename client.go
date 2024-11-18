@@ -20,6 +20,16 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type activeConnection struct {
+	WebSocketConn *websocket.Conn
+	LocalConn     net.Conn
+}
+
+var activeConnections = struct {
+	sync.RWMutex
+	connections map[string]*activeConnection
+}{connections: make(map[string]*activeConnection)}
+
 var (
 	rp       int
 	debug    bool
@@ -40,11 +50,10 @@ type clientState struct {
 }
 
 type RegisterResponse struct {
-	UDID            string `json:"udid"`
-	ProxyURLTLS     string `json:"proxy_url_tls"`
-	ProxyURLNoTLS   string `json:"proxy_url_notls"`
-	ClientPortTLS   string `json:"client_port_tls"`
-	ClientPortNoTLS string `json:"client_port_notls"`
+	UDID          string `json:"udid"`
+	ProxyURLTLS   string `json:"proxy_url_tls"`
+	ProxyURLNoTLS string `json:"proxy_url_notls"`
+	ClientPortTLS string `json:"client_port_tls"`
 }
 
 // getRandomFreePort finds a random free port within the specified range.
@@ -146,39 +155,28 @@ func serveFolderLocally(ctx context.Context, folderPath string, localPort string
 
 // connectAndForward establishes a WebSocket connection and forwards data.
 func connectAndForward(ctx context.Context, state *clientState, wg *sync.WaitGroup) {
-	// Decrement the WaitGroup counter when the function completes.
 	defer wg.Done()
 
-	// Define constants for reconnection interval, connection read limit, and connection timeout.
 	const (
 		reconnectInterval = 6 * time.Second
 		connReadLimit     = 1024 * 1024
-		connTimeout       = 3 * time.Second
+		connTimeout       = 30 * time.Second
 	)
 
-	// Use the secure WebSocket scheme (wss).
 	scheme := "wss"
 
-	// Construct the WebSocket URL using the server address and client port from the state.
 	u := url.URL{Scheme: scheme, Host: fmt.Sprintf("%s:%s", state.ServerAddr, state.ClientPort), Path: "/ws"}
 
-	// Infinite loop to continuously attempt to establish a WebSocket connection.
 	for {
 		select {
 		case <-ctx.Done():
-			// Exit the loop if the context is done (e.g., due to a cancellation signal).
 			return
 		default:
-			// Continue with the connection attempt if the context is not done.
 		}
 
-		// Create a WebSocket dialer with the specified handshake timeout.
 		dialer := websocket.Dialer{HandshakeTimeout: connTimeout}
-
-		// Attempt to establish a WebSocket connection.
 		conn, resp, err := dialer.Dial(u.String(), nil)
 		if err != nil {
-			// If the connection attempt fails, log the error and wait before retrying.
 			if resp != nil {
 				log.Printf("WebSocket connection failed with status: %d %s", resp.StatusCode, resp.Status)
 			} else {
@@ -188,108 +186,20 @@ func connectAndForward(ctx context.Context, state *clientState, wg *sync.WaitGro
 			continue
 		}
 
-		// Set the read limit for the WebSocket connection.
 		conn.SetReadLimit(connReadLimit)
-
-		// Log a message indicating that the control connection has been established, if debug mode is enabled.
 		if debug {
 			log.Printf("Control connection established")
 		}
 
-		// Handle the WebSocket connection.
-		handleWebSocketConnection(ctx, conn, state)
-
-		// Close the WebSocket connection.
-		conn.Close()
-
-		// Wait before attempting to reconnect.
-		time.Sleep(reconnectInterval)
-	}
-}
-
-// handleWebSocketConnection handles incoming WebSocket messages.
-func handleWebSocketConnection(ctx context.Context, conn *websocket.Conn, state *clientState) {
-	// Define a constant for the write wait timeout.
-	const (
-		writeWait = 10 * time.Second
-	)
-
-	// Set the ping handler for the WebSocket connection.
-	conn.SetPingHandler(func(appData string) error {
-		// Log a message indicating that a ping was received from the server, if debug mode is enabled.
-		if debug {
-			log.Printf("Received ping from server")
-		}
-		// Send a pong message in response to the ping.
-		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeWait))
-	})
-
-	// Set the pong handler for the WebSocket connection.
-	conn.SetPongHandler(func(appData string) error {
-		// Log a message indicating that a pong was received from the server, if debug mode is enabled.
-		if debug {
-			log.Printf("Received pong from server")
-		}
-		return nil
-	})
-
-	// Start a goroutine to read messages from the WebSocket connection.
-	go func() {
-		for {
-			// Read a message from the WebSocket connection.
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				// Log an error message and return if there is an error reading from the WebSocket.
-				log.Printf("Error reading from WebSocket: %v", err)
-				return
-			}
-
-			// Unmarshal the message into a control message map.
-			var controlMsg map[string]string
-			if err := json.Unmarshal(msg, &controlMsg); err != nil {
-				// Log an error message and continue if the control message is invalid.
-				log.Printf("Invalid control message: %v", err)
-				continue
-			}
-
-			// Check if the control message type is "new_connection".
-			if controlMsg["type"] == "new_connection" {
-				// Extract the connection ID and useTLS flag from the control message.
-				connectionID := controlMsg["connectionID"]
-				useTLSStr := controlMsg["useTLS"]
-				useTLSConn := useTLSStr == "true"
-				// Start a new goroutine to establish a new WebSocket connection for data forwarding.
-				go establishNewWebSocketConnection(ctx, state, connectionID, useTLSConn)
-			}
-		}
-	}()
-
-	// Infinite loop to periodically send ping messages to the server.
-	for {
-		select {
-		case <-ctx.Done():
-			// Close the WebSocket connection and return if the context is done.
-			conn.Close()
-			return
-		default:
-			// Send a ping message to the server.
-			if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-				// Log an error message and return if there is an error sending the ping message.
-				log.Printf("Lost connection, attempting to reconnect...")
-				return
-			}
-			// Wait for 5 seconds before sending the next ping message.
-			time.Sleep(5 * time.Second)
-		}
+		go handleWebSocketConnection(ctx, conn, state)
+		time.Sleep(reconnectInterval) // Keep reconnect attempts spaced apart.
 	}
 }
 
 // establishNewWebSocketConnection establishes a new WebSocket connection for data forwarding.
 func establishNewWebSocketConnection(ctx context.Context, state *clientState, connectionID string, useTLS bool) {
-	// Use the secure WebSocket scheme (wss).
 	scheme := "wss"
 
-	// Construct the WebSocket URL using the server address, client port, and query parameters.
 	wsURL := url.URL{
 		Scheme: scheme,
 		Host:   fmt.Sprintf("%s:%s", state.ServerAddr, state.ClientPort),
@@ -300,59 +210,129 @@ func establishNewWebSocketConnection(ctx context.Context, state *clientState, co
 		}.Encode(),
 	}
 
-	// Create a WebSocket dialer with a handshake timeout of 10 seconds.
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+			wsConn, _, err := dialer.Dial(wsURL.String(), nil)
+			if err != nil {
+				log.Printf("Failed to establish WebSocket connection for connectionID %s: %v", connectionID, err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
 
-	// Attempt to establish a new WebSocket connection.
-	wsConn, _, err := dialer.Dial(wsURL.String(), nil)
-	if err != nil {
-		// Log an error message and return if the connection attempt fails.
-		log.Printf("Failed to establish new WebSocket connection for connectionID %s: %v", connectionID, err)
-		return
+			localConn, err := net.Dial("tcp", state.LocalPort)
+			if err != nil {
+				log.Printf("Failed to connect to local application for connectionID %s: %v", connectionID, err)
+				wsConn.Close()
+				return
+			}
+
+			activeConnections.Lock()
+			activeConnections.connections[connectionID] = &activeConnection{
+				WebSocketConn: wsConn,
+				LocalConn:     localConn,
+			}
+			activeConnections.Unlock()
+
+			go handleDataForwarding(ctx, wsConn, localConn, connectionID)
+			return
+		}
 	}
-
-	// Attempt to establish a TCP connection to the local application.
-	localConn, err := net.Dial("tcp", state.LocalPort)
-	if err != nil {
-		// Log an error message, close the WebSocket connection, and return if the TCP connection attempt fails.
-		log.Printf("Failed to connect to local application for connectionID %s: %v", connectionID, err)
-		wsConn.Close()
-		return
-	}
-
-	// Log a message indicating that the new WebSocket connection has been established.
-	log.Printf("New WebSocket connection established for connectionID %s", connectionID)
-
-	// Handle data forwarding between the WebSocket connection and the local TCP connection.
-	handleDataForwarding(wsConn, localConn, connectionID)
 }
 
 // handleDataForwarding handles data forwarding between WebSocket and local connection.
-func handleDataForwarding(wsConn *websocket.Conn, localConn net.Conn, connectionID string) {
-	// Ensure that both the WebSocket connection and the local TCP connection are closed when the function completes.
-	defer wsConn.Close()
-	defer localConn.Close()
+func handleDataForwarding(ctx context.Context, wsConn *websocket.Conn, localConn net.Conn, connectionID string) {
+	defer func() {
+		wsConn.Close()
+		localConn.Close()
+		activeConnections.Lock()
+		delete(activeConnections.connections, connectionID)
+		activeConnections.Unlock()
+		log.Printf("Connection with ID %s closed", connectionID)
+	}()
 
-	// Create a channel to signal when data forwarding is complete.
 	done := make(chan struct{})
 
-	// Start a goroutine to copy data from the WebSocket connection to the local TCP connection.
 	go func() {
-		io.Copy(localConn, wsConn.UnderlyingConn())
-		done <- struct{}{}
+		defer func() { done <- struct{}{} }()
+		if _, err := io.Copy(localConn, wsConn.UnderlyingConn()); err != nil && !isClosedNetworkError(err) {
+			log.Printf("Error during WebSocket to local copy for connectionID %s: %v", connectionID, err)
+		}
 	}()
 
-	// Start a goroutine to copy data from the local TCP connection to the WebSocket connection.
 	go func() {
-		io.Copy(wsConn.UnderlyingConn(), localConn)
-		done <- struct{}{}
+		defer func() { done <- struct{}{} }()
+		if _, err := io.Copy(wsConn.UnderlyingConn(), localConn); err != nil && !isClosedNetworkError(err) {
+			log.Printf("Error during local to WebSocket copy for connectionID %s: %v", connectionID, err)
+		}
 	}()
 
-	// Wait for either of the goroutines to complete.
 	select {
 	case <-done:
-		// Log a message indicating that data forwarding has completed for the specified connection ID.
 		log.Printf("Data forwarding completed for connectionID %s", connectionID)
+	case <-ctx.Done():
+		log.Printf("Context canceled for connectionID %s", connectionID)
+	}
+}
+
+func isClosedNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.EOF {
+		return true
+	}
+	netErr, ok := err.(*net.OpError)
+	return ok && !netErr.Temporary()
+}
+
+// handleWebSocketConnection handles incoming WebSocket messages.
+func handleWebSocketConnection(ctx context.Context, conn *websocket.Conn, state *clientState) {
+	defer conn.Close()
+
+	const writeWait = 10 * time.Second
+	conn.SetPingHandler(func(appData string) error {
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeWait))
+	})
+
+	go func() {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("Error reading from WebSocket: %v", err)
+				return
+			}
+
+			var controlMsg map[string]string
+			if err := json.Unmarshal(msg, &controlMsg); err != nil {
+				log.Printf("Invalid control message: %v", err)
+				continue
+			}
+
+			if controlMsg["type"] == "new_connection" {
+				connectionID := controlMsg["connectionID"]
+				useTLSStr := controlMsg["useTLS"]
+				useTLSConn := useTLSStr == "true"
+
+				go establishNewWebSocketConnection(ctx, state, connectionID, useTLSConn)
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+				log.Printf("Lost control connection, attempting to reconnect...")
+				return
+			}
+			time.Sleep(5 * time.Second)
+		}
 	}
 }
 
@@ -380,7 +360,14 @@ func registerClient(state *clientState) bool {
 	}
 
 	// Create an HTTP client with a timeout of 10 seconds.
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        1000,
+			MaxIdleConnsPerHost: 1000,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 
 	// Variable to store the registration response.
 	var res RegisterResponse
@@ -416,18 +403,15 @@ func registerClient(state *clientState) bool {
 		// Update the client ID with the UDID from the response.
 		clientID = res.UDID
 
-		// Update the state with the appropriate proxy URL and client port based on the connection type.
+		state.ClientPort = res.ClientPortTLS
+
 		if state.UseTLS {
 			state.ProxyURL = res.ProxyURLTLS
-			state.ClientPort = res.ClientPortTLS
 		} else {
 			state.ProxyURL = res.ProxyURLNoTLS
-			state.ClientPort = res.ClientPortNoTLS
 		}
 
-		// Check if the proxy URL or client port is empty.
 		if state.ProxyURL == "" || state.ClientPort == "" {
-			// Log an error message and wait before retrying if the proxy URL or client port is empty.
 			log.Printf("Attempt %d: Received empty proxy URL or client port", attempt)
 			time.Sleep(backoffFactor * time.Duration(attempt))
 			continue
@@ -664,7 +648,6 @@ func main() {
 	// Wait for all goroutines to finish.
 	wg.Wait()
 
-	// Clear in-memory state on exit.
 	stateMutex.Lock()
 	state = nil
 	stateMutex.Unlock()
