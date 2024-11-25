@@ -54,11 +54,11 @@ var (
 	certFile                 string
 	keyFile                  string
 	upgrader                 = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-	maxConcurrentConnections = 2000
+	maxConcurrentConnections = 5000
 	connLimiter              = make(chan struct{}, maxConcurrentConnections)
 	usedPorts                = make(map[int]bool)
 	portMutex                sync.Mutex
-	inactivityTimeout        = 2000 * time.Minute
+	inactivityTimeout        = 1000 * time.Minute
 
 	basePortNoTLS     = 4000
 	baseClientPortTLS = 7000
@@ -548,34 +548,63 @@ func handleProxyWebSocketConnection(proxyConn net.Conn, wsConn *websocket.Conn, 
 	log.Printf("Closing connection between WebSocket and proxy")
 }
 
+// Constants for WebSocket ping/pong handling
+const (
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10 // Send pings at this period
+)
+
+// waitForClientConnection sets up a WebSocket server for a client and manages the connection lifecycle.
 func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort int, useTLS bool, udid string) {
 
+	// Create a new HTTP request multiplexer (router)
 	mux := http.NewServeMux()
+
+	// Handle the "/ws" endpoint for control WebSocket connections
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if debug {
 			log.Printf("Received request on /ws endpoint: %v", r)
 			log.Printf("Request Headers: %v", r.Header)
 		}
 
+		// Check if the request is a WebSocket upgrade request
 		if r.Header.Get("Upgrade") != "websocket" {
 			http.Error(w, "400 Bad Request - Upgrade header missing", http.StatusBadRequest)
 			return
 		}
 
+		// Limit the number of concurrent connections using connLimiter
 		select {
 		case connLimiter <- struct{}{}:
+			// Release the slot in connLimiter when the function returns
 			defer func() { <-connLimiter }()
 		default:
+			log.Printf("Server too busy, connLimiter is full")
 			http.Error(w, "Server too busy", http.StatusServiceUnavailable)
 			return
 		}
 
+		// Upgrade the HTTP connection to a WebSocket connection
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("Failed to upgrade to WebSocket: %v", err)
 			return
 		}
 
+		// Set the read deadline for the WebSocket connection
+		wsConn.SetReadDeadline(time.Now().Add(pongWait))
+
+		// Set the Pong handler to reset the read deadline upon receiving a Pong message
+		wsConn.SetPongHandler(func(string) error {
+			wsConn.SetReadDeadline(time.Now().Add(pongWait))
+			// Update the client's last activity timestamp
+			clientsMutex.Lock()
+			client.LastActivity = time.Now()
+			clientsMutex.Unlock()
+			return nil
+		})
+
+		// Update client information with the new WebSocket connection
 		clientsMutex.Lock()
 		client.connMutex.Lock()
 		client.conn = wsConn
@@ -586,14 +615,17 @@ func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort
 			log.Printf("Control WebSocket client connected on port %d", clientPort)
 		}
 
+		// Start a goroutine to send Ping messages periodically
 		go func() {
-			ticker := time.NewTicker(15 * time.Second)
+			// Create a ticker to send Ping messages at regular intervals
+			ticker := time.NewTicker(pingPeriod)
 			defer ticker.Stop()
 
 			for {
 				select {
 				case <-ticker.C:
-					if err := wsConn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+					// Send a Ping message to the client
+					if err := wsConn.WriteMessage(websocket.PingMessage, nil); err != nil {
 						log.Printf("Error sending ping: %v", err)
 						wsConn.Close()
 						return
@@ -601,35 +633,34 @@ func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort
 					if debug {
 						log.Printf("Ping sent successfully")
 					}
-					clientsMutex.Lock()
-					client.LastActivity = time.Now()
-					clientsMutex.Unlock()
 				case <-ctx.Done():
+					// Context has been canceled; close the WebSocket connection
 					wsConn.Close()
 					return
 				}
 			}
 		}()
 
+		// Listen for incoming messages from the client
 		for {
-			msgType, _, err := wsConn.ReadMessage()
+			// Read a message from the WebSocket connection
+			_, _, err := wsConn.ReadMessage()
 			if err != nil {
-				if debug {
-					log.Printf("Control WebSocket connection closed: %v", err)
+				// An error occurred while reading (e.g., connection closed or timeout)
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Printf("Unexpected WebSocket closure: %v", err)
 				}
 				wsConn.Close()
 				return
 			}
-			if msgType == websocket.PongMessage {
-				clientsMutex.Lock()
-				client.LastActivity = time.Now()
-				clientsMutex.Unlock()
-			}
+			// No need to handle messages here; Pong messages are handled by the Pong handler
 		}
 	})
 
+	// Handle the "/client_ws" endpoint for client WebSocket connections
 	mux.HandleFunc("/client_ws", clientWebSocketHandler)
 
+	// Create the HTTP server
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", clientPort),
 		Handler:      mux,
@@ -638,34 +669,43 @@ func waitForClientConnection(ctx context.Context, client *clientInfo, clientPort
 		IdleTimeout:  5 * time.Minute,
 	}
 
+	// Store the server in the client information for later shutdown
 	if useTLS {
 		client.clientListenerTLS = server
 	} else {
 		client.clientListenerNoTLS = server
 	}
 
+	// Start the server in a new goroutine
 	go func() {
 		if useTLS {
+			// Load the TLS certificate and key
 			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 			if err != nil {
 				log.Fatalf("Failed to load certificate for port %d: %v", clientPort, err)
 			}
+			// Set up TLS configuration
 			server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 			log.Printf("Secure WebSocket server listening on port %d", clientPort)
+			// Start the HTTPS server with TLS
 			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("Failed to start TLS client server on port %d: %v", clientPort, err)
 			}
 		} else {
 			log.Printf("WebSocket server listening on port %d", clientPort)
+			// Start the HTTP server without TLS
 			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("Failed to start client server on port %d: %v", clientPort, err)
 			}
 		}
 	}()
 
+	// Wait until the context is canceled
 	<-ctx.Done()
+	// Create a context with timeout for server shutdown
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	// Attempt to gracefully shut down the server
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Error shutting down client server on port %d: %v", clientPort, err)
 	} else {
