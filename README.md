@@ -174,8 +174,7 @@ sudo ./xrok server -domain yourdomain.com
 
 | Port | Purpose |
 |------|---------|
-| 443 | Unified HTTPS (registration + proxy) |
-| 9090 | Prometheus metrics |
+| 443 | Unified HTTPS (registration, proxy, metrics, health) |
 
 ## Client Usage
 
@@ -650,7 +649,7 @@ export XROK_RATE_LIMIT=100  # requests per second per client
 ### Connection Issues
 
 - Verify server is running: `curl https://yourdomain.com/health`
-- Check firewall allows ports: 443, 9090
+- Check firewall allows port 443
 - Verify DNS resolves correctly: `dig yourdomain.com`
 
 ### Certificate Issues
