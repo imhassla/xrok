@@ -130,7 +130,6 @@ type TunnelRoute struct {
 var (
 	serverDebug                    bool
 	serverClientCA                 string
-	serverMetricsPort              int
 	serverRequestLog               bool
 	serverClients                  = make(map[string]*serverClientInfo)
 	serverClientsMutex             sync.Mutex
@@ -262,7 +261,6 @@ func RunServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	fs.StringVar(&serverDomain, "domain", "", "Domain to use in URLs (required)")
 	fs.BoolVar(&serverDebug, "debug", false, "Enable debug logging")
-	fs.IntVar(&serverMetricsPort, "metrics-port", 9090, "Port for metrics/health endpoints")
 	fs.BoolVar(&serverRequestLog, "request-log", false, "Enable HTTP request logging")
 	fs.StringVar(&serverClientCA, "client-ca", "", "Path to CA certificate for mTLS client verification")
 	fs.Parse(args)
@@ -279,7 +277,6 @@ func RunServer(args []string) {
 	go cleanupServerRateLimiters(serverShutdownChan, &serverWg)
 
 	initServerMetrics()
-	startServerMetrics(serverMetricsPort)
 
 	loadServerState()
 
@@ -623,52 +620,6 @@ func initServerMetrics() {
 		srvWsUpgrades,
 		srvWsPingPongLatency,
 	)
-}
-
-func startServerMetrics(port int) {
-	mux := http.NewServeMux()
-
-	mux.Handle("/metrics", promhttp.Handler())
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy"}`))
-	})
-
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		serverClientsMutex.Lock()
-		clientCount := len(serverClients)
-		serverClientsMutex.Unlock()
-		w.Write([]byte(fmt.Sprintf(`{"status":"ready","clients":%d}`, clientCount)))
-	})
-
-	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-		serverClientsMutex.Lock()
-		clientCount := len(serverClients)
-		serverClientsMutex.Unlock()
-
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("xrok Server Stats\n"))
-		w.Write([]byte("=================\n"))
-		w.Write([]byte(fmt.Sprintf("Active Clients: %d\n", clientCount)))
-	})
-
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Metrics server error: %v", err)
-		}
-	}()
-
-	log.Printf("Metrics server listening on :%d", port)
 }
 
 func generateServerPorts() (int, int) {
@@ -1045,6 +996,27 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte(`{"status":"healthy"}`))
+				return
+			case "/ready":
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				serverClientsMutex.Lock()
+				clientCount := len(serverClients)
+				serverClientsMutex.Unlock()
+				w.Write([]byte(fmt.Sprintf(`{"status":"ready","clients":%d}`, clientCount)))
+				return
+			case "/stats":
+				serverClientsMutex.Lock()
+				clientCount := len(serverClients)
+				serverClientsMutex.Unlock()
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("xrok Server Stats\n"))
+				w.Write([]byte("=================\n"))
+				w.Write([]byte(fmt.Sprintf("Active Clients: %d\n", clientCount)))
+				return
+			case "/metrics":
+				promhttp.Handler().ServeHTTP(w, r)
 				return
 			default:
 				http.Error(w, "Not Found", http.StatusNotFound)

@@ -160,7 +160,6 @@ sudo ./xrok server -domain yourdomain.com
 |------|-------------|---------|
 | `-domain` | Domain name for tunnel URLs (required) | - |
 | `-debug` | Enable debug logging | false |
-| `-metrics-port` | Port for metrics endpoint | 9090 |
 | `-request-log` | Enable HTTP request logging | false |
 | `-client-ca` | CA certificate for mTLS client verification | - |
 
@@ -544,13 +543,13 @@ This allows SSH access to internal hosts through the xrok tunnel without port fo
 │  or Client  │────────▶│  (yourdomain.com)   │◀───────▶│   (local)    │
 └─────────────┘         └─────────────────────┘         └──────┬───────┘
                                │                               │
-                               │ SNI-based                     │ local
-                               │ routing                       │ connections
-                               ▼                               ▼
-                        ┌─────────────┐               ┌──────────────┐
-                        │   Metrics   │               │ Local Apps   │
-                        │   :9090     │               │ :8080, etc.  │
-                        └─────────────┘               └──────────────┘
+                               │ SNI-based routing             │ local
+                               │ /metrics, /health             │ connections
+                               │                               ▼
+                               │                        ┌──────────────┐
+                               │                        │ Local Apps   │
+                               │                        │ :8080, etc.  │
+                               │                        └──────────────┘
 ```
 
 ### P2P Mode (Direct Connection)
@@ -591,7 +590,7 @@ This allows SSH access to internal hosts through the xrok tunnel without port fo
 
 ### Prometheus Metrics
 
-Available at `http://server:9090/metrics`:
+Available at `https://yourdomain.com/metrics`:
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -609,7 +608,7 @@ Available at `http://server:9090/metrics`:
 
 ### Health & Status Endpoints
 
-Available at `http://server:9090/`:
+Available on main HTTPS endpoint:
 
 | Endpoint | Description |
 |----------|-------------|
@@ -621,7 +620,7 @@ Available at `http://server:9090/`:
 ### Health Check
 
 ```bash
-curl http://server:9090/health
+curl https://yourdomain.com/health
 ```
 
 ## Security
