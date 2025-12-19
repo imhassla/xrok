@@ -692,8 +692,6 @@ xrok/
 │   │   └── tunnel.go    # P2P tunnel transport layer
 │   └── transport/
 │       └── quic.go      # QUIC transport implementation
-├── docs/
-│   └── plans/           # Design documents
 └── README.md
 ```
 

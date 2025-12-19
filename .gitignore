@@ -3,3 +3,6 @@
 xrok
 xrok-*
 *.log
+
+# Docs
+docs/
