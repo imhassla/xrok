@@ -1534,7 +1534,7 @@ func handleMuxStream(ctx context.Context, stream net.Conn, state *clientState) {
 	}
 	defer localConn.Close()
 
-	done := make(chan struct{})
+	done := make(chan struct{}, 2)
 
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -1704,7 +1704,7 @@ func handleDataForwarding(ctx context.Context, wsConn *websocket.Conn, localConn
 		log.Printf("Connection with ID %s closed", connectionID)
 	}()
 
-	done := make(chan struct{})
+	done := make(chan struct{}, 2)
 
 	go func() {
 		defer func() { done <- struct{}{} }()

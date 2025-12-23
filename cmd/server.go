@@ -1746,7 +1746,7 @@ func handleProxyWebSocketConnection(proxyConn net.Conn, wsConn *websocket.Conn, 
 	defer wsConn.Close()
 	defer proxyConn.Close()
 
-	done := make(chan struct{})
+	done := make(chan struct{}, 2)
 	errChan := make(chan error, 2)
 
 	go func() {
