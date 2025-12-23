@@ -2190,6 +2190,7 @@ func loadServerState() {
 		}
 		client.SetLastActivity(clientData.LastActivity)
 		serverClients[id] = client
+		srvActiveClients.Inc() // Count restored clients
 
 		ctx, cancel := context.WithCancel(context.Background())
 		client.cancelFunc = cancel
