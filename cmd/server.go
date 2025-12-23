@@ -1298,6 +1298,7 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 				stream.Close()
 				return
 			}
+			srvBytesSent.Add(float64(len(header)))
 		}
 
 		// Write initial request data
@@ -1307,6 +1308,7 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 				stream.Close()
 				return
 			}
+			srvBytesSent.Add(float64(len(initialData)))
 		}
 
 		handleMuxProxyConnection(conn, stream, client)
@@ -1339,6 +1341,7 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 				(*stream).Close()
 				return
 			}
+			srvBytesSent.Add(float64(len(header)))
 		}
 
 		// Write initial request data
@@ -1348,6 +1351,7 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 				(*stream).Close()
 				return
 			}
+			srvBytesSent.Add(float64(len(initialData)))
 		}
 
 		handleQUICProxyConnection(conn, stream, client)
@@ -1359,6 +1363,11 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 
 // startReverseListener starts a listener for reverse port forwarding
 func startReverseListener(ctx context.Context, client *serverClientInfo, remoteAddr, localTarget string) {
+	// Normalize address: if it's just a port number, add the colon prefix
+	if !strings.Contains(remoteAddr, ":") {
+		remoteAddr = ":" + remoteAddr
+	}
+
 	listener, err := net.Listen("tcp", remoteAddr)
 	if err != nil {
 		log.Printf("Failed to start reverse listener on %s: %v", remoteAddr, err)
