@@ -532,6 +532,114 @@ Host internal-*
 
 This allows SSH access to internal hosts through the xrok tunnel without port forwarding.
 
+## Transport Types
+
+xrok supports two types of tunneling depending on your protocol needs:
+
+### HTTP/WebSocket Tunnels (Web Traffic)
+
+Use `tunnels` for HTTP-based protocols. Traffic flows through WebSocket multiplexing.
+
+**Best for:**
+- Web applications (HTTP/HTTPS)
+- REST APIs
+- WebSocket applications
+- Webhooks
+- File sharing
+
+```yaml
+tunnels:
+  - name: webapp
+    target: localhost:3000
+```
+
+**Access:** `https://webapp.yourdomain.com`
+
+### Reverse Port Forwarding (Raw TCP)
+
+Use `reverse` for raw TCP protocols. Server opens a port that forwards directly to your local service.
+
+**Best for:**
+- SSH
+- Databases (PostgreSQL, MySQL, Redis)
+- Custom TCP protocols
+- Game servers
+- Any non-HTTP service
+
+```yaml
+reverse:
+  - remote: "2222"
+    local: "localhost:22"
+```
+
+**Access:** Direct TCP connection to `yourdomain.com:2222`
+
+### Comparison
+
+| Feature | HTTP Tunnels (`tunnels`) | Raw TCP (`reverse`) |
+|---------|-------------------------|---------------------|
+| Protocol | HTTP/WebSocket over TLS | Raw TCP |
+| Access | Subdomain URL | Server IP + Port |
+| TLS | End-to-end HTTPS | Plain TCP (use SSH/TLS in app) |
+| Auth | HTTP Basic Auth supported | App-level auth only |
+| Best for | Web apps, APIs | SSH, databases, custom TCP |
+
+### Example: Expose SSH via Reverse Forwarding
+
+```yaml
+# ssh-tunnel.yaml
+server: xrok.example.com
+connection_type: tls
+
+reverse:
+  - remote: "2222"
+    local: "localhost:22"
+```
+
+Connect via:
+```bash
+ssh user@xrok.example.com -p 2222
+```
+
+### Example: Expose Database via Reverse Forwarding
+
+```yaml
+# db-tunnel.yaml
+server: xrok.example.com
+connection_type: tls
+
+reverse:
+  - remote: "5432"
+    local: "localhost:5432"
+```
+
+Connect via:
+```bash
+psql -h xrok.example.com -p 5432 -U myuser mydb
+```
+
+### Example: Combined Web + SSH Access
+
+```yaml
+# full-access.yaml
+server: xrok.example.com
+connection_type: tls
+
+# Web application via HTTPS subdomain
+tunnels:
+  - name: app
+    target: localhost:3000
+
+# SSH via direct TCP port
+reverse:
+  - remote: "2222"
+    local: "localhost:22"
+```
+
+Access:
+- Web: `https://app.xrok.example.com`
+- SSH: `ssh user@xrok.example.com -p 2222`
+
 ## Architecture
 
 ### Standard Mode (Relay)
@@ -669,6 +777,20 @@ export XROK_RATE_LIMIT=100  # requests per second per client
 - Wait for previous client to disconnect or use different name
 - Restart server to clear state
 
+## Example Configurations
+
+Ready-to-use configuration examples are available in the `examples/` directory:
+
+| File | Description |
+|------|-------------|
+| `ssh-tunnel.yaml` | Expose local SSH through xrok |
+| `ssh-multiple-hosts.yaml` | Multiple SSH hosts on different ports |
+| `database-tunnel.yaml` | Expose PostgreSQL, MySQL, Redis |
+| `web-app.yaml` | Simple web application tunnel |
+| `web-with-auth.yaml` | Web tunnel with HTTP Basic Auth |
+| `full-featured.yaml` | Combined web + SSH + SOCKS5 |
+| `quic-tunnel.yaml` | QUIC transport for better performance |
+
 ## Development
 
 ### Project Structure
@@ -691,6 +813,10 @@ xrok/
 │   │   └── tunnel.go    # P2P tunnel transport layer
 │   └── transport/
 │       └── quic.go      # QUIC transport implementation
+├── examples/            # Ready-to-use YAML configurations
+│   ├── ssh-tunnel.yaml
+│   ├── database-tunnel.yaml
+│   └── ...
 └── README.md
 ```
 

@@ -1,0 +1,15 @@
+# QUIC Transport (faster, UDP-based)
+#
+# Use QUIC instead of WebSocket for better performance
+# on high-latency or lossy networks.
+#
+server: xrok.example.com
+connection_type: quic
+
+tunnels:
+  - name: app
+    target: localhost:8080
+
+reverse:
+  - remote: "2222"
+    local: "localhost:22"

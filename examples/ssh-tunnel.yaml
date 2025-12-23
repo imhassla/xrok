@@ -1,0 +1,11 @@
+# SSH Tunnel via Reverse Port Forwarding
+#
+# This config exposes local SSH (port 22) through the xrok server.
+# Connect via: ssh user@xrok.firestarter.click -p 2222
+#
+server: xrok.firestarter.click
+connection_type: tls
+
+reverse:
+  - remote: "2222"
+    local: "localhost:22"

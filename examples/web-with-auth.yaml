@@ -1,0 +1,12 @@
+# Web Application with Basic Auth
+#
+# Protect your tunnel with HTTP Basic Authentication:
+#   https://staging.xrok.example.com (requires login)
+#
+server: xrok.example.com
+connection_type: tls
+
+tunnels:
+  - name: staging
+    target: localhost:8080
+    basic_auth: "admin:secretpassword"

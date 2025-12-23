@@ -1,0 +1,17 @@
+# Multiple SSH Hosts via Reverse Port Forwarding
+#
+# Expose multiple SSH servers through different ports:
+#   ssh user@xrok.example.com -p 2222  -> web-server
+#   ssh user@xrok.example.com -p 2223  -> db-server
+#   ssh user@xrok.example.com -p 2224  -> dev-server
+#
+server: xrok.example.com
+connection_type: tls
+
+reverse:
+  - remote: "2222"
+    local: "web-server:22"
+  - remote: "2223"
+    local: "db-server:22"
+  - remote: "2224"
+    local: "dev-server:22"

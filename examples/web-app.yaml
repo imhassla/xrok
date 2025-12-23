@@ -1,0 +1,11 @@
+# Web Application Tunnel (HTTP/HTTPS)
+#
+# Expose local web server via HTTPS subdomain:
+#   https://myapp.xrok.example.com -> localhost:3000
+#
+server: xrok.example.com
+connection_type: tls
+
+tunnels:
+  - name: myapp
+    target: localhost:3000

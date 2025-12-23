@@ -1,0 +1,17 @@
+# Database Tunnel via Reverse Port Forwarding
+#
+# Expose local databases through xrok server:
+#   PostgreSQL: psql -h xrok.example.com -p 5432
+#   MySQL:      mysql -h xrok.example.com -P 3306
+#   Redis:      redis-cli -h xrok.example.com -p 6379
+#
+server: xrok.example.com
+connection_type: tls
+
+reverse:
+  - remote: "5432"
+    local: "localhost:5432"
+  - remote: "3306"
+    local: "localhost:3306"
+  - remote: "6379"
+    local: "localhost:6379"

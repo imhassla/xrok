@@ -1,0 +1,29 @@
+# Full-Featured Configuration
+#
+# Combines multiple features:
+# - Web tunnels for HTTP services
+# - Reverse forwarding for SSH/TCP
+# - SOCKS5 proxy for outbound connections
+#
+server: xrok.example.com
+connection_type: tls
+
+# HTTP/WebSocket tunnels (accessed via subdomain)
+tunnels:
+  - name: web
+    target: localhost:3000
+  - name: api
+    target: localhost:8080
+    basic_auth: "api:token123"
+
+# Raw TCP services (accessed via server port)
+reverse:
+  - remote: "2222"
+    local: "localhost:22"      # SSH
+  - remote: "5432"
+    local: "localhost:5432"    # PostgreSQL
+
+# SOCKS5 proxy for outbound connections
+socks5:
+  enabled: true
+  port: 1080
