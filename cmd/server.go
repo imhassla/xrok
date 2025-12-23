@@ -115,6 +115,7 @@ type serverClientInfo struct {
 	p2pSignalMutex      sync.Mutex            // Mutex for P2P signaling
 	p2pConnections      map[string]net.Conn   // Active P2P connections (peerID -> conn)
 	p2pConnMutex        sync.RWMutex          // Mutex for P2P connections
+	decrementOnce       sync.Once             // Ensure active clients counter only decremented once
 }
 
 // TunnelRoute maps a subdomain to client and tunnel info
@@ -652,8 +653,10 @@ func releaseServerPorts(ports ...int) {
 }
 
 func closeServerClientConnections(clientID string, client *serverClientInfo) {
-	// Note: srvActiveClients.Dec() is called in handleMuxYamuxSessionClose
-	// to avoid double decrement
+	// Ensure counter is decremented exactly once when client is fully cleaned up
+	defer client.decrementOnce.Do(func() {
+		srvActiveClients.Dec()
+	})
 
 	// Clean up tunnel routes for this client
 	serverTunnelRoutesMutex.Lock()
@@ -793,7 +796,9 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		// Release old ports
 		releaseServerPorts(existing.PortNoTLS, existing.ClientPortTLS, existing.ClientPortNoTLS)
 		delete(serverClients, clientID)
-		srvActiveClients.Dec()
+		existing.decrementOnce.Do(func() {
+			srvActiveClients.Dec()
+		})
 		log.Printf("Cleaned up existing client %s for reconnection", clientID)
 	}
 	serverClientsMutex.Unlock()
@@ -2330,7 +2335,9 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	// Release ports
 	releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
 
-	srvActiveClients.Dec()
+	client.decrementOnce.Do(func() {
+		srvActiveClients.Dec()
+	})
 	log.Printf("Yamux session closed for client %s, resources released", clientID)
 }
 
