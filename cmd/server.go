@@ -652,7 +652,8 @@ func releaseServerPorts(ports ...int) {
 }
 
 func closeServerClientConnections(clientID string, client *serverClientInfo) {
-	srvActiveClients.Dec()
+	// Note: srvActiveClients.Dec() is called in handleMuxYamuxSessionClose
+	// to avoid double decrement
 
 	// Clean up tunnel routes for this client
 	serverTunnelRoutesMutex.Lock()
