@@ -22,13 +22,18 @@ type ServerRuntime struct {
 	run   func([]string)
 	store RuntimeStateStore
 	drain DrainController
+	ha    HAConfig
 }
 
 func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &ServerRuntime{cfg: cfg, done: make(chan struct{})}, nil
+	ha, err := LoadHAConfig(nil)
+	if err != nil {
+		return nil, err
+	}
+	return &ServerRuntime{cfg: cfg, done: make(chan struct{}), ha: ha}, nil
 }
 
 // ServerRuntimeDeps allows embedders and tests to inject the serving loop.
@@ -92,6 +97,7 @@ func (r *ServerRuntime) Shutdown() {
 }
 
 func (r *ServerRuntime) StateStore() RuntimeStateStore { return r.store }
+func (r *ServerRuntime) HAConfig() HAConfig            { return r.ha }
 func (r *ServerRuntime) AddDrainHook(h DrainHook)      { r.drain.Add(h) }
 
 func (r *ServerRuntime) Wait() { <-r.done }

@@ -1,0 +1,46 @@
+package cmd // import "xrok/cmd"
+
+func FetchViaP2P(state *clientState, tunnelURL string, req *http.Request) (*http.Response, bool, error)
+func LegacyServerDepsFallbacks() uint64
+func RunClient(args []string)
+func RunServer(args []string)
+func RunStatus(args []string)
+func WithServerDeps(ctx context.Context, deps *ServerDeps) context.Context
+type ClientRegistry struct{ ... }
+    func NewClientRegistry() *ClientRegistry
+type ClientRuntime struct{ ... }
+    func CurrentClientRuntime() *ClientRuntime
+    func NewClientRuntime(l *logger.Logger) *ClientRuntime
+type DrainController struct{ ... }
+type DrainHook func(context.Context) error
+type HAConfig struct{ ... }
+    func LoadHAConfig(getenv func(string) string) (HAConfig, error)
+type InMemoryStateStore struct{ ... }
+    func NewInMemoryStateStore(max int) *InMemoryStateStore
+type OIDCVerifier struct{ ... }
+    func NewOIDCVerifier(issuer, audience string, client *http.Client, ttl time.Duration) *OIDCVerifier
+type ReconnectConfig struct{ ... }
+type ReverseConfig struct{ ... }
+type ReverseConfigJSON struct{ ... }
+type RouteRegistry struct{ ... }
+    func NewRouteRegistry() *RouteRegistry
+type RuntimeState struct{ ... }
+type RuntimeStateStore interface{ ... }
+type SOCKS5Server struct{ ... }
+    func NewSOCKS5Server(addr string, dialFunc func(target string) (net.Conn, error)) (*SOCKS5Server, error)
+type ServerDeps struct{ ... }
+    func NewServerDeps(domain string, start time.Time, logger *log.Logger) *ServerDeps
+    func ServerDepsFromContext(ctx context.Context) (*ServerDeps, bool)
+type ServerReverseConfig struct{ ... }
+type ServerRuntime struct{ ... }
+    func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error)
+    func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error)
+type ServerRuntimeDeps struct{ ... }
+type ServerStatus struct{ ... }
+type ServerTunnelConfig struct{ ... }
+type ServerTunnelInfo struct{ ... }
+type TunnelConfig struct{ ... }
+type TunnelInfo struct{ ... }
+type TunnelRoute struct{ ... }
+type TunnelStatus struct{ ... }
+type UDPTunnelConfig struct{ ... }

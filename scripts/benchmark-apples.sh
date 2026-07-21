@@ -14,8 +14,9 @@ measure() {
   local name=$1 url=$2 i start end elapsed body code bytes
   for i in $(seq 1 "$ITERATIONS"); do
     body=$(mktemp); start=$(date +%s%N)
-    code=$(curl --silent --show-error --max-time "${CURL_TIMEOUT:-15}" -o "$body" -w '%{http_code}' "$url" || echo 000)
+    code=$(curl --silent --show-error --max-time "${CURL_TIMEOUT:-15}" -o "$body" -w '%{http_code}' "$url" 2>/dev/null) || code=000
     end=$(date +%s%N); elapsed=$(( (end-start)/1000000 )); bytes=$(wc -c <"$body" | tr -d ' '); rm -f "$body"
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
     printf '%s,%s,%s,%s,%s\n' "$name" "$i" "$elapsed" "$code" "$bytes" | tee -a "$OUT"
   done
 }

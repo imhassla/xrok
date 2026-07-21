@@ -24,14 +24,34 @@ if os.path.exists(apples_path):
     vals = {}
     with open(apples_path, newline="") as f:
         for r in csv.DictReader(f):
-            try: vals.setdefault(r["implementation"], []).append(float(r["latency_ms"]))
+            try:
+                impl = r["implementation"]
+                latency = float(r["latency_ms"])
+                code = int(r.get("http_code", "0"))
+                size = float(r.get("bytes", "0"))
+                vals.setdefault(impl, []).append((latency, code, size))
             except (KeyError, ValueError): pass
-    if vals.get("xrok") and vals.get("frp"):
-        x = sum(vals["xrok"])/len(vals["xrok"]); f = sum(vals["frp"])/len(vals["frp"])
-        pct = (x/f-1)*100 if f else 0
-        print(f"apples mean latency: xrok={x:.2f}ms frp={f:.2f}ms delta={pct:+.1f}%")
-        if pct > float(base.get("apples", {}).get("max_latency_regression_pct", 25)):
-            failed.append(f"apples latency regression {pct:.1f}%")
+    def percentile(xs, p):
+        xs = sorted(xs)
+        if not xs: return 0.0
+        k = (len(xs)-1) * p / 100.0; lo = int(k); hi = min(lo+1, len(xs)-1)
+        return xs[lo] + (xs[hi]-xs[lo])*(k-lo)
+    summary = {}
+    for impl, records in vals.items():
+        lat = [x[0] for x in records]; ok = [x for x in records if 200 <= x[1] < 400]
+        summary[impl] = {"count": len(records), "p50_ms": percentile(lat,50), "p95_ms": percentile(lat,95), "p99_ms": percentile(lat,99),
+                         "error_rate": (len(records)-len(ok))/len(records) if records else 0,
+                         "throughput_bytes_per_sec": sum(x[2] for x in ok) / (sum(x[0] for x in ok)/1000) if ok and sum(x[0] for x in ok) else 0}
+        print(f"{impl}: p50={summary[impl]['p50_ms']:.2f}ms p95={summary[impl]['p95_ms']:.2f}ms p99={summary[impl]['p99_ms']:.2f}ms errors={summary[impl]['error_rate']:.1%} throughput={summary[impl]['throughput_bytes_per_sec']:.0f}B/s")
+    if os.environ.get("ANALYTICS_OUT"):
+        json.dump(summary, open(os.environ["ANALYTICS_OUT"], "w"), indent=2)
+    if summary.get("xrok") and summary.get("frp"):
+        x = summary["xrok"]; f = summary["frp"]
+        pct = (x["p95_ms"]/f["p95_ms"]-1)*100 if f["p95_ms"] else 0
+        print(f"apples p95 latency delta: {pct:+.1f}%")
+        lim = base.get("apples", {})
+        if pct > float(lim.get("max_p95_latency_regression_pct", lim.get("max_latency_regression_pct", 25))): failed.append(f"apples p95 latency regression {pct:.1f}%")
+        if x["error_rate"] > float(lim.get("max_error_rate", 0.05)): failed.append(f"xrok error rate {x['error_rate']:.1%}")
 else:
     print(f"warning: {apples_path} not found; run scripts/benchmark-apples.sh")
 if failed:
