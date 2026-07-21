@@ -3,6 +3,7 @@
 xrok
 xrok-*
 *.log
+.artifacts/
 
 # Docs
 docs/

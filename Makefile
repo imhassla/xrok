@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench e2e fuzz security check
+.PHONY: build test race vet bench e2e fuzz security ci-local check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -20,6 +20,9 @@ fuzz:
 	$(GO_ENV) go test ./cmd/config ./cmd/p2p -run '^$$' -fuzz=Fuzz -fuzztime=10s
 
 security: vet fuzz
+
+ci-local:
+	./scripts/ci-local.sh
 
 bench:
 	$(GO_ENV) go test -run '^$$' -bench=. -benchmem ./...
