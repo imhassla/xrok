@@ -1,0 +1,5 @@
+bindPort = 7000
+vhostHTTPPort = 8080
+auth.method = "token"
+auth.token = "xrok-benchmark-token"
+transport.tls.force = true

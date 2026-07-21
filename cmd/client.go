@@ -240,6 +240,66 @@ type clientState struct {
 	P2PTunnelsMutex sync.RWMutex              // Mutex for P2P tunnels
 }
 
+// ClientRuntime owns client lifecycle state and synchronization.  The CLI keeps
+// a compatibility pointer for legacy handlers, while new code and tests can
+// inject an independent runtime instance without sharing process globals.
+type ClientRuntime struct {
+	mu    sync.RWMutex
+	state *clientState
+	log   *logger.Logger
+	stop  context.CancelFunc
+}
+
+func NewClientRuntime(l *logger.Logger) *ClientRuntime {
+	if l == nil {
+		l = logger.New()
+	}
+	return &ClientRuntime{state: &clientState{TunnelMap: make(map[string]string), ReverseMap: make(map[string]string), P2PConnections: make(map[string]net.Conn), P2PTunnels: make(map[string]*p2p.P2PTunnel)}, log: l}
+}
+
+// CurrentClientRuntime exposes the active CLI runtime for embedding and
+// diagnostics. It returns nil until RunClient has initialized the client.
+func CurrentClientRuntime() *ClientRuntime { return clientRuntime_ }
+
+// State returns a snapshot pointer for read-only inspection. Mutations should
+// use Update to preserve lifecycle synchronization.
+func (r *ClientRuntime) State() *clientState { r.mu.RLock(); defer r.mu.RUnlock(); return r.state }
+
+func (r *ClientRuntime) Update(fn func(*clientState)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fn(r.state)
+}
+
+func (r *ClientRuntime) replaceState(s *clientState) {
+	r.mu.Lock()
+	r.state = s
+	r.mu.Unlock()
+}
+
+func (r *ClientRuntime) Logger() *logger.Logger { return r.log }
+
+func (r *ClientRuntime) WithContext(parent context.Context) context.Context {
+	ctx, cancel := context.WithCancel(parent)
+	r.mu.Lock()
+	r.stop = cancel
+	r.mu.Unlock()
+	return ctx
+}
+
+func (r *ClientRuntime) Close() {
+	r.mu.Lock()
+	if r.stop != nil {
+		r.stop()
+		r.stop = nil
+	}
+	s := r.state
+	r.mu.Unlock()
+	if s != nil && s.MuxSession != nil {
+		_ = s.MuxSession.Close()
+	}
+}
+
 type registerResponse struct {
 	UDID          string       `json:"udid"`
 	ProxyURLTLS   string       `json:"proxy_url_tls"`
@@ -256,6 +316,7 @@ var (
 	reconnectConfig   *ReconnectConfig
 	clientState_      *clientState
 	clientStateMutex  sync.Mutex
+	clientRuntime_    *ClientRuntime
 	isConnected       atomic.Bool
 	reconnectCount    atomic.Int64
 	clientLog         *logger.Logger
@@ -338,6 +399,9 @@ func RunClient(args []string) {
 
 	// Setup logging
 	setupClientLogging()
+	// Keep lifecycle state behind an injectable runtime. Legacy handlers still
+	// access clientState_ during the CLI migration.
+	clientRuntime_ = NewClientRuntime(clientLog)
 
 	// Configure logger based on flags (will be adjusted after config load)
 	if *quietMode {
@@ -559,6 +623,8 @@ func RunClient(args []string) {
 		P2PConnections: make(map[string]net.Conn),
 		P2PTunnels:     make(map[string]*p2p.P2PTunnel),
 	}
+	clientRuntime_.replaceState(clientState_)
+	clientState_ = clientRuntime_.State()
 	// For backwards compatibility with single tunnel
 	if len(tunnelConfigs) == 1 {
 		clientState_.LocalPort = tunnelConfigs[0].Target

@@ -1,0 +1,45 @@
+name: xrok-benchmark
+services:
+  xrok:
+    build: { context: ., dockerfile: Dockerfile }
+    image: xrok:local
+    command: ["server", "--domain", "localhost", "--port", "8443", "--tls-cert", "/certs/server.pem", "--tls-key", "/certs/server-key.pem", "--state-file", "/data/state.dat", "--log-file", "/data/server.log"]
+    environment:
+      XROK_API_TOKEN: ${XROK_API_TOKEN:-local-benchmark-token}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    ports: ["${XROK_PORT:-8443}:8443/tcp", "${XROK_UDP_PORT:-8443}:8443/udp"]
+    volumes: ["./local-certs:/certs:ro", "xrok-benchmark-data:/data"]
+    depends_on:
+      otel-collector: { condition: service_healthy }
+      coturn: { condition: service_started }
+    healthcheck:
+      test: ["CMD", "/xrok", "status", "--help"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+  frps:
+    image: fatedier/frps:v0.61.1
+    command: ["-c", "/etc/frp/frps.toml"]
+    ports: ["${FRP_PORT:-7000}:7000/tcp", "${FRP_HTTP_PORT:-8080}:8080/tcp"]
+    volumes: ["./bench/frps.toml:/etc/frp/frps.toml:ro"]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 7000"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+  coturn:
+    image: coturn/coturn:4.6.3
+    command: ["-n", "--no-cli", "--log-file=stdout", "--listening-port=3478", "--min-port=49160", "--max-port=49200", "--realm=xrok.local", "--lt-cred-mech", "--user=benchmark:benchmark-pass"]
+    ports: ["3478:3478/udp", "49160-49200:49160-49200/udp"]
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes: ["./bench/otel-collector.yaml:/etc/otelcol/config.yaml:ro"]
+    ports: ["4317:4317", "4318:4318"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:13133/"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+volumes:
+  xrok-benchmark-data:
