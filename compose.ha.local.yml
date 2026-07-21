@@ -46,10 +46,22 @@ services:
       retries: 10
 
   xrok-b:
-    extends: xrok-a
+    build: .
     command: ["server", "--domain", "localhost", "--port", "8444", "--tls-cert", "/certs/server.pem", "--tls-key", "/certs/server-key.pem", "--state-file", "/data/state-b.dat", "--log-file", "/data/server-b.log"]
+    environment:
+      XROK_API_TOKEN: ${XROK_API_TOKEN:-local-ha-token}
+      XROK_HA_REDIS_ADDR: redis:6379
+      XROK_HA_POSTGRES_DSN: postgres://xrok:xrok-local@postgres:5432/xrok?sslmode=disable
     ports: ["${XROK_HA_PORT_B:-9443}:8444/tcp", "${XROK_HA_UDP_B:-9443}:8444/udp"]
     volumes: ["./local-certs:/certs:ro", "xrok-b-data:/data"]
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "/xrok", "status", "--help"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
 volumes:
   ha-redis:

@@ -7,9 +7,11 @@ set -euo pipefail
 
 compose_file="${XROK_HA_COMPOSE_FILE:-compose.ha.local.yml}"
 artifact="${HA_INTEGRATION_ARTIFACT:-.artifacts/ha-integration.json}"
+log_dir="${HA_INTEGRATION_LOG_DIR:-$(dirname "$artifact")/ha-integration-attempts}"
 project="${COMPOSE_PROJECT_NAME:-}"
 compose=()
 mkdir -p "$(dirname "$artifact")"
+mkdir -p "$log_dir"
 
 pick_port() {
   local avoid="${1:-}"
@@ -55,6 +57,11 @@ selected_udp_a=""
 selected_tcp_b=""
 selected_udp_b=""
 up_duration_ms=0
+diagnostics_file="${HA_INTEGRATION_DIAGNOSTICS:-${artifact%.json}.diagnostics.log}"
+mkdir -p "$(dirname "$diagnostics_file")"
+failure_class=""
+last_error_log=""
+current_attempt_dir=""
 cleanup() {
   # Keep the artifact valid JSON even when a failure occurs before Compose is
   # initialized. Health details are captured from the final project state.
@@ -64,7 +71,7 @@ cleanup() {
   fi
   "${compose[@]}" down >/dev/null 2>&1 || true
   ended_at=$(date +%s)
-  ARTIFACT="$artifact" STATUS="$status" COMPOSE_FILE="$compose_file" DURATION="$((ended_at-started_at))" LOAD="$load_iterations" ATTEMPTS="$attempts" COLLISIONS="$collision_count" TCP_A="$selected_tcp_a" UDP_A="$selected_udp_a" TCP_B="$selected_tcp_b" UDP_B="$selected_udp_b" UP_MS="$up_duration_ms" HEALTH="$health" python3 - <<'PY'
+  ARTIFACT="$artifact" STATUS="$status" COMPOSE_FILE="$compose_file" DURATION="$((ended_at-started_at))" LOAD="$load_iterations" ATTEMPTS="$attempts" COLLISIONS="$collision_count" TCP_A="$selected_tcp_a" UDP_A="$selected_udp_a" TCP_B="$selected_tcp_b" UDP_B="$selected_udp_b" UP_MS="$up_duration_ms" HEALTH="$health" FAILURE_CLASS="$failure_class" LAST_ERROR_LOG="$last_error_log" LOG_DIR="$log_dir" DIAGNOSTICS="$diagnostics_file" python3 - <<'PY'
 import json, os
 out = {
   "status": os.environ["STATUS"], "compose": os.environ["COMPOSE_FILE"],
@@ -72,6 +79,10 @@ out = {
   "attempts": int(os.environ["ATTEMPTS"]), "collision_count": int(os.environ["COLLISIONS"]),
   "selected_ports": {"tcp_a": os.environ["TCP_A"], "udp_a": os.environ["UDP_A"], "tcp_b": os.environ["TCP_B"], "udp_b": os.environ["UDP_B"]},
   "compose_up_duration_ms": int(os.environ["UP_MS"]),
+  "failure_class": os.environ.get("FAILURE_CLASS", ""),
+  "last_error_log": os.environ.get("LAST_ERROR_LOG", ""),
+  "attempt_log_dir": os.environ.get("LOG_DIR", ""),
+  "diagnostics": os.environ.get("DIAGNOSTICS", ""),
   "service_health": json.loads(os.environ.get("HEALTH", "{}")),
   "checks": ["redis_aof","redis_load","redis_failure","postgres_volume","postgres_load","postgres_failure","replica_restart","graceful_drain"],
 }
@@ -87,11 +98,26 @@ wait_running() {
     [[ "$state" == *running* ]] && return 0
     sleep "$interval"
   done
+  failure_class="health"
+  if [[ -n "$current_attempt_dir" ]]; then
+    printf 'service=%s state=%s\n' "$svc" "${state:-unknown}" >"$current_attempt_dir/health.err"
+    "${compose[@]}" ps >"$current_attempt_dir/health.ps" 2>&1 || true
+    "${compose[@]}" logs --no-color "$svc" >"$current_attempt_dir/health.log" 2>&1 || true
+    last_error_log="$current_attempt_dir/health.err"
+  fi
   fail "$svc did not become running (state: ${state:-unknown})"
 }
 
 up_attempts="${HA_COMPOSE_UP_RETRIES:-5}"
 up_ok=0
+validate_ports() {
+  local p
+  for p in "$XROK_HA_PORT_A" "$XROK_HA_UDP_A" "$XROK_HA_PORT_B" "$XROK_HA_UDP_B"; do
+    [[ "$p" =~ ^[0-9]+$ ]] && ((p > 0 && p < 65536)) || return 1
+  done
+  [[ "$XROK_HA_PORT_A" != "$XROK_HA_PORT_B" ]] || return 1
+  [[ "$XROK_HA_UDP_A" != "$XROK_HA_UDP_B" ]] || return 1
+}
 for attempt in $(seq 1 "$up_attempts"); do
   attempts=$attempt
   project="${COMPOSE_PROJECT_NAME:-xrok-ha-$RANDOM-$$-$attempt}"
@@ -101,20 +127,47 @@ for attempt in $(seq 1 "$up_attempts"); do
   PORT_AVOID="$XROK_HA_PORT_A"; export PORT_AVOID
   export XROK_HA_PORT_B="${XROK_HA_PORT_B_OVERRIDE:-$(pick_port "$XROK_HA_PORT_A")}" 
   export XROK_HA_UDP_B="${XROK_HA_UDP_B_OVERRIDE:-$XROK_HA_PORT_B}"
+  if ! validate_ports; then
+    collision_count=$((collision_count+1)); echo "invalid/conflicting port mapping (attempt $attempt)" >>"$diagnostics_file"; continue
+  fi
   selected_tcp_a="$XROK_HA_PORT_A"; selected_udp_a="$XROK_HA_UDP_A"; selected_tcp_b="$XROK_HA_PORT_B"; selected_udp_b="$XROK_HA_UDP_B"
   up_started=$(now_ms)
-  if "${compose[@]}" config >/dev/null 2>&1 && "${compose[@]}" up -d --build >/dev/null 2>&1; then
+  attempt_dir="$log_dir/attempt-$attempt"
+  current_attempt_dir="$attempt_dir"
+  mkdir -p "$attempt_dir"
+  {
+    echo "=== attempt $attempt project=$project ==="
+    echo "ports: tcp_a=$XROK_HA_PORT_A udp_a=$XROK_HA_UDP_A tcp_b=$XROK_HA_PORT_B udp_b=$XROK_HA_UDP_B"
+    "${compose[@]}" config --environment 2>&1 || true
+    "${compose[@]}" config 2>&1
+  } >>"$diagnostics_file"
+  if "${compose[@]}" config >"$attempt_dir/config.out" 2>"$attempt_dir/config.err" && "${compose[@]}" up -d --build >"$attempt_dir/up.out" 2>"$attempt_dir/up.err"; then
     up_finished=$(now_ms); up_duration_ms=$((up_finished-up_started))
     up_ok=1
     break
   fi
   up_finished=$(now_ms); up_duration_ms=$((up_finished-up_started)); collision_count=$((collision_count+1))
+  last_error_log="$attempt_dir/up.err"
+  if grep -Eqi 'operation not permitted|permission denied|cannot connect to the docker daemon|is the docker daemon running' "$attempt_dir/up.err"; then
+    failure_class="environment"
+  elif grep -Eqi 'address already in use|bind.*failed|port is already allocated' "$attempt_dir/up.err"; then
+    failure_class="bind"
+  elif grep -Eqi 'build|failed to solve|dockerfile|image' "$attempt_dir/up.err"; then
+    failure_class="build"
+  elif [[ -s "$attempt_dir/config.err" ]]; then
+    failure_class="config"
+    last_error_log="$attempt_dir/config.err"
+  else
+    failure_class="up"
+  fi
+  "${compose[@]}" ps >"$attempt_dir/ps.txt" 2>&1 || true
+  "${compose[@]}" logs --no-color >"$attempt_dir/logs.txt" 2>&1 || true
   # Docker performs the actual bind only during `up`; a prior socket probe is
   # therefore advisory. Tear down the partial project, choose a fresh set of
   # ports, and retry when another lab wins the race.
   "${compose[@]}" down --remove-orphans >/dev/null 2>&1 || true
 done
-[[ "$up_ok" == 1 ]] || fail "compose up failed after $up_attempts attempts (likely port collision)"
+[[ "$up_ok" == 1 ]] || fail "compose up failed after $up_attempts attempts (class=${failure_class:-unknown}; see ${last_error_log:-$log_dir})"
 for svc in redis postgres xrok-a xrok-b; do wait_running "$svc"; done
 
 # Redis AOF persistence check.
