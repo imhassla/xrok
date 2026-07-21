@@ -18,7 +18,10 @@ run_one() {
   (
     export COMPOSE_PROJECT_NAME="$project"
     case "$name" in
-      ha) HA_INTEGRATION_ARTIFACT="$artifact_dir/$name.json" "$script" ;;
+      ha)
+        # Keep generated certificates and Compose state isolated per parallel run.
+        export XROK_CERT_DIR="$artifact_dir/$name-certs"
+        HA_INTEGRATION_ARTIFACT="$artifact_dir/$name.json" "$script" ;;
       nat) NAT_MATRIX_ARTIFACT="$artifact_dir/$name.json" "$script" ;;
       reference) XROK_ARTIFACT_DIR="$artifact_dir/reference" "$script" up-smoke ;;
     esac
@@ -59,6 +62,11 @@ labs = {}
 for p in pathlib.Path(d).glob('*.json'):
     try: labs[p.stem] = json.loads(p.read_text())
     except Exception: labs[p.stem] = {'status':'failed','artifact':str(p)}
+# Derive aggregate status from artifacts as well as process exit codes. This
+# prevents a child that exited early after writing a failed artifact from
+# being reported as passed by the orchestrator.
+if any(str(v.get('status','')).lower() in ('failed','fail','error') for v in labs.values()):
+    status = 'failed'
 out = {'status': status, 'run_id': run_id, 'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'labs': labs}
 pathlib.Path(d, 'summary.json').write_text(json.dumps(out, indent=2) + '\n')
 PY

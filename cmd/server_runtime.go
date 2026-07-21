@@ -33,13 +33,21 @@ func newServerRuntime(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerR
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	ha, err := LoadHAConfig(nil)
+	// Derive backend settings from the versioned ServerConfig. Environment
+	// variables remain a CLI compatibility fallback, but embedded runtimes must
+	// not silently select a different backend from process-global environment.
+	ha, err := HAConfigFromServerConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
-	store, err := NewRuntimeStateStore(context.Background(), cfg, deps.StoreFactory)
-	if err != nil {
-		return nil, err
+	var store RuntimeStateStore
+	if deps.Store != nil {
+		store = deps.Store
+	} else {
+		store, err = NewRuntimeStateStore(context.Background(), cfg, deps.StoreFactory)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &ServerRuntime{cfg: cfg, done: make(chan struct{}), ha: ha, store: store}, nil
 }

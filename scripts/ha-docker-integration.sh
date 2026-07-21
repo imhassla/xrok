@@ -66,6 +66,7 @@ selected_udp_a=""
 selected_tcp_b=""
 selected_udp_b=""
 up_duration_ms=0
+health_timings='{}'
 diagnostics_file="${HA_INTEGRATION_DIAGNOSTICS:-${artifact%.json}.diagnostics.log}"
 mkdir -p "$(dirname "$diagnostics_file")"
 failure_class=""
@@ -80,7 +81,7 @@ cleanup() {
   fi
   "${compose[@]}" down >/dev/null 2>&1 || true
   ended_at=$(date +%s)
-  ARTIFACT="$artifact" STATUS="$status" COMPOSE_FILE="$compose_file" DURATION="$((ended_at-started_at))" LOAD="$load_iterations" ATTEMPTS="$attempts" COLLISIONS="$collision_count" TCP_A="$selected_tcp_a" UDP_A="$selected_udp_a" TCP_B="$selected_tcp_b" UDP_B="$selected_udp_b" UP_MS="$up_duration_ms" HEALTH="$health" FAILURE_CLASS="$failure_class" LAST_ERROR_LOG="$last_error_log" LOG_DIR="$log_dir" DIAGNOSTICS="$diagnostics_file" python3 - <<'PY'
+  ARTIFACT="$artifact" STATUS="$status" COMPOSE_FILE="$compose_file" DURATION="$((ended_at-started_at))" LOAD="$load_iterations" ATTEMPTS="$attempts" COLLISIONS="$collision_count" TCP_A="$selected_tcp_a" UDP_A="$selected_udp_a" TCP_B="$selected_tcp_b" UDP_B="$selected_udp_b" UP_MS="$up_duration_ms" HEALTH="$health" HEALTH_TIMINGS="$health_timings" FAILURE_CLASS="$failure_class" LAST_ERROR_LOG="$last_error_log" LOG_DIR="$log_dir" DIAGNOSTICS="$diagnostics_file" python3 - <<'PY'
 import json, os
 out = {
   "status": os.environ["STATUS"], "compose": os.environ["COMPOSE_FILE"],
@@ -88,12 +89,13 @@ out = {
   "attempts": int(os.environ["ATTEMPTS"]), "collision_count": int(os.environ["COLLISIONS"]),
   "selected_ports": {"tcp_a": os.environ["TCP_A"], "udp_a": os.environ["UDP_A"], "tcp_b": os.environ["TCP_B"], "udp_b": os.environ["UDP_B"]},
   "compose_up_duration_ms": int(os.environ["UP_MS"]),
+  "health_check_timings_ms": json.loads(os.environ.get("HEALTH_TIMINGS", "{}")),
   "failure_class": os.environ.get("FAILURE_CLASS", ""),
   "last_error_log": os.environ.get("LAST_ERROR_LOG", ""),
   "attempt_log_dir": os.environ.get("LOG_DIR", ""),
   "diagnostics": os.environ.get("DIAGNOSTICS", ""),
   "service_health": json.loads(os.environ.get("HEALTH", "{}")),
-  "checks": ["redis_aof","redis_load","redis_failure","postgres_volume","postgres_load","postgres_failure","replica_restart","graceful_drain"],
+  "checks": ["redis_aof","redis_load","redis_failure","postgres_volume","postgres_load","postgres_failure","replica_restart","graceful_drain","xrok_health","xrok_ready","xrok_metrics"],
 }
 with open(os.environ["ARTIFACT"], "w") as f: json.dump(out, f, sort_keys=True); f.write("\n")
 PY
@@ -102,9 +104,15 @@ trap cleanup EXIT
 fail() { echo "HA Docker integration: FAIL: $*" >&2; exit 1; }
 wait_running() {
   local svc="$1" state=""
+  local check_started check_finished
+  check_started=$(now_ms)
   for _ in $(seq 1 "$retries"); do
     state=$(${compose[@]} ps --format '{{.Service}} {{.State}}' "$svc" 2>/dev/null || true)
-    [[ "$state" == *running* || "$state" == *Up* ]] && return 0
+    if [[ "$state" == *running* || "$state" == *Up* ]]; then
+      check_finished=$(now_ms)
+      health_timings=$(SVC="$svc" ELAPSED="$((check_finished-check_started))" PREV="$health_timings" python3 -c 'import json,os; d=json.loads(os.environ["PREV"]); d[os.environ["SVC"]]=int(os.environ["ELAPSED"]); print(json.dumps(d,separators=(",",":")))')
+      return 0
+    fi
     sleep "$interval"
   done
   failure_class="health"
@@ -115,6 +123,20 @@ wait_running() {
     last_error_log="$current_attempt_dir/health.err"
   fi
   fail "$svc did not become running (state: ${state:-unknown})"
+}
+
+check_http_endpoint() {
+  local name="$1" port="$2" path="$3" expected="$4"
+  local url="https://127.0.0.1:${port}${path}" body="" code=""
+  local started finished elapsed
+  started=$(now_ms)
+  if command -v curl >/dev/null 2>&1; then
+    body=$(curl -ksS --max-time "${HA_HTTP_TIMEOUT:-5}" -H "Authorization: Bearer ${XROK_API_TOKEN:-local-ha-token}" -w '\n%{http_code}' "$url" 2>/dev/null || true)
+    code="${body##*$'\n'}"; body="${body%$'\n'*}"
+  fi
+  finished=$(now_ms); elapsed=$((finished-started))
+  health_timings=$(NAME="$name" ELAPSED="$elapsed" CODE="$code" PREV="$health_timings" python3 -c 'import json,os; d=json.loads(os.environ["PREV"]); d[os.environ["NAME"]]={"latency_ms":int(os.environ["ELAPSED"]),"status_code":os.environ["CODE"]}; print(json.dumps(d,separators=(",",":")))')
+  [[ "$code" == "$expected" ]] || fail "$name endpoint unhealthy (code=${code:-unavailable})"
 }
 
 up_attempts="${HA_COMPOSE_UP_RETRIES:-5}"
@@ -178,6 +200,16 @@ for attempt in $(seq 1 "$up_attempts"); do
 done
 [[ "$up_ok" == 1 ]] || fail "compose up failed after $up_attempts attempts (class=${failure_class:-unknown}; see ${last_error_log:-$log_dir})"
 for svc in redis postgres xrok-a xrok-b; do wait_running "$svc"; done
+# Assert the actual xrok HTTP readiness path, not just container state. Metrics
+# is authenticated and therefore also validates API token wiring.
+check_http_endpoint "xrok_a_health" "$XROK_HA_PORT_A" "/health" 200
+check_http_endpoint "xrok_a_ready" "$XROK_HA_PORT_A" "/ready" 200
+check_http_endpoint "xrok_b_health" "$XROK_HA_PORT_B" "/health" 200
+check_http_endpoint "xrok_b_ready" "$XROK_HA_PORT_B" "/ready" 200
+if [[ "${HA_ASSERT_METRICS:-1}" == "1" ]]; then
+  check_http_endpoint "xrok_a_metrics" "$XROK_HA_PORT_A" "/metrics" 200
+  check_http_endpoint "xrok_b_metrics" "$XROK_HA_PORT_B" "/metrics" 200
+fi
 
 # Redis AOF persistence check.
 "${compose[@]}" exec -T redis redis-cli SET xrok-ha-integration alive >/dev/null

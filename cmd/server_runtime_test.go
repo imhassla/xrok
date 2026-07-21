@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"xrok/cmd/config"
@@ -18,10 +19,35 @@ func TestRuntimeStateBackendSelection(t *testing.T) {
 		t.Fatalf("store=%T", r.StateStore())
 	}
 	c.StateBackend = "postgres"
-	c.PostgresDSN = "dsn"
+	c.PostgresDSN = "postgres://user:pass@localhost:5432/db?sslmode=disable"
 	r, err = NewServerRuntimeWithDeps(c, ServerRuntimeDeps{StoreFactory: StoreFactoryDeps{OpenSQL: func(_, _ string) (*sql.DB, error) { return nil, context.Canceled }}})
 	if err != context.Canceled {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPostgresBackendRequiresDriverContract(t *testing.T) {
+	c := config.ServerConfig{Domain: "test.local", StateBackend: "postgres", PostgresDSN: "postgres://user:pass@localhost:5432/db?sslmode=disable"}
+	_, err := NewServerRuntime(c)
+	if err == nil || !strings.Contains(err.Error(), "OpenSQL") {
+		t.Fatalf("err=%v, want explicit driver availability error", err)
+	}
+}
+
+func TestServerRuntimeUsesConfigBackendAndInjectedStore(t *testing.T) {
+	// A runtime embedded in a process must honor its explicit config even when
+	// the caller's environment requests another HA backend.
+	t.Setenv("XROK_HA_BACKEND", "redis")
+	store := NewInMemoryStateStore(8)
+	r, err := NewServerRuntimeWithDeps(config.ServerConfig{Domain: "test.local", StateBackend: "memory"}, ServerRuntimeDeps{Store: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.StateStore() != store {
+		t.Fatalf("store=%T, want injected store", r.StateStore())
+	}
+	if r.HAConfig().Backend != "memory" {
+		t.Fatalf("backend=%q, want memory", r.HAConfig().Backend)
 	}
 }
 
