@@ -155,6 +155,8 @@ func serverDepsFromGlobals() *ServerDeps {
 }
 
 var (
-	legacyClientRegistry = &ClientRegistry{m: serverClients}
-	legacyRouteRegistry  = &RouteRegistry{m: serverTunnelRoutes}
+	// Legacy registries are now the authoritative process-local stores. They
+	// retain their names for handlers that have not yet received ServerDeps.
+	legacyClientRegistry = NewClientRegistry()
+	legacyRouteRegistry  = NewRouteRegistry()
 )

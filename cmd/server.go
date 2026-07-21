@@ -136,16 +136,14 @@ type TunnelRoute struct {
 
 // Server globals
 var (
-	serverDebug        bool
-	serverClientCA     string
-	serverRequestLog   bool
-	serverClients      = make(map[string]*serverClientInfo)
-	serverClientsMutex sync.Mutex
-	serverDomain       string
-	serverCertFile     string
-	serverKeyFile      string
-	serverPort         = 443
-	serverUpgrader     = websocket.Upgrader{
+	serverDebug      bool
+	serverClientCA   string
+	serverRequestLog bool
+	serverDomain     string
+	serverCertFile   string
+	serverKeyFile    string
+	serverPort       = 443
+	serverUpgrader   = websocket.Upgrader{
 		CheckOrigin:       func(r *http.Request) bool { return true },
 		EnableCompression: true,
 	}
@@ -165,10 +163,6 @@ var (
 	serverShutdownChan = make(chan struct{})
 	serverWg           sync.WaitGroup
 
-	// Tunnel routing: subdomain -> TunnelRoute
-	serverTunnelRoutes      = make(map[string]*TunnelRoute)
-	serverTunnelRoutesMutex sync.RWMutex
-
 	serverBufferPool = sync.Pool{
 		New: func() interface{} {
 			buf := make([]byte, 32*1024)
@@ -180,15 +174,11 @@ var (
 // registry mutation helpers keep legacy map access behind one synchronization
 // boundary while allowing injected handlers to observe the same registry.
 func putServerClient(id string, c *serverClientInfo) {
-	serverClientsMutex.Lock()
 	legacyClientRegistry.Put(id, c)
-	serverClientsMutex.Unlock()
 }
 
 func deleteServerClient(id string) {
-	serverClientsMutex.Lock()
 	legacyClientRegistry.Delete(id)
-	serverClientsMutex.Unlock()
 }
 
 // Auth globals
@@ -817,7 +807,6 @@ func monitorServerClientActivity(clientID string, client *serverClientInfo) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		serverClientsMutex.Lock()
 		if time.Since(client.GetLastActivity()) > serverInactivityTimeout {
 			if serverDebug {
 				log.Printf("Client %s inactive, closing connections", clientID)
@@ -830,10 +819,8 @@ func monitorServerClientActivity(clientID string, client *serverClientInfo) {
 			go func() {
 				closeServerClientConnections(clientID, client)
 			}()
-			serverClientsMutex.Unlock()
 			return
 		}
-		serverClientsMutex.Unlock()
 	}
 }
 
@@ -883,8 +870,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clean up existing client if reconnecting (stateless behavior)
-	serverClientsMutex.Lock()
-	if existing, exists := serverClients[clientID]; exists {
+	if existing, exists := legacyClientRegistry.Get(clientID); exists {
 		// Clean up old tunnel routes
 		for _, t := range existing.tunnels {
 			legacyRouteRegistry.DeleteOwned(t.Name, clientID)
@@ -908,7 +894,6 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		log.Printf("Cleaned up existing client %s for reconnection", clientID)
 	}
-	serverClientsMutex.Unlock()
 
 	// Process tunnels
 	var tunnels []ServerTunnelConfig
@@ -1131,15 +1116,11 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 			case "/ready":
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				serverClientsMutex.Lock()
-				clientCount := len(serverClients)
-				serverClientsMutex.Unlock()
+				clientCount := legacyClientRegistry.Len()
 				w.Write([]byte(fmt.Sprintf(`{"status":"ready","clients":%d}`, clientCount)))
 				return
 			case "/stats":
-				serverClientsMutex.Lock()
-				clientCount := len(serverClients)
-				serverClientsMutex.Unlock()
+				clientCount := legacyClientRegistry.Len()
 				w.Header().Set("Content-Type", "text/plain")
 				w.WriteHeader(http.StatusOK)
 				w.Write([]byte("xrok Server Stats\n"))
@@ -1353,9 +1334,7 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 
 	clientID, sessionToken := parts[1], parts[2]
 
-	serverClientsMutex.Lock()
-	client, exists := serverClients[clientID]
-	serverClientsMutex.Unlock()
+	client, exists := legacyClientRegistry.Get(clientID)
 
 	if !exists || subtle.ConstantTimeCompare([]byte(sessionToken), []byte(client.sessionToken)) != 1 {
 		log.Printf("QUIC: Unknown client %s", clientID)
@@ -2166,11 +2145,9 @@ func waitForServerClientConnection(ctx context.Context, client *serverClientInfo
 			return nil
 		})
 
-		serverClientsMutex.Lock()
 		client.connMutex.Lock()
 		client.conn = wsConn
 		client.connMutex.Unlock()
-		serverClientsMutex.Unlock()
 		client.SetLastActivity(time.Now())
 
 		go func() {
@@ -2264,9 +2241,6 @@ func waitForServerClientConnection(ctx context.Context, client *serverClientInfo
 }
 
 func saveServerState() {
-	serverClientsMutex.Lock()
-	defer serverClientsMutex.Unlock()
-
 	state := struct {
 		Clients   map[string]serializableClientInfoForSave
 		UsedPorts map[int]bool
@@ -2275,7 +2249,7 @@ func saveServerState() {
 		UsedPorts: make(map[int]bool),
 	}
 
-	for id, client := range serverClients {
+	for id, client := range legacyClientRegistry.Snapshot() {
 		state.Clients[id] = serializableClientInfoForSave{
 			UDID:            client.UDID,
 			PortNoTLS:       client.PortNoTLS,
@@ -2328,7 +2302,6 @@ func loadServerState() {
 		return
 	}
 
-	serverClientsMutex.Lock()
 	for id, clientData := range state.Clients {
 		client := &serverClientInfo{
 			serializableClientInfo: serializableClientInfo{
@@ -2370,8 +2343,6 @@ func loadServerState() {
 			monitorServerClientActivity(id, client)
 		}(id, client)
 	}
-	serverClientsMutex.Unlock()
-
 	serverPortMutex.Lock()
 	for port, used := range state.UsedPorts {
 		serverUsedPorts[port] = used
@@ -2388,14 +2359,12 @@ func gracefulServerShutdown() {
 
 	close(serverShutdownChan)
 
-	serverClientsMutex.Lock()
-	for clientID, client := range serverClients {
+	for clientID, client := range legacyClientRegistry.Snapshot() {
 		log.Printf("Closing client %s", clientID)
 		if client.cancelFunc != nil {
 			client.cancelFunc()
 		}
 	}
-	serverClientsMutex.Unlock()
 
 	done := make(chan struct{})
 	go func() {
@@ -2422,9 +2391,7 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serverClientsMutex.Lock()
-	client, exists := serverClients[clientID]
-	serverClientsMutex.Unlock()
+	client, exists := legacyClientRegistry.Get(clientID)
 	if !exists {
 		http.Error(w, "Unknown client", http.StatusNotFound)
 		return
@@ -2670,9 +2637,7 @@ func serverClientWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	srvWsUpgrades.Inc()
 
-	serverClientsMutex.Lock()
-	client, exists := serverClients[clientID]
-	serverClientsMutex.Unlock()
+	client, exists := legacyClientRegistry.Get(clientID)
 	if !exists {
 		wsConn.Close()
 		return
@@ -2698,9 +2663,7 @@ func handleP2PWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serverClientsMutex.Lock()
-	client, exists := serverClients[clientID]
-	serverClientsMutex.Unlock()
+	client, exists := legacyClientRegistry.Get(clientID)
 
 	if !exists {
 		http.Error(w, "Client not found", http.StatusNotFound)
@@ -2758,9 +2721,7 @@ func handleP2PSignalRelay(fromClientID string, signal *p2p.SignalMessage) {
 	switch signal.Type {
 	case p2p.SignalTypeDiscover:
 		// Client wants to discover another peer
-		serverClientsMutex.Lock()
-		targetClient, exists := serverClients[signal.ToPeer]
-		serverClientsMutex.Unlock()
+		targetClient, exists := legacyClientRegistry.Get(signal.ToPeer)
 
 		if !exists {
 			sendP2PSignalToClient(fromClientID, p2p.NewFallbackSignal(
@@ -2778,9 +2739,7 @@ func handleP2PSignalRelay(fromClientID string, signal *p2p.SignalMessage) {
 		sendP2PSignalToClient(fromClientID, p2p.NewPeerInfoSignal(signal.ToPeer, targetClient.p2pInfo))
 
 		// Also notify target that someone wants to connect
-		serverClientsMutex.Lock()
-		fromClient, _ := serverClients[fromClientID]
-		serverClientsMutex.Unlock()
+		fromClient, _ := legacyClientRegistry.Get(fromClientID)
 
 		if fromClient != nil && fromClient.p2pInfo != nil {
 			sendP2PSignalToClient(signal.ToPeer, p2p.NewPeerInfoSignal(fromClientID, fromClient.p2pInfo))
@@ -2804,9 +2763,7 @@ func handleP2PSignalRelay(fromClientID string, signal *p2p.SignalMessage) {
 
 // sendP2PSignalToClient sends a P2P signal to a specific client
 func sendP2PSignalToClient(clientID string, signal *p2p.SignalMessage) {
-	serverClientsMutex.Lock()
-	client, exists := serverClients[clientID]
-	serverClientsMutex.Unlock()
+	client, exists := legacyClientRegistry.Get(clientID)
 
 	if !exists {
 		return
@@ -2845,9 +2802,7 @@ func handleP2PSignaling(w http.ResponseWriter, r *http.Request) {
 	switch signal.Type {
 	case p2p.SignalTypeDiscover:
 		// Return peer info for requested client
-		serverClientsMutex.Lock()
-		targetClient, exists := serverClients[signal.ToPeer]
-		serverClientsMutex.Unlock()
+		targetClient, exists := legacyClientRegistry.Get(signal.ToPeer)
 
 		if !exists || targetClient.p2pInfo == nil {
 			w.Header().Set("Content-Type", "application/json")
@@ -2861,9 +2816,7 @@ func handleP2PSignaling(w http.ResponseWriter, r *http.Request) {
 
 	case p2p.SignalTypePunch:
 		// Acknowledge punch signal - actual hole punching is client-side
-		serverClientsMutex.Lock()
-		_, exists := serverClients[signal.ToPeer]
-		serverClientsMutex.Unlock()
+		_, exists := legacyClientRegistry.Get(signal.ToPeer)
 
 		if !exists {
 			http.Error(w, "Peer not found", http.StatusNotFound)
@@ -2887,11 +2840,8 @@ func handleP2PClients(w http.ResponseWriter, r *http.Request) {
 		HasSignal  bool          `json:"has_signal"`
 	}
 
-	serverClientsMutex.Lock()
-	defer serverClientsMutex.Unlock()
-
 	clients := make([]clientInfo, 0)
-	for id, client := range serverClients {
+	for id, client := range legacyClientRegistry.Snapshot() {
 		tunnels := make([]string, 0)
 		for _, t := range client.tunnels {
 			tunnels = append(tunnels, t.Name)
@@ -2920,10 +2870,8 @@ func handleP2PDiscoverTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serverClientsMutex.Lock()
-	fromClient, fromExists := serverClients[from]
-	toClient, toExists := serverClients[to]
-	serverClientsMutex.Unlock()
+	fromClient, fromExists := legacyClientRegistry.Get(from)
+	toClient, toExists := legacyClientRegistry.Get(to)
 
 	if !fromExists || !toExists {
 		http.Error(w, "Client not found", http.StatusNotFound)
@@ -2970,9 +2918,7 @@ func handleP2PTunnelOwner(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get client P2P info
-	serverClientsMutex.Lock()
-	client, clientExists := serverClients[route.ClientID]
-	serverClientsMutex.Unlock()
+	client, clientExists := serverDepsFromRequest(r).Clients.Get(route.ClientID)
 
 	response := map[string]interface{}{
 		"tunnel":      tunnelName,
