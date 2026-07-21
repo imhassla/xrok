@@ -7,6 +7,15 @@ set -euo pipefail
 
 compose_file="${XROK_HA_COMPOSE_FILE:-compose.ha.local.yml}"
 artifact="${HA_INTEGRATION_ARTIFACT:-.artifacts/ha-integration.json}"
+cert_dir="${XROK_CERT_DIR:-local-certs}"
+if [[ ! -s "$cert_dir/server.pem" || ! -s "$cert_dir/server-key.pem" ]]; then
+  if command -v openssl >/dev/null 2>&1; then
+    mkdir -p "$cert_dir"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+      -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+      -keyout "$cert_dir/server-key.pem" -out "$cert_dir/server.pem" >/dev/null 2>&1
+  fi
+fi
 log_dir="${HA_INTEGRATION_LOG_DIR:-$(dirname "$artifact")/ha-integration-attempts}"
 project="${COMPOSE_PROJECT_NAME:-}"
 compose=()

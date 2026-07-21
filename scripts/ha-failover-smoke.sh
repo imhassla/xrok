@@ -7,6 +7,12 @@ set -euo pipefail
 compose_file="${XROK_HA_COMPOSE_FILE:-compose.ha.local.yml}"
 project="${COMPOSE_PROJECT_NAME:-xrok-ha-smoke-$RANDOM-$$}"
 compose=(docker compose -p "$project" -f "$compose_file")
+if [[ ! -s local-certs/server.pem || ! -s local-certs/server-key.pem ]] && command -v openssl >/dev/null 2>&1; then
+  mkdir -p local-certs
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+    -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+    -keyout local-certs/server-key.pem -out local-certs/server.pem >/dev/null 2>&1
+fi
 retries="${HA_SMOKE_RETRIES:-30}"
 interval="${HA_SMOKE_INTERVAL:-2}"
 up_attempts="${HA_SMOKE_UP_ATTEMPTS:-5}"
@@ -18,7 +24,7 @@ wait_running() {
   local svc="$1" state=""
   for _ in $(seq 1 "$retries"); do
     state=$("${compose[@]}" ps --format '{{.Service}} {{.State}}' "$svc" 2>/dev/null || true)
-    [[ "$state" == *"running"* ]] && return 0
+    [[ "$state" == *"running"* || "$state" == *"Up"* ]] && return 0
     sleep "$interval"
   done
   fail "$svc did not become running within $((retries * interval))s (state: ${state:-unknown})"
