@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench e2e check
+.PHONY: build test race vet bench e2e fuzz security check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -15,6 +15,11 @@ race:
 
 vet:
 	$(GO_ENV) go vet ./...
+
+fuzz:
+	$(GO_ENV) go test ./cmd/config ./cmd/p2p -run '^$$' -fuzz=Fuzz -fuzztime=10s
+
+security: vet fuzz
 
 bench:
 	$(GO_ENV) go test -run '^$$' -bench=. -benchmem ./...

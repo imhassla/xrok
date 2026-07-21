@@ -7,6 +7,8 @@ package p2p
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"time"
@@ -37,6 +39,16 @@ type ICEConfig struct {
 	STUNServer    string
 	Relay         RelayProvider
 	GatherTimeout time.Duration
+	// DialUDP allows deterministic tests and custom transports. When nil,
+	// net.DialUDP is used.
+	DialUDP func(network string, laddr, raddr *net.UDPAddr) (udpConn, error)
+}
+
+type udpConn interface {
+	Write([]byte) (int, error)
+	Read([]byte) (int, error)
+	SetReadDeadline(time.Time) error
+	Close() error
 }
 
 type ICEAgent struct{ cfg ICEConfig }
@@ -51,7 +63,7 @@ func NewICEAgent(cfg ICEConfig) *ICEAgent {
 // GatherCandidates always returns host candidates and optionally a server
 // reflexive candidate. Failure to reach STUN is non-fatal.
 func (a *ICEAgent) GatherCandidates(ctx context.Context) ([]Candidate, error) {
-	_, cancel := context.WithTimeout(ctx, a.cfg.GatherTimeout)
+	deadline, cancel := context.WithTimeout(ctx, a.cfg.GatherTimeout)
 	defer cancel()
 	var out []Candidate
 	ifaces, err := net.Interfaces()
@@ -70,7 +82,76 @@ func (a *ICEAgent) GatherCandidates(ctx context.Context) ([]Candidate, error) {
 	if len(out) == 0 {
 		out = append(out, Candidate{ID: "host-loopback", Type: CandidateHost, Addr: "127.0.0.1", Priority: 126})
 	}
+	if a.cfg.STUNServer != "" {
+		if c, err := a.gatherSrflx(deadline); err == nil {
+			out = append(out, c)
+		}
+	}
 	return out, nil
+}
+
+// GatherRelay obtains a TURN allocation through the injected provider. TURN
+// failures are returned to the caller so deployments can choose whether to
+// fall back to host/srflx candidates.
+func (a *ICEAgent) GatherRelay(ctx context.Context, peerID string) (net.Conn, Candidate, error) {
+	if a.cfg.Relay == nil {
+		return nil, Candidate{}, fmt.Errorf("TURN relay provider is not configured")
+	}
+	return a.cfg.Relay.Allocate(ctx, peerID)
+}
+
+func (a *ICEAgent) gatherSrflx(ctx context.Context) (Candidate, error) {
+	addr, err := net.ResolveUDPAddr("udp", a.cfg.STUNServer)
+	if err != nil {
+		// Deterministic/in-memory dialers do not need DNS resolution. Allow
+		// them to exercise STUN parsing with synthetic hostnames in tests.
+		if a.cfg.DialUDP == nil {
+			return Candidate{}, err
+		}
+		addr = &net.UDPAddr{IP: net.IPv4zero, Port: 3478}
+	}
+	dial := a.cfg.DialUDP
+	if dial == nil {
+		dial = func(n string, l, r *net.UDPAddr) (udpConn, error) { return net.DialUDP(n, l, r) }
+	}
+	c, err := dial("udp", nil, addr)
+	if err != nil {
+		return Candidate{}, err
+	}
+	defer c.Close()
+	var tx [12]byte
+	_, _ = rand.Read(tx[:])
+	p := make([]byte, 20)
+	binary.BigEndian.PutUint16(p, 0x0001)
+	binary.BigEndian.PutUint16(p[2:], 0)
+	binary.BigEndian.PutUint32(p[4:], 0x2112A442)
+	copy(p[8:], tx[:])
+	if _, err = c.Write(p); err != nil {
+		return Candidate{}, err
+	}
+	_ = c.SetReadDeadline(time.Now().Add(a.cfg.GatherTimeout))
+	b := make([]byte, 1500)
+	n, err := c.Read(b)
+	if err != nil {
+		return Candidate{}, err
+	}
+	if n < 20 || binary.BigEndian.Uint16(b) != 0x0101 {
+		return Candidate{}, fmt.Errorf("invalid STUN response")
+	}
+	for off := 20; off+4 <= n; {
+		typ, ln := binary.BigEndian.Uint16(b[off:]), int(binary.BigEndian.Uint16(b[off+2:]))
+		off += 4
+		if off+ln > n {
+			break
+		}
+		if typ == 0x0020 && ln >= 8 {
+			port := binary.BigEndian.Uint16(b[off+2:]) ^ 0x2112
+			ip := net.IPv4(b[off+4]^0x21, b[off+5]^0x12, b[off+6]^0xA4, b[off+7]^0x42)
+			return Candidate{ID: "srflx-" + ip.String(), Type: CandidateSrflx, Addr: net.JoinHostPort(ip.String(), fmt.Sprint(port)), Priority: 100}, nil
+		}
+		off += ln
+	}
+	return Candidate{}, fmt.Errorf("STUN mapped address not found")
 }
 
 func (a *ICEAgent) Select(local, remote []Candidate) (Candidate, Candidate, error) {

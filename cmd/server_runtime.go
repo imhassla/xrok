@@ -20,6 +20,8 @@ type ServerRuntime struct {
 	stop  sync.Once
 	done  chan struct{}
 	run   func([]string)
+	store RuntimeStateStore
+	drain DrainController
 }
 
 func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
@@ -32,7 +34,8 @@ func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
 // ServerRuntimeDeps allows embedders and tests to inject the serving loop.
 // When Run is nil, the legacy CLI runner is used for backwards compatibility.
 type ServerRuntimeDeps struct {
-	Run func([]string)
+	Run   func([]string)
+	Store RuntimeStateStore
 }
 
 func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error) {
@@ -41,6 +44,7 @@ func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (
 		return nil, err
 	}
 	r.run = deps.Run
+	r.store = deps.Store
 	return r, nil
 }
 
@@ -77,6 +81,7 @@ func (r *ServerRuntime) Start(ctx context.Context) error {
 }
 
 func (r *ServerRuntime) Shutdown() {
+	_ = r.drain.Drain(context.Background())
 	r.stop.Do(func() {
 		select {
 		case <-serverShutdownChan:
@@ -85,6 +90,9 @@ func (r *ServerRuntime) Shutdown() {
 		}
 	})
 }
+
+func (r *ServerRuntime) StateStore() RuntimeStateStore { return r.store }
+func (r *ServerRuntime) AddDrainHook(h DrainHook)      { r.drain.Add(h) }
 
 func (r *ServerRuntime) Wait() { <-r.done }
 
