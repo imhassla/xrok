@@ -101,6 +101,11 @@ type ServerConfig struct {
 	// mTLS: CA certificate for verifying client certificates
 	ClientCAPath string `yaml:"client_ca_path,omitempty"`
 	Insecure     bool   `yaml:"insecure,omitempty"`
+	// StateBackend selects the runtime control-plane store: memory, redis, or postgres.
+	StateBackend  string `yaml:"state_backend,omitempty"`
+	RedisAddr     string `yaml:"redis_addr,omitempty"`
+	RedisPassword string `yaml:"redis_password,omitempty"`
+	PostgresDSN   string `yaml:"postgres_dsn,omitempty"`
 }
 
 // CurrentVersion is the on-disk configuration schema version.
@@ -119,7 +124,13 @@ func MigrateClientConfig(c *ClientConfig) {
 // MigrateServerConfig upgrades legacy configs in memory and is idempotent.
 func MigrateServerConfig(c *ServerConfig) {
 	if c.Version < CurrentVersion {
+		if c.StateBackend == "" {
+			c.StateBackend = "memory"
+		}
 		c.Version = CurrentVersion
+	}
+	if c.StateBackend == "" {
+		c.StateBackend = "memory"
 	}
 }
 
@@ -144,6 +155,19 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.MetricsPort < 0 || c.MetricsPort > 65535 {
 		return fmt.Errorf("metrics_port must be between 0 and 65535")
+	}
+	switch c.StateBackend {
+	case "", "memory":
+	case "redis":
+		if c.RedisAddr == "" {
+			return fmt.Errorf("redis state backend requires redis_addr")
+		}
+	case "postgres":
+		if c.PostgresDSN == "" {
+			return fmt.Errorf("postgres state backend requires postgres_dsn")
+		}
+	default:
+		return fmt.Errorf("unsupported state_backend %q (want memory, redis, or postgres)", c.StateBackend)
 	}
 	// Empty certificate paths are valid: the server derives the Let's Encrypt
 	// paths from domain, or the CLI can supply them after loading this config.
@@ -170,15 +194,16 @@ func DefaultClientConfig() *ClientConfig {
 // DefaultServerConfig returns default server configuration
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Port:        7645,
-		ProxyPort:   443,
-		MetricsPort: 9090,
-		Debug:       false,
-		Quiet:       false,
-		Verbose:     false,
-		RateLimit:   0, // unlimited
-		RequestLog:  false,
-		Compress:    false,
+		Port:         7645,
+		ProxyPort:    443,
+		MetricsPort:  9090,
+		Debug:        false,
+		Quiet:        false,
+		Verbose:      false,
+		RateLimit:    0, // unlimited
+		RequestLog:   false,
+		Compress:     false,
+		StateBackend: "memory",
 		HealthCheck: HealthCheckConfig{
 			Enabled:  true,
 			Interval: 30 * time.Second,

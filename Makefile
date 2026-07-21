@@ -30,6 +30,10 @@ api-compat:
 ci-local:
 	./scripts/ci-local.sh
 
+# Requires Docker; reports SKIP (success) when no daemon is available.
+ha-integration:
+	./scripts/ha-docker-integration.sh
+
 bench:
 	$(GO_ENV) go test -run '^$$' -bench=. -benchmem ./...
 

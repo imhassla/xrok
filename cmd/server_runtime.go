@@ -26,6 +26,10 @@ type ServerRuntime struct {
 }
 
 func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
+	return NewServerRuntimeWithDeps(cfg, ServerRuntimeDeps{})
+}
+
+func newServerRuntime(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -33,23 +37,30 @@ func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ServerRuntime{cfg: cfg, done: make(chan struct{}), ha: ha}, nil
+	store, err := NewRuntimeStateStore(context.Background(), cfg, deps.StoreFactory)
+	if err != nil {
+		return nil, err
+	}
+	return &ServerRuntime{cfg: cfg, done: make(chan struct{}), ha: ha, store: store}, nil
 }
 
 // ServerRuntimeDeps allows embedders and tests to inject the serving loop.
 // When Run is nil, the legacy CLI runner is used for backwards compatibility.
 type ServerRuntimeDeps struct {
-	Run   func([]string)
-	Store RuntimeStateStore
+	Run          func([]string)
+	Store        RuntimeStateStore
+	StoreFactory StoreFactoryDeps
 }
 
 func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error) {
-	r, err := NewServerRuntime(cfg)
+	r, err := newServerRuntime(cfg, deps)
 	if err != nil {
 		return nil, err
 	}
 	r.run = deps.Run
-	r.store = deps.Store
+	if deps.Store != nil {
+		r.store = deps.Store
+	}
 	return r, nil
 }
 

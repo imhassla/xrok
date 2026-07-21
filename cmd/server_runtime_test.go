@@ -2,10 +2,28 @@ package cmd
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"xrok/cmd/config"
 )
+
+func TestRuntimeStateBackendSelection(t *testing.T) {
+	c := config.ServerConfig{Domain: "test.local", StateBackend: "redis", RedisAddr: "127.0.0.1:6379"}
+	r, err := NewServerRuntime(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.StateStore().(*RedisStateStore); !ok {
+		t.Fatalf("store=%T", r.StateStore())
+	}
+	c.StateBackend = "postgres"
+	c.PostgresDSN = "dsn"
+	r, err = NewServerRuntimeWithDeps(c, ServerRuntimeDeps{StoreFactory: StoreFactoryDeps{OpenSQL: func(_, _ string) (*sql.DB, error) { return nil, context.Canceled }}})
+	if err != context.Canceled {
+		t.Fatalf("err=%v", err)
+	}
+}
 
 func TestServerRuntimeValidationAndArgs(t *testing.T) {
 	if _, err := NewServerRuntime(config.ServerConfig{}); err == nil {
