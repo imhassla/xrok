@@ -47,6 +47,8 @@ type SOCKS5Server struct {
 	clientConn func(target string) (net.Conn, error) // Function to establish connection through tunnel
 	wg         sync.WaitGroup
 	done       chan struct{}
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 // NewSOCKS5Server creates a new SOCKS5 server
@@ -89,14 +91,12 @@ func (s *SOCKS5Server) Serve() error {
 
 // Close shuts down the SOCKS5 server
 func (s *SOCKS5Server) Close() error {
-	select {
-	case <-s.done:
-	default:
+	s.closeOnce.Do(func() {
 		close(s.done)
-	}
-	err := s.listener.Close()
+		s.closeErr = s.listener.Close()
+	})
 	s.wg.Wait()
-	return err
+	return s.closeErr
 }
 
 func (s *SOCKS5Server) handleConnection(conn net.Conn) {
