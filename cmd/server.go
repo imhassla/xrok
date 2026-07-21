@@ -1254,27 +1254,22 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 	}
 }
 
-func serverStatusHandler(w http.ResponseWriter, _ *http.Request) {
-	serverClientsMutex.Lock()
-	clients := len(serverClients)
-	serverClientsMutex.Unlock()
-
-	serverTunnelRoutesMutex.RLock()
-	tunnels := make([]TunnelStatus, 0, len(serverTunnelRoutes))
-	for _, route := range serverTunnelRoutes {
+func serverStatusHandler(w http.ResponseWriter, r *http.Request) {
+	deps := serverDepsFromRequest(r)
+	clients := deps.Clients.Len()
+	tunnels := make([]TunnelStatus, 0)
+	for _, route := range deps.Routes.Snapshot() {
 		tunnels = append(tunnels, TunnelStatus{
 			Name:     route.TunnelName,
 			Target:   route.Target,
-			URL:      fmt.Sprintf("https://%s.%s", route.TunnelName, serverDomain),
+			URL:      fmt.Sprintf("https://%s.%s", route.TunnelName, deps.Domain),
 			ClientID: route.ClientID,
 		})
 	}
-	serverTunnelRoutesMutex.RUnlock()
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ServerStatus{
 		Status:  "healthy",
-		Uptime:  time.Since(serverStartTime).Round(time.Second).String(),
+		Uptime:  time.Since(deps.StartTime).Round(time.Second).String(),
 		Version: "2.0.0",
 		Clients: clients,
 		Tunnels: tunnels,
