@@ -481,7 +481,7 @@ func RunClient(args []string) {
 		}
 	}
 
-	if len(tunnelConfigs) == 0 && *folderPath == "" && !*useProxy && *socks5Addr == "" && len(udpTunnels) == 0 {
+	if len(tunnelConfigs) == 0 && *folderPath == "" && !*useProxy && *socks5Addr == "" && len(udpTunnels) == 0 && len(reverseTunnels) == 0 {
 		clientLog.Error("Specify --tunnel, --port, --folder, --socks5, or --udp to expose a service.")
 		clientLog.Info("Examples:")
 		clientLog.Info("  --tunnel app:localhost:8080")

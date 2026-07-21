@@ -153,6 +153,74 @@ func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
 	}
 }
 
+func TestReverseTCPRelayEndToEnd(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	caFile, certFile, keyFile := generateTestPKI(t, tmp)
+	binary := filepath.Join(tmp, "xrok")
+	run(t, root, nil, "go", "build", "-o", binary, ".")
+
+	local, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	go func() {
+		conn, acceptErr := local.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(conn, conn)
+	}()
+	serverPort := freePort(t)
+	remotePort := freePort(t)
+	token := "e2e-reverse-token"
+	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
+		"server", "--domain", "localhost", "--port", fmt.Sprint(serverPort),
+		"--tls-cert", certFile, "--tls-key", keyFile,
+		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
+	defer stopProcess(t, server)
+	tlsClient := newTLSClient(t, caFile)
+	waitFor(t, 10*time.Second, func() bool {
+		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", serverPort))
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+	client := startProcess(t, tmp, nil, binary,
+		"client", "--server", "localhost", "--rp", fmt.Sprint(serverPort), "--ca-cert", caFile,
+		"--token", token, "--id", "reverse-client", "-R", fmt.Sprintf("%d:%s", remotePort, local.Addr()),
+		"--retry-interval", "50ms", "--max-interval", "250ms")
+	defer stopProcess(t, client)
+
+	var conn net.Conn
+	waitFor(t, 15*time.Second, func() bool {
+		candidate, dialErr := net.DialTimeout("tcp4", fmt.Sprintf("127.0.0.1:%d", remotePort), 200*time.Millisecond)
+		if dialErr != nil {
+			return false
+		}
+		conn = candidate
+		return true
+	})
+	defer conn.Close()
+	if _, err := conn.Write([]byte("reverse-payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(io.LimitReader(conn, int64(len("reverse-payload"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "reverse-payload" {
+		t.Fatalf("unexpected reverse response: %q", got)
+	}
+}
+
 func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
