@@ -27,6 +27,8 @@ type ClientConfig struct {
 	LogFile   string            `yaml:"log_file,omitempty"`
 	// Transport protocol: "websocket" (default), "quic"
 	Transport string `yaml:"transport,omitempty"`
+	// ConnectionType is a deprecated alias retained for older examples.
+	ConnectionType string `yaml:"connection_type,omitempty"`
 	// P2P configuration
 	P2P P2PConfig `yaml:"p2p,omitempty"`
 	// HTTP CONNECT proxy for corporate environments

@@ -43,6 +43,20 @@ type TunnelConfig struct {
 // tunnelFlag implements flag.Value for multiple --tunnel flags
 type tunnelFlag []TunnelConfig
 
+type headerFlag map[string]string
+
+func (h headerFlag) String() string { return fmt.Sprintf("%v", map[string]string(h)) }
+
+func (h headerFlag) Set(value string) error {
+	name, headerValue, ok := strings.Cut(value, ":")
+	name, headerValue = strings.TrimSpace(name), strings.TrimSpace(headerValue)
+	if !ok || name == "" || strings.ContainsAny(name+headerValue, "\r\n") {
+		return fmt.Errorf("invalid header %q, expected Name: Value", value)
+	}
+	h[http.CanonicalHeaderKey(name)] = headerValue
+	return nil
+}
+
 func (t *tunnelFlag) String() string {
 	return fmt.Sprintf("%v", *t)
 }
@@ -260,6 +274,7 @@ func RunClient(args []string) {
 	fs.IntVar(&clientRp, "rp", 443, "Port for client registration")
 	serverAddr := fs.String("server", "", "server name (required)")
 	useProxy := fs.Bool("proxy", false, "use local HTTP proxy")
+	proxyAddr := fs.String("proxy-addr", "127.0.0.1:8080", "Local HTTP proxy listen address")
 	useTLS := fs.Bool("tls", true, "use TLS for connections")
 	fs.BoolVar(&clientDebug, "debug", false, "Enable debug logging")
 	fs.StringVar(&clientID, "id", "", "Custom client ID for registration")
@@ -272,6 +287,8 @@ func RunClient(args []string) {
 	// Multiple tunnels support
 	var tunnels tunnelFlag
 	fs.Var(&tunnels, "tunnel", "Tunnel specification: name:target (can be used multiple times, e.g., --tunnel app:localhost:8080 --tunnel api:localhost:3000)")
+	headers := headerFlag{}
+	fs.Var(headers, "header", "Custom upstream header Name:Value (repeatable)")
 
 	// UDP tunnels support
 	var udpTunnels udpFlag
@@ -365,7 +382,7 @@ func RunClient(args []string) {
 			*enableCompress = cfg.Compress
 		}
 		// Apply transport from config
-		if cfg.Transport == "quic" && !*useQUIC {
+		if (cfg.Transport == "quic" || cfg.ConnectionType == "quic") && !*useQUIC {
 			*useQUIC = true
 		}
 		// Apply TLS setting from config (CLI can override)
@@ -448,10 +465,20 @@ func RunClient(args []string) {
 	// Add tunnels from --tunnel flags
 	tunnelConfigs = append(tunnelConfigs, tunnels...)
 
-	// Auto-create tunnel for --folder if no tunnel specified
-	if *folderPath != "" && len(tunnelConfigs) == 0 {
-		// Will be updated with actual port later
-		tunnelConfigs = append(tunnelConfigs, TunnelConfig{Name: clientID, Target: "folder-placeholder"})
+	// File sharing owns exactly one tunnel and replaces its target with the local file server.
+	if *folderPath != "" {
+		if len(tunnelConfigs) > 1 {
+			clientLog.Error("--folder supports exactly one tunnel")
+			os.Exit(1)
+		}
+		if clientID == "" {
+			clientID = fmt.Sprintf("files-%08x", rand.Uint32())
+		}
+		if len(tunnelConfigs) == 0 {
+			tunnelConfigs = append(tunnelConfigs, TunnelConfig{Name: clientID, Target: "folder-placeholder"})
+		} else {
+			tunnelConfigs[0].Target = "folder-placeholder"
+		}
 	}
 
 	if len(tunnelConfigs) == 0 && *folderPath == "" && !*useProxy && *socks5Addr == "" && len(udpTunnels) == 0 {
@@ -492,8 +519,17 @@ func RunClient(args []string) {
 	if *configFile != "" {
 		cfg, _ := loadClientConfigFile(*configFile)
 		if cfg != nil {
-			customHeaders = cfg.Headers
+			customHeaders = make(map[string]string, len(cfg.Headers)+len(headers))
+			for key, value := range cfg.Headers {
+				customHeaders[http.CanonicalHeaderKey(key)] = value
+			}
 		}
+	}
+	if customHeaders == nil {
+		customHeaders = make(map[string]string, len(headers))
+	}
+	for key, value := range headers {
+		customHeaders[key] = value
 	}
 
 	clientStateMutex.Lock()
@@ -605,14 +641,10 @@ func RunClient(args []string) {
 		clientStateMutex.Lock()
 		clientState_.LocalPort = folderAddr
 		// Update TunnelMap with actual folder server port
-		if clientState_.TunnelMap[clientID] == "folder-placeholder" {
-			clientState_.TunnelMap[clientID] = folderAddr
-			// Also update the Tunnels slice
-			for i := range clientState_.Tunnels {
-				if clientState_.Tunnels[i].Name == clientID && clientState_.Tunnels[i].Target == "folder-placeholder" {
-					clientState_.Tunnels[i].Target = folderAddr
-					break
-				}
+		for i := range clientState_.Tunnels {
+			if clientState_.Tunnels[i].Target == "folder-placeholder" {
+				clientState_.Tunnels[i].Target = folderAddr
+				clientState_.TunnelMap[clientState_.Tunnels[i].Name] = folderAddr
 			}
 		}
 		clientStateMutex.Unlock()
@@ -625,14 +657,10 @@ func RunClient(args []string) {
 	}
 
 	if *useProxy {
-		port, err := getRandomFreePort(8000, 9000)
-		if err != nil {
-			log.Fatalf("Failed to find a free port: %v", err)
-		}
 		wg.Add(1)
-		go startLocalProxy(ctx, port, "127.0.0.1", &wg)
+		go startLocalProxy(ctx, *proxyAddr, &wg)
 		clientStateMutex.Lock()
-		clientState_.LocalPort = fmt.Sprintf("127.0.0.1:%d", port)
+		clientState_.LocalPort = *proxyAddr
 		clientStateMutex.Unlock()
 	}
 
@@ -641,32 +669,7 @@ func RunClient(args []string) {
 	if *socks5Addr != "" {
 		// Dial function that routes through the tunnel
 		dialFunc := func(target string) (net.Conn, error) {
-			clientStateMutex.Lock()
-			session := clientState_.MuxSession
-			clientStateMutex.Unlock()
-
-			if session == nil {
-				return nil, fmt.Errorf("no tunnel connection available")
-			}
-
-			stream, err := session.Open()
-			if err != nil {
-				return nil, fmt.Errorf("failed to open mux stream: %w", err)
-			}
-
-			// Send SOCKS5 dynamic connection header
-			// Format: 0xFF (marker) + length (1 byte) + target string
-			header := make([]byte, 2+len(target))
-			header[0] = 0xFF // Special marker for SOCKS5/dynamic connections
-			header[1] = byte(len(target))
-			copy(header[2:], target)
-
-			if _, err := stream.Write(header); err != nil {
-				stream.Close()
-				return nil, fmt.Errorf("failed to send target header: %w", err)
-			}
-
-			return stream, nil
+			return openDynamicStream(target)
 		}
 
 		var err error
@@ -826,10 +829,36 @@ func serveFolderLocally(ctx context.Context, folderPath string, localPort string
 	}
 }
 
-func startLocalProxy(ctx context.Context, port int, host string, wg *sync.WaitGroup) {
-	defer wg.Done()
+func openDynamicStream(target string) (net.Conn, error) {
+	if len(target) == 0 || len(target) > 255 {
+		return nil, fmt.Errorf("invalid dynamic target length")
+	}
+	clientStateMutex.Lock()
+	state := clientState_
+	var session *yamux.Session
+	if state != nil {
+		session = state.MuxSession
+	}
+	clientStateMutex.Unlock()
+	if session == nil {
+		return nil, fmt.Errorf("no tunnel connection available")
+	}
+	stream, err := session.Open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open mux stream: %w", err)
+	}
+	header := make([]byte, 2+len(target))
+	header[0], header[1] = 0xFF, byte(len(target))
+	copy(header[2:], target)
+	if _, err := stream.Write(header); err != nil {
+		stream.Close()
+		return nil, fmt.Errorf("failed to send dynamic target: %w", err)
+	}
+	return stream, nil
+}
 
-	localAddr := fmt.Sprintf("%s:%d", host, port)
+func startLocalProxy(ctx context.Context, localAddr string, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	client := &http.Client{
 		Timeout: 30 * time.Second,
@@ -838,12 +867,43 @@ func startLocalProxy(ctx context.Context, port int, host string, wg *sync.WaitGr
 			MaxIdleConns:        1000,
 			MaxIdleConnsPerHost: 100,
 			IdleConnTimeout:     120 * time.Second,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return openDynamicStream(addr)
+			},
 		},
 	}
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect {
+			proxyConn, err := openDynamicStream(r.Host)
+			if err != nil {
+				http.Error(w, "Failed to connect", http.StatusBadGateway)
+				return
+			}
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				proxyConn.Close()
+				http.Error(w, "Hijacking unsupported", http.StatusInternalServerError)
+				return
+			}
+			clientConn, _, err := hijacker.Hijack()
+			if err != nil {
+				proxyConn.Close()
+				return
+			}
+			_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+			go func() {
+				defer clientConn.Close()
+				defer proxyConn.Close()
+				done := make(chan struct{}, 2)
+				go func() { _, _ = io.Copy(proxyConn, clientConn); done <- struct{}{} }()
+				go func() { _, _ = io.Copy(clientConn, proxyConn); done <- struct{}{} }()
+				<-done
+			}()
+			return
+		}
 		if clientDebug {
 			log.Printf("Proxying request: %s %s", r.Method, r.URL.String())
 		}

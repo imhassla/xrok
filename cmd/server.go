@@ -551,6 +551,28 @@ func injectHeaders(requestData []byte, headers map[string]string) []byte {
 		return requestData
 	}
 
+	// Remove existing values first so a policy header cannot be bypassed by
+	// sending a second value with different casing.
+	lines := strings.Split(requestStr, "\r\n")
+	blocked := make(map[string]struct{}, len(headers))
+	for key := range headers {
+		blocked[strings.ToLower(strings.TrimSpace(key))] = struct{}{}
+	}
+	filtered := make([]string, 0, len(lines))
+	for i, line := range lines {
+		if i == 0 || line == "" {
+			filtered = append(filtered, line)
+			continue
+		}
+		name, _, ok := strings.Cut(line, ":")
+		if ok {
+			if _, remove := blocked[strings.ToLower(strings.TrimSpace(name))]; remove {
+				continue
+			}
+		}
+		filtered = append(filtered, line)
+	}
+
 	// Build headers string
 	var headerStr strings.Builder
 	for key, value := range headers {
@@ -560,9 +582,11 @@ func injectHeaders(requestData []byte, headers map[string]string) []byte {
 		headerStr.WriteString("\r\n")
 	}
 
-	// Insert headers after the first line
-	result := requestStr[:firstLineEnd+2] + headerStr.String() + requestStr[firstLineEnd+2:]
-	return []byte(result)
+	// Insert headers after the first line. The body remains untouched because
+	// only header lines before the first blank line are filtered.
+	filteredRequest := strings.Join(filtered, "\r\n")
+	firstLineEnd = strings.Index(filteredRequest, "\r\n")
+	return []byte(filteredRequest[:firstLineEnd+2] + headerStr.String() + filteredRequest[firstLineEnd+2:])
 }
 
 // checkBasicAuth verifies HTTP Basic Auth credentials

@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -34,7 +35,7 @@ func TestHTTPRelayEndToEnd(t *testing.T) {
 	binary := filepath.Join(tmp, "xrok")
 	run(t, root, nil, "go", "build", "-o", binary, ".")
 
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Upstream", "xrok-e2e")
 		_, _ = fmt.Fprintf(w, "method=%s path=%s body=", r.Method, r.URL.Path)
 		_, _ = io.Copy(w, r.Body)
@@ -83,6 +84,86 @@ func TestHTTPRelayEndToEnd(t *testing.T) {
 	if responseBody != "method=POST path=/hello body=payload" {
 		t.Fatalf("unexpected tunneled response: %q", responseBody)
 	}
+}
+
+func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	caFile, certFile, keyFile := generateTestPKI(t, tmp)
+	binary := filepath.Join(tmp, "xrok")
+	run(t, root, nil, "go", "build", "-o", binary, ".")
+
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Seen-By-Upstream", r.Header.Get("X-Injected"))
+		_, _ = io.WriteString(w, "protected")
+	}))
+	target := strings.TrimPrefix(upstream.URL, "http://")
+	port := freePort(t)
+	token := "e2e-auth-token"
+	configPath := filepath.Join(tmp, "client.yaml")
+	configData := fmt.Sprintf("server: localhost\ntls: true\ntunnels:\n  - name: protected\n    target: %s\n    basic_auth: user:secret\nheaders:\n  X-Injected: e2e\nreconnect:\n  enabled: true\n  initial_wait: 50ms\n  max_wait: 250ms\n", target)
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
+		"server", "--domain", "localhost", "--port", fmt.Sprint(port),
+		"--tls-cert", certFile, "--tls-key", keyFile,
+		"--state-file", filepath.Join(tmp, "state.dat"),
+		"--log-file", filepath.Join(tmp, "server.log"))
+	defer stopProcess(t, server)
+	tlsClient := newTLSClient(t, caFile)
+	waitFor(t, 10*time.Second, func() bool {
+		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", port))
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+
+	client := startProcess(t, tmp, nil, binary,
+		"client", "--config", configPath, "--rp", fmt.Sprint(port),
+		"--ca-cert", caFile, "--token", token, "--id", "auth-client",
+		"--retry-interval", "50ms", "--max-interval", "250ms")
+	defer stopProcess(t, client)
+
+	waitFor(t, 15*time.Second, func() bool {
+		req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/", port), nil)
+		req.Host = "protected.localhost"
+		resp, err := tlsClient.Do(req)
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusUnauthorized
+	})
+
+	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/", port), nil)
+	req.Host = "protected.localhost"
+	credentials := base64.StdEncoding.EncodeToString([]byte("user:secret"))
+	req.Header.Set("Authorization", "Basic "+credentials)
+	resp, err := tlsClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "protected" {
+		t.Fatalf("protected request failed: status=%s body=%q", resp.Status, body)
+	}
+}
+
+func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return server
 }
 
 func repositoryRoot(t *testing.T) string {
