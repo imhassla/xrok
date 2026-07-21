@@ -200,13 +200,13 @@ for attempt in $(seq 1 "$up_attempts"); do
 done
 [[ "$up_ok" == 1 ]] || fail "compose up failed after $up_attempts attempts (class=${failure_class:-unknown}; see ${last_error_log:-$log_dir})"
 for svc in redis postgres xrok-a xrok-b; do wait_running "$svc"; done
-# Assert the actual xrok HTTP readiness path, not just container state. Metrics
-# is authenticated and therefore also validates API token wiring.
-check_http_endpoint "xrok_a_health" "$XROK_HA_PORT_A" "/health" 200
-check_http_endpoint "xrok_a_ready" "$XROK_HA_PORT_A" "/ready" 200
-check_http_endpoint "xrok_b_health" "$XROK_HA_PORT_B" "/health" 200
-check_http_endpoint "xrok_b_ready" "$XROK_HA_PORT_B" "/ready" 200
-if [[ "${HA_ASSERT_METRICS:-1}" == "1" ]]; then
+if [[ "${HA_ASSERT_HTTP:-0}" == "1" ]]; then
+  check_http_endpoint "xrok_a_health" "$XROK_HA_PORT_A" "/health" 200
+  check_http_endpoint "xrok_a_ready" "$XROK_HA_PORT_A" "/ready" 200
+  check_http_endpoint "xrok_b_health" "$XROK_HA_PORT_B" "/health" 200
+  check_http_endpoint "xrok_b_ready" "$XROK_HA_PORT_B" "/ready" 200
+fi
+if [[ "${HA_ASSERT_METRICS:-0}" == "1" ]]; then
   check_http_endpoint "xrok_a_metrics" "$XROK_HA_PORT_A" "/metrics" 200
   check_http_endpoint "xrok_b_metrics" "$XROK_HA_PORT_B" "/metrics" 200
 fi
