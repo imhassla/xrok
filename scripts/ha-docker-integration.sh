@@ -95,7 +95,7 @@ wait_running() {
   local svc="$1" state=""
   for _ in $(seq 1 "$retries"); do
     state=$(${compose[@]} ps --format '{{.Service}} {{.State}}' "$svc" 2>/dev/null || true)
-    [[ "$state" == *running* ]] && return 0
+    [[ "$state" == *running* || "$state" == *Up* ]] && return 0
     sleep "$interval"
   done
   failure_class="health"
