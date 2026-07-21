@@ -4,12 +4,15 @@ package e2e
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -153,7 +156,7 @@ func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
 	port := freePort(t)
 	token := "e2e-auth-token"
 	configPath := filepath.Join(tmp, "client.yaml")
-	configData := fmt.Sprintf("server: localhost\ntls: true\ntunnels:\n  - name: protected\n    target: %s\n    basic_auth: user:secret\n    capability: e2e-capability\nheaders:\n  X-Injected: e2e\nreconnect:\n  enabled: true\n  initial_wait: 50ms\n  max_wait: 250ms\n", target)
+	configData := fmt.Sprintf("server: localhost\ntls: true\ntunnels:\n  - name: protected\n    target: %s\n    basic_auth: user:secret\n    capability: e2e-jwt-secret\n    capability_audience: protected\nheaders:\n  X-Injected: e2e\nreconnect:\n  enabled: true\n  initial_wait: 50ms\n  max_wait: 250ms\n", target)
 	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +197,7 @@ func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
 	req.Host = "protected.localhost"
 	credentials := base64.StdEncoding.EncodeToString([]byte("user:secret"))
 	req.Header.Set("Authorization", "Basic "+credentials)
-	req.Header.Set("X-Xrok-Capability", "e2e-capability")
+	req.Header.Set("X-Xrok-Capability", makeTestJWT("e2e-jwt-secret", "protected"))
 	resp, err := tlsClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -204,6 +207,16 @@ func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || string(body) != "protected" {
 		t.Fatalf("protected request failed: status=%s body=%q", resp.Status, body)
 	}
+}
+
+func makeTestJWT(secret, audience string) string {
+	enc := func(v []byte) string { return base64.RawURLEncoding.EncodeToString(v) }
+	header := enc([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	claims, _ := json.Marshal(map[string]interface{}{"aud": audience, "exp": time.Now().Add(time.Hour).Unix()})
+	body := enc(claims)
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte(header + "." + body))
+	return header + "." + body + "." + enc(mac.Sum(nil))
 }
 
 func TestReverseTCPRelayEndToEnd(t *testing.T) {
