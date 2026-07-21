@@ -4,6 +4,7 @@ xrok
 xrok-*
 *.log
 .artifacts/
+local-certs/
 
 # Docs
 docs/
