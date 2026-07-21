@@ -30,6 +30,12 @@ func TestAuthenticatedPunchRejectsTamperingAndStaleTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	badMAC := append([]byte(nil), msg...)
+	if badMAC[len(badMAC)-1] == 'A' {
+		badMAC[len(badMAC)-1] = 'B'
+	} else {
+		badMAC[len(badMAC)-1] = 'A'
+	}
 	tests := []struct {
 		name string
 		msg  string
@@ -38,7 +44,7 @@ func TestAuthenticatedPunchRejectsTamperingAndStaleTimestamp(t *testing.T) {
 		{"stale", string(msg), now.Add(2 * time.Minute)},
 		{"future", string(msg), now.Add(-2 * time.Minute)},
 		{"wrong peer", string(msg), now},
-		{"bad mac", string(msg[:len(msg)-1]) + "A", now},
+		{"bad mac", string(badMAC), now},
 		{"extra field", string(msg) + ":extra", now},
 		{"legacy", "XROK-P2P-PUNCH:v1:peer-a:proof", now},
 	}

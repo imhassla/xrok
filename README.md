@@ -64,7 +64,14 @@ P2P mode:
 - Uses server for signaling only
 - Data flows directly between clients
 - Reduces latency and server bandwidth
-- Automatic fallback to relay if NAT traversal fails
+- Falls back to the normal xrok server relay when direct traversal fails
+
+The Go P2P API also includes an RFC 5766 TURN-over-UDP provider with
+long-term authentication, permissions, allocation refresh and Send/Data
+indications. It is exercised against the pinned local coturn lab. The current
+CLI does not yet exchange TURN candidates between both peers, so TURN is an
+embeddable ICE transport option rather than a claim of end-to-end CLI TURN
+fallback. ChannelBind and TURN-over-TCP/TLS are not implemented.
 
 #### P2P Server APIs
 
