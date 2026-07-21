@@ -19,6 +19,20 @@ func TestServerDepsRegistriesAreIsolated(t *testing.T) {
 	}
 }
 
+func TestRouteRegistryDeleteOwned(t *testing.T) {
+	r := NewRouteRegistry()
+	r.Put("web", &TunnelRoute{ClientID: "old"})
+	if r.DeleteOwned("web", "new") {
+		t.Fatal("delete must reject a different owner")
+	}
+	if _, ok := r.Get("web"); !ok {
+		t.Fatal("route was removed by non-owner")
+	}
+	if !r.DeleteOwned("web", "old") {
+		t.Fatal("owner should remove route")
+	}
+}
+
 func TestServerDepsContext(t *testing.T) {
 	deps := &ServerDeps{Clients: NewClientRegistry(), Routes: NewRouteRegistry()}
 	ctx := WithServerDeps(context.Background(), deps)

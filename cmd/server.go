@@ -177,6 +177,20 @@ var (
 	}
 )
 
+// registry mutation helpers keep legacy map access behind one synchronization
+// boundary while allowing injected handlers to observe the same registry.
+func putServerClient(id string, c *serverClientInfo) {
+	serverClientsMutex.Lock()
+	legacyClientRegistry.Put(id, c)
+	serverClientsMutex.Unlock()
+}
+
+func deleteServerClient(id string) {
+	serverClientsMutex.Lock()
+	legacyClientRegistry.Delete(id)
+	serverClientsMutex.Unlock()
+}
+
 // Auth globals
 var (
 	serverApiToken    string
@@ -754,11 +768,9 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 	})
 
 	// Clean up tunnel routes for this client
-	serverTunnelRoutesMutex.Lock()
 	for _, t := range client.tunnels {
-		delete(serverTunnelRoutes, t.Name)
+		legacyRouteRegistry.DeleteOwned(t.Name, clientID)
 	}
-	serverTunnelRoutesMutex.Unlock()
 
 	client.muxSessionMutex.Lock()
 	if client.muxSession != nil {
@@ -794,9 +806,7 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 	}
 
 	releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
-	serverClientsMutex.Lock()
-	delete(serverClients, clientID)
-	serverClientsMutex.Unlock()
+	deleteServerClient(clientID)
 	if serverDebug {
 		log.Printf("Resources released for client %s", clientID)
 	}
@@ -876,11 +886,9 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	serverClientsMutex.Lock()
 	if existing, exists := serverClients[clientID]; exists {
 		// Clean up old tunnel routes
-		serverTunnelRoutesMutex.Lock()
 		for _, t := range existing.tunnels {
-			delete(serverTunnelRoutes, t.Name)
+			legacyRouteRegistry.DeleteOwned(t.Name, clientID)
 		}
-		serverTunnelRoutesMutex.Unlock()
 
 		// Cancel old client context
 		if existing.cancelFunc != nil {
@@ -894,7 +902,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 
 		// Release old ports
 		releaseServerPorts(existing.PortNoTLS, existing.ClientPortTLS, existing.ClientPortNoTLS)
-		delete(serverClients, clientID)
+		legacyClientRegistry.Delete(clientID)
 		existing.decrementOnce.Do(func() {
 			srvActiveClients.Dec()
 		})
@@ -915,9 +923,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Check for duplicate subdomain (from different client)
-			serverTunnelRoutesMutex.RLock()
-			existingRoute, routeExists := serverTunnelRoutes[name]
-			serverTunnelRoutesMutex.RUnlock()
+			existingRoute, routeExists := legacyRouteRegistry.Get(name)
 			if routeExists && existingRoute.ClientID != clientID {
 				http.Error(w, fmt.Sprintf("Subdomain '%s' already in use by another client", name), http.StatusConflict)
 				cancel()
@@ -961,15 +967,12 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	client.SetLastActivity(time.Now())
 
-	serverClientsMutex.Lock()
-	serverClients[clientID] = client
-	serverClientsMutex.Unlock()
+	putServerClient(clientID, client)
 
 	// Register tunnel routes
-	serverTunnelRoutesMutex.Lock()
 	for _, t := range tunnels {
 		log.Printf("Registering tunnel route: name=%s, target=%s, auth_configured=%t, header_count=%d", t.Name, t.Target, t.BasicAuth != "", len(regReq.Headers))
-		serverTunnelRoutes[t.Name] = &TunnelRoute{
+		legacyRouteRegistry.Put(t.Name, &TunnelRoute{
 			ClientID:           clientID,
 			TunnelName:         t.Name,
 			Target:             t.Target,
@@ -977,9 +980,8 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			Headers:            regReq.Headers,
 			Capability:         t.Capability,
 			CapabilityAudience: t.CapabilityAudience,
-		}
+		})
 	}
-	serverTunnelRoutesMutex.Unlock()
 
 	// Start reverse forwarding listeners
 	for _, revConfig := range regReq.Reverse {
@@ -2342,7 +2344,7 @@ func loadServerState() {
 			p2pConnections: make(map[string]net.Conn),
 		}
 		client.SetLastActivity(clientData.LastActivity)
-		serverClients[id] = client
+		legacyClientRegistry.Put(id, client)
 		srvActiveClients.Inc() // Count restored clients
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -2482,16 +2484,12 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	client.muxSessionMutex.Unlock()
 
 	// Clean up tunnel routes when session closes (stateless behavior)
-	serverTunnelRoutesMutex.Lock()
 	for _, t := range client.tunnels {
-		delete(serverTunnelRoutes, t.Name)
+		legacyRouteRegistry.DeleteOwned(t.Name, clientID)
 	}
-	serverTunnelRoutesMutex.Unlock()
 
 	// Remove client from server clients
-	serverClientsMutex.Lock()
-	delete(serverClients, clientID)
-	serverClientsMutex.Unlock()
+	deleteServerClient(clientID)
 
 	// Release ports
 	releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
@@ -2964,9 +2962,7 @@ func handleP2PTunnelOwner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	serverTunnelRoutesMutex.RLock()
-	route, exists := serverTunnelRoutes[tunnelName]
-	serverTunnelRoutesMutex.RUnlock()
+	route, exists := legacyRouteRegistry.Get(tunnelName)
 
 	if !exists {
 		http.Error(w, "Tunnel not found", http.StatusNotFound)

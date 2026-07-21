@@ -92,6 +92,18 @@ func (r *RouteRegistry) Put(name string, v *TunnelRoute) {
 	r.m[name] = v
 }
 func (r *RouteRegistry) Delete(name string) { r.mu.Lock(); defer r.mu.Unlock(); delete(r.m, name) }
+
+// DeleteOwned removes a route only when it still belongs to clientID.
+func (r *RouteRegistry) DeleteOwned(name, clientID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.m[name]
+	if !ok || v == nil || v.ClientID != clientID {
+		return false
+	}
+	delete(r.m, name)
+	return true
+}
 func (r *RouteRegistry) Snapshot() []*TunnelRoute {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
