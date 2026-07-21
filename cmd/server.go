@@ -1072,19 +1072,19 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 				serverRateLimitMiddleware(serverMuxWebSocketHandler)(w, r)
 				return
 			case "/p2p/signal":
-				handleP2PSignaling(w, r)
+				serverAuthMiddleware(handleP2PSignaling)(w, r)
 				return
 			case "/p2p/ws":
-				handleP2PWebSocket(w, r)
+				serverAuthMiddleware(handleP2PWebSocket)(w, r)
 				return
 			case "/p2p/clients":
-				handleP2PClients(w, r)
+				serverAuthMiddleware(handleP2PClients)(w, r)
 				return
 			case "/p2p/discover":
-				handleP2PDiscoverTrigger(w, r)
+				serverAuthMiddleware(handleP2PDiscoverTrigger)(w, r)
 				return
 			case "/p2p/tunnel-owner":
-				handleP2PTunnelOwner(w, r)
+				serverAuthMiddleware(handleP2PTunnelOwner)(w, r)
 				return
 			case "/health":
 				w.Header().Set("Content-Type", "application/json")

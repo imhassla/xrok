@@ -2182,7 +2182,11 @@ func connectP2PSignaling(ctx context.Context, state *clientState) {
 		TLSClientConfig: state.TLSConfig,
 	}
 
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	headers := http.Header{}
+	if state.APIToken != "" {
+		headers.Set("X-API-Token", state.APIToken)
+	}
+	conn, _, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
 		clientLog.Warn("P2P signaling connection failed: %v", err)
 		return
@@ -2375,8 +2379,16 @@ func FetchViaP2P(state *clientState, tunnelURL string, req *http.Request) (*http
 	tunnelName := parts[0]
 
 	// Query server for tunnel owner
-	lookupURL := fmt.Sprintf("https://%s/p2p/tunnel-owner?tunnel=%s", state.ServerAddr, tunnelName)
-	lookupResp, err := http.Get(lookupURL)
+	lookupURL := fmt.Sprintf("https://%s/p2p/tunnel-owner?tunnel=%s", state.ServerAddr, url.QueryEscape(tunnelName))
+	lookupReq, err := http.NewRequestWithContext(req.Context(), http.MethodGet, lookupURL, nil)
+	if err != nil {
+		return nil, false, nil
+	}
+	if state.APIToken != "" {
+		lookupReq.Header.Set("X-API-Token", state.APIToken)
+	}
+	lookupClient := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: state.TLSConfig}}
+	lookupResp, err := lookupClient.Do(lookupReq)
 	if err != nil {
 		return nil, false, nil
 	}
