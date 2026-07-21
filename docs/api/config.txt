@@ -1,6 +1,6 @@
 package config // import "xrok/cmd/config"
 
-const CurrentVersion = 1
+const CurrentVersion = 2
 func FindConfigFile(name string) string
 func GenerateExampleClientConfig() string
 func GenerateExampleServerConfig() string
@@ -19,5 +19,6 @@ type ReverseConfig struct{ ... }
 type ServerConfig struct{ ... }
     func DefaultServerConfig() *ServerConfig
     func LoadServerConfig(path string) (*ServerConfig, error)
+type TelemetryConfig struct{ ... }
 type TunnelConfig struct{ ... }
 type UDPConfig struct{ ... }

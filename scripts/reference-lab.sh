@@ -41,7 +41,7 @@ smoke() {
     echo "reference_lab=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     health prometheus http://127.0.0.1:9090/-/ready
     health grafana http://127.0.0.1:3000/api/health
-    health otel http://127.0.0.1:13133/
+    health otel "http://127.0.0.1:${OTEL_HEALTH_PORT:-13133}/"
     health toxiproxy http://127.0.0.1:8474/version
     "${c[@]}" ps
   } | tee "$out"

@@ -349,14 +349,42 @@ type ctxKey struct{}
 
 var defaultExporter Exporter = &MemoryExporter{}
 var exporterMu sync.RWMutex
+var exporterGeneration uint64
 
 func SetExporter(e Exporter) {
 	exporterMu.Lock()
 	defer exporterMu.Unlock()
+	exporterGeneration++
 	if e == nil {
 		defaultExporter = &MemoryExporter{}
 	} else {
 		defaultExporter = e
+	}
+}
+
+// InstallExporter atomically installs e and returns an idempotent restore
+// function. Restore is ownership-aware: it does not overwrite an exporter
+// installed by another runtime after this lease was created.
+func InstallExporter(e Exporter) func() {
+	if e == nil {
+		return func() {}
+	}
+	exporterMu.Lock()
+	previous := defaultExporter
+	defaultExporter = e
+	exporterGeneration++
+	generation := exporterGeneration
+	exporterMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			exporterMu.Lock()
+			if exporterGeneration == generation {
+				defaultExporter = previous
+				exporterGeneration++
+			}
+			exporterMu.Unlock()
+		})
 	}
 }
 

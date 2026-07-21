@@ -6,7 +6,7 @@ services:
     command: ["server", "--domain", "localhost", "--port", "8443", "--tls-cert", "/certs/server.pem", "--tls-key", "/certs/server-key.pem", "--state-file", "/data/state.dat", "--log-file", "/data/server.log"]
     environment:
       XROK_API_TOKEN: ${XROK_API_TOKEN:-local-benchmark-token}
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     ports: ["${XROK_PORT:-8443}:8443/tcp", "${XROK_UDP_PORT:-8443}:8443/udp"]
     volumes: ["./local-certs:/certs:ro", "xrok-benchmark-data:/data"]
     depends_on:

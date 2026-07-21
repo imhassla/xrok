@@ -232,3 +232,24 @@ func TestAsyncOTLPRejectsExportAfterClose(t *testing.T) {
 		t.Fatalf("late export stats: %+v", got)
 	}
 }
+
+func TestInstallExporterRestoreIsOwnershipAware(t *testing.T) {
+	baseline := &MemoryExporter{}
+	first := &MemoryExporter{}
+	second := &MemoryExporter{}
+	SetExporter(baseline)
+	defer SetExporter(nil)
+	restoreFirst := InstallExporter(first)
+	if currentExporter() != first {
+		t.Fatal("first exporter not installed")
+	}
+	restoreSecond := InstallExporter(second)
+	restoreFirst()
+	if currentExporter() != second {
+		t.Fatal("stale lease overwrote current exporter")
+	}
+	restoreSecond()
+	if currentExporter() != first {
+		t.Fatal("second lease did not restore previous exporter")
+	}
+}

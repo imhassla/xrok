@@ -313,7 +313,10 @@ func RunServer(args []string) {
 
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	fs.String("config", "", "Path to YAML config file")
-	fs.StringVar(&serverDomain, "domain", "", "Domain to use in URLs (required)")
+	// Preserve a domain loaded from --config unless the CLI explicitly
+	// overrides it. Registering the flag with an empty default would reset the
+	// already-loaded value during FlagSet construction.
+	fs.StringVar(&serverDomain, "domain", serverDomain, "Domain to use in URLs (required)")
 	fs.IntVar(&serverPort, "port", serverPort, "Unified HTTPS and QUIC port")
 	fs.StringVar(&serverCertFile, "tls-cert", serverCertFile, "Path to TLS certificate")
 	fs.StringVar(&serverKeyFile, "tls-key", serverKeyFile, "Path to TLS private key")
@@ -323,6 +326,27 @@ func RunServer(args []string) {
 	fs.BoolVar(&serverRequestLog, "request-log", serverRequestLog, "Enable HTTP request logging")
 	fs.StringVar(&serverClientCA, "client-ca", serverClientCA, "Path to CA certificate for mTLS client verification")
 	fs.Parse(args)
+	telemetryConfig := config.DefaultServerConfig().Telemetry
+	if loadedConfig != nil {
+		telemetryConfig = loadedConfig.Telemetry
+	}
+	telemetryConfig, err := telemetryConfigFromEnvironment(telemetryConfig, os.Getenv)
+	if err != nil {
+		fmt.Printf("Invalid OTLP configuration: %v\n", err)
+		return
+	}
+	runtimeTelemetry, err := newRuntimeTelemetry(telemetryConfig, nil)
+	if err != nil {
+		fmt.Printf("Invalid OTLP configuration: %v\n", err)
+		return
+	}
+	restoreTelemetry := telemetry.InstallExporter(runtimeTelemetry.exporter)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), telemetryConfig.ShutdownTimeout)
+		_ = runtimeTelemetry.drain(ctx)
+		cancel()
+		restoreTelemetry()
+	}()
 	setupServerLogging()
 
 	if serverDomain == "" {
@@ -1374,10 +1398,17 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 		reqBuf.WriteString(fmt.Sprintf("Host: %s\r\n", r.Host))
 	}
 	for key, values := range r.Header {
+		// A hijacked socket is bound to the tunnel selected by the first Host.
+		// Reusing it for another request could bypass the main-domain router and
+		// its control-plane policy, so every HTTP proxy exchange is single-use.
+		if strings.EqualFold(key, "Connection") || strings.EqualFold(key, "Proxy-Connection") {
+			continue
+		}
 		for _, value := range values {
 			reqBuf.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
 		}
 	}
+	reqBuf.WriteString("Connection: close\r\n")
 	reqBuf.WriteString("\r\n")
 
 	// Read any buffered body data

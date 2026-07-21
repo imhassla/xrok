@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -110,6 +111,22 @@ type ServerConfig struct {
 	RedisAddr     string `yaml:"redis_addr,omitempty"`
 	RedisPassword string `yaml:"redis_password,omitempty"`
 	PostgresDSN   string `yaml:"postgres_dsn,omitempty"`
+	// Telemetry configures bounded asynchronous OTLP/HTTP trace export. An
+	// empty endpoint keeps export disabled.
+	Telemetry TelemetryConfig `yaml:"telemetry,omitempty"`
+}
+
+// TelemetryConfig is the versioned server-side trace export contract.
+// Durations use Go/YAML duration syntax, for example "250ms" or "5s".
+type TelemetryConfig struct {
+	Endpoint        string        `yaml:"endpoint,omitempty"`
+	QueueSize       int           `yaml:"queue_size,omitempty"`
+	BatchSize       int           `yaml:"batch_size,omitempty"`
+	FlushInterval   time.Duration `yaml:"flush_interval,omitempty"`
+	ExportTimeout   time.Duration `yaml:"export_timeout,omitempty"`
+	MaxRetries      int           `yaml:"max_retries,omitempty"`
+	RetryBackoff    time.Duration `yaml:"retry_backoff,omitempty"`
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout,omitempty"`
 }
 
 // ClientIdentityConfig binds a credential to one stable client ID and an
@@ -121,7 +138,40 @@ type ClientIdentityConfig struct {
 }
 
 // CurrentVersion is the on-disk configuration schema version.
-const CurrentVersion = 1
+const CurrentVersion = 2
+
+func defaultTelemetryConfig() TelemetryConfig {
+	return TelemetryConfig{
+		QueueSize: 2048, BatchSize: 128, FlushInterval: time.Second,
+		ExportTimeout: 5 * time.Second, MaxRetries: 3,
+		RetryBackoff: 100 * time.Millisecond, ShutdownTimeout: 10 * time.Second,
+	}
+}
+
+func migrateTelemetryConfig(c *TelemetryConfig) {
+	d := defaultTelemetryConfig()
+	if c.QueueSize == 0 {
+		c.QueueSize = d.QueueSize
+	}
+	if c.BatchSize == 0 {
+		c.BatchSize = d.BatchSize
+	}
+	if c.FlushInterval == 0 {
+		c.FlushInterval = d.FlushInterval
+	}
+	if c.ExportTimeout == 0 {
+		c.ExportTimeout = d.ExportTimeout
+	}
+	if c.MaxRetries == 0 {
+		c.MaxRetries = d.MaxRetries
+	}
+	if c.RetryBackoff == 0 {
+		c.RetryBackoff = d.RetryBackoff
+	}
+	if c.ShutdownTimeout == 0 {
+		c.ShutdownTimeout = d.ShutdownTimeout
+	}
+}
 
 // MigrateClientConfig upgrades legacy configs in memory and is idempotent.
 func MigrateClientConfig(c *ClientConfig) {
@@ -135,12 +185,18 @@ func MigrateClientConfig(c *ClientConfig) {
 
 // MigrateServerConfig upgrades legacy configs in memory and is idempotent.
 func MigrateServerConfig(c *ServerConfig) {
-	if c.Version < CurrentVersion {
+	if c.Version > CurrentVersion {
+		return
+	}
+	if c.Version < 1 {
 		if c.StateBackend == "" {
 			c.StateBackend = "memory"
 		}
-		c.Version = CurrentVersion
 	}
+	if c.Version < 2 {
+		migrateTelemetryConfig(&c.Telemetry)
+	}
+	c.Version = CurrentVersion
 	if c.StateBackend == "" {
 		c.StateBackend = "memory"
 	}
@@ -156,6 +212,9 @@ type HealthCheckConfig struct {
 // Validate checks settings that would otherwise fail only after the runtime
 // has started goroutines and opened partial listeners.
 func (c *ServerConfig) Validate() error {
+	if c.Version > CurrentVersion {
+		return fmt.Errorf("unsupported server config version %d (current %d)", c.Version, CurrentVersion)
+	}
 	if c.Domain == "" {
 		return fmt.Errorf("server domain is required")
 	}
@@ -201,6 +260,24 @@ func (c *ServerConfig) Validate() error {
 			}
 		}
 	}
+	if t := c.Telemetry; t.Endpoint != "" {
+		u, err := url.Parse(t.Endpoint)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+			return fmt.Errorf("telemetry endpoint must be an http(s) URL with a host and no userinfo")
+		}
+		if t.QueueSize <= 0 {
+			return fmt.Errorf("telemetry queue_size must be positive")
+		}
+		if t.BatchSize <= 0 || t.BatchSize > t.QueueSize {
+			return fmt.Errorf("telemetry batch_size must be between 1 and queue_size")
+		}
+		if t.FlushInterval <= 0 || t.ExportTimeout <= 0 || t.RetryBackoff <= 0 || t.ShutdownTimeout <= 0 {
+			return fmt.Errorf("telemetry durations must be positive")
+		}
+		if t.MaxRetries < 0 {
+			return fmt.Errorf("telemetry max_retries must not be negative")
+		}
+	}
 	// Empty certificate paths are valid: the server derives the Let's Encrypt
 	// paths from domain, or the CLI can supply them after loading this config.
 	return nil
@@ -236,6 +313,7 @@ func DefaultServerConfig() *ServerConfig {
 		RequestLog:   false,
 		Compress:     false,
 		StateBackend: "memory",
+		Telemetry:    defaultTelemetryConfig(),
 		HealthCheck: HealthCheckConfig{
 			Enabled:  true,
 			Interval: 30 * time.Second,
@@ -257,6 +335,9 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 	MigrateClientConfig(cfg)
+	if cfg.Version > CurrentVersion {
+		return nil, fmt.Errorf("unsupported client config version %d (current %d)", cfg.Version, CurrentVersion)
+	}
 
 	return cfg, nil
 }
@@ -274,6 +355,9 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 	MigrateServerConfig(cfg)
+	if cfg.Version > CurrentVersion {
+		return nil, fmt.Errorf("unsupported server config version %d (current %d)", cfg.Version, CurrentVersion)
+	}
 
 	return cfg, nil
 }
@@ -281,6 +365,9 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 // SaveClientConfig saves client configuration to file
 func SaveClientConfig(cfg *ClientConfig, path string) error {
 	MigrateClientConfig(cfg)
+	if cfg.Version > CurrentVersion {
+		return fmt.Errorf("unsupported client config version %d (current %d)", cfg.Version, CurrentVersion)
+	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
@@ -301,6 +388,9 @@ func SaveClientConfig(cfg *ClientConfig, path string) error {
 // SaveServerConfig saves server configuration to file
 func SaveServerConfig(cfg *ServerConfig, path string) error {
 	MigrateServerConfig(cfg)
+	if cfg.Version > CurrentVersion {
+		return fmt.Errorf("unsupported server config version %d (current %d)", cfg.Version, CurrentVersion)
+	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
@@ -436,6 +526,17 @@ state_file: /var/lib/xrok/state.json
 
 # Request logging
 request_log: false
+
+# Bounded asynchronous OTLP/HTTP traces (disabled when endpoint is empty)
+telemetry:
+  endpoint: "" # e.g. http://otel-collector:4318; empty disables export
+  queue_size: 2048
+  batch_size: 128
+  flush_interval: 1s
+  export_timeout: 5s
+  max_retries: 3
+  retry_backoff: 100ms
+  shutdown_timeout: 10s
 
 # Compression
 compress: false

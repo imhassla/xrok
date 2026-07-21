@@ -12,6 +12,12 @@ Generate a development certificate in `local-certs/` (the same files used by `co
 
 Run the existing benchmark client against `localhost:${XROK_PORT:-8443}` and compare with frp on port `${FRP_PORT:-7000}`. Collector traces/metrics are printed by the `debug` exporter. Stop the lab with `./scripts/benchmark-lab.sh down`.
 
+To verify the complete telemetry path independently, run
+`make otlp-integration`. It allocates collision-resistant local ports, starts the
+pinned collector, emits a traced request through `ServerRuntime`, waits for the
+asynchronous exporter to drain, checks collector output, and removes its
+isolated Compose project.
+
 ## Apples-to-apples runner
 
 Expose the same application payload through xrok and frp (for example on

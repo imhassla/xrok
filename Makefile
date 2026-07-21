@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench regression e2e e2e-soak fuzz security fault-injection api-compat ci-local soak supply-chain lab-parallel lab-smoke check
+.PHONY: build test race vet bench regression e2e e2e-soak fuzz security fault-injection api-compat ci-local soak supply-chain lab-parallel lab-smoke otlp-integration check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -55,6 +55,10 @@ lab-parallel:
 
 lab-smoke:
 	./scripts/tests/lab-orchestration-smoke.sh
+
+# Runs the real async exporter against the pinned local OTEL Collector.
+otlp-integration:
+	./scripts/otel-collector-integration.sh
 
 e2e:
 	$(GO_ENV) go test -tags=e2e ./e2e -count=1

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"xrok/cmd/config"
+	"xrok/cmd/telemetry"
 )
 
 // ServerRuntime owns one server process lifecycle.  It provides an embeddable
@@ -14,20 +16,22 @@ import (
 // The underlying handlers remain compatible with the existing global registry;
 // lifecycle state is reset for each runtime instance.
 type ServerRuntime struct {
-	cfg        config.ServerConfig
-	mu         sync.Mutex
-	start      bool
-	stop       sync.Once
-	done       chan struct{}
-	run        func([]string)
-	runContext func(context.Context, []string) error
-	cancel     context.CancelFunc
-	shutdown   chan struct{}
-	legacy     bool
-	runErr     error
-	store      RuntimeStateStore
-	drain      DrainController
-	ha         HAConfig
+	cfg              config.ServerConfig
+	mu               sync.Mutex
+	start            bool
+	stop             sync.Once
+	done             chan struct{}
+	run              func([]string)
+	runContext       func(context.Context, []string) error
+	cancel           context.CancelFunc
+	shutdown         chan struct{}
+	legacy           bool
+	runErr           error
+	store            RuntimeStateStore
+	drain            DrainController
+	ha               HAConfig
+	telemetry        runtimeTelemetry
+	restoreTelemetry func()
 }
 
 func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
@@ -35,6 +39,7 @@ func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
 }
 
 func newServerRuntime(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error) {
+	config.MigrateServerConfig(&cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -54,10 +59,15 @@ func newServerRuntime(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerR
 			return nil, err
 		}
 	}
-	return &ServerRuntime{
+	runtimeTelemetry, err := newRuntimeTelemetry(cfg.Telemetry, deps.TelemetryExporter)
+	if err != nil {
+		return nil, err
+	}
+	r := &ServerRuntime{
 		cfg: cfg, done: make(chan struct{}), shutdown: make(chan struct{}),
-		ha: ha, store: store, run: RunServer, legacy: true,
-	}, nil
+		ha: ha, store: store, run: RunServer, legacy: true, telemetry: runtimeTelemetry,
+	}
+	return r, nil
 }
 
 // ServerRuntimeDeps allows embedders and tests to inject the serving loop.
@@ -70,6 +80,9 @@ type ServerRuntimeDeps struct {
 	RunContext   func(context.Context, []string) error
 	Store        RuntimeStateStore
 	StoreFactory StoreFactoryDeps
+	// TelemetryExporter overrides endpoint-based construction for embedders and
+	// tests. Closers implementing Close(context.Context) join graceful drain.
+	TelemetryExporter telemetry.Exporter
 }
 
 func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error) {
@@ -115,11 +128,28 @@ func (r *ServerRuntime) Start(ctx context.Context) error {
 	if r.legacy {
 		serverShutdownChan = r.shutdown
 	}
+	if r.telemetry.exporter != nil {
+		r.restoreTelemetry = telemetry.InstallExporter(r.telemetry.exporter)
+	}
 	r.mu.Unlock()
 
 	args := r.args()
 	go func() {
 		defer func() {
+			drainTimeout := r.telemetry.timeout
+			if drainTimeout <= 0 {
+				drainTimeout = 10 * time.Second
+			}
+			drainCtx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+			_ = r.drain.Drain(drainCtx)
+			// Keep telemetry accepting spans until the serving loop and its
+			// handlers have stopped. Draining it from ShutdownContext would race
+			// with final request/shutdown spans emitted after cancellation.
+			_ = r.telemetry.drain(drainCtx)
+			cancel()
+			if r.restoreTelemetry != nil {
+				r.restoreTelemetry()
+			}
 			if r.legacy {
 				releaseLegacyServerRuntime(r)
 			}
