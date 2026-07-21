@@ -12,4 +12,20 @@ Generate a development certificate in `local-certs/` (the same files used by `co
 
 Run the existing benchmark client against `localhost:${XROK_PORT:-8443}` and compare with frp on port `${FRP_PORT:-7000}`. Collector traces/metrics are printed by the `debug` exporter. Stop the lab with `./scripts/benchmark-lab.sh down`.
 
+## Apples-to-apples runner
+
+Expose the same application payload through xrok and frp (for example on
+ports 18080 and 18081), then run:
+
+```sh
+ITERATIONS=20 XROK_URL=http://127.0.0.1:18080 FRP_URL=http://127.0.0.1:18081 \
+  ./scripts/benchmark-apples.sh
+```
+
+The runner records per-request latency, status and payload size in
+`bench/results.csv`. This compares workload endpoints rather than frp's
+control port. CPU/RSS can be sampled with `docker stats --no-stream` while it
+runs; pin compose image tags before publishing a result. Failed requests are
+recorded as HTTP code `000`, keeping reconnect/flakiness visible.
+
 All image tags and service ports are explicit so CI or a later performance run can reproduce the same topology. The compose file does not publish credentials beyond the local benchmark network.

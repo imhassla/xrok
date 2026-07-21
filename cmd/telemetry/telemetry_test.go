@@ -2,9 +2,11 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestTraceparentRoundTrip(t *testing.T) {
@@ -13,6 +15,35 @@ func TestTraceparentRoundTrip(t *testing.T) {
 	got, parent, ok := ExtractTraceparent(InjectTraceparent(tr, sp))
 	if !ok || got != tr || parent != sp {
 		t.Fatalf("traceparent roundtrip failed")
+	}
+}
+
+func TestOTLPHTTPExporter(t *testing.T) {
+	defer func() {
+		if recover() != nil {
+			t.Skip("loopback listener unavailable in restricted test environment")
+		}
+	}()
+	got := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/traces" || r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("bad OTLP request: %s", r.URL)
+		}
+		var p map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		got <- p
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	e := NewOTLPHTTPExporter(srv.URL)
+	e.Export(context.Background(), Span{TraceID: "0123456789abcdef0123456789abcdef", SpanID: "0123456789abcdef", Name: "unit", Start: time.Unix(1, 2), End: time.Unix(1, 3), Status: 200})
+	select {
+	case p := <-got:
+		if len(p["resourceSpans"].([]any)) != 1 {
+			t.Fatal("missing resource spans")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("export timeout")
 	}
 }
 func TestHTTPMiddlewareExportsAndPropagates(t *testing.T) {

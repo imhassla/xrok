@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -8,6 +9,17 @@ import (
 	"testing"
 	"time"
 )
+
+func TestOIDCVerifierRejectsMalformedAndEmptyIssuer(t *testing.T) {
+	v := NewOIDCVerifier("", "api", nil, 0)
+	if err := v.Verify(context.Background(), "a.b.c", time.Now()); err == nil {
+		t.Fatal("expected malformed token rejection")
+	}
+	v = NewOIDCVerifier("http://127.0.0.1", "api", nil, 0)
+	if err := v.Verify(context.Background(), "eyJhbGciOiJSUzI1NiIsImtpZCI6Im1pc3MifQ.eA.eA", time.Now()); err == nil {
+		t.Fatal("expected invalid signature rejection")
+	}
+}
 
 func testJWT(secret string, exp int64, aud string) string {
 	enc := func(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }

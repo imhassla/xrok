@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
@@ -19,6 +20,84 @@ type Span struct {
 	Status                int
 }
 type Exporter interface{ Export(context.Context, Span) }
+
+// OTLPHTTPExporter exports spans using the OTLP/HTTP JSON protocol. It is
+// intentionally dependency-free so the runtime can emit traces to a local
+// OpenTelemetry Collector without pulling the full SDK into binaries.
+type OTLPHTTPExporter struct {
+	Endpoint string
+	Client   *http.Client
+}
+
+func NewOTLPHTTPExporter(endpoint string) *OTLPHTTPExporter {
+	endpoint = strings.TrimRight(endpoint, "/")
+	if !strings.HasSuffix(endpoint, "/v1/traces") {
+		endpoint += "/v1/traces"
+	}
+	return &OTLPHTTPExporter{Endpoint: endpoint, Client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+func (e *OTLPHTTPExporter) Export(ctx context.Context, s Span) {
+	if e == nil || e.Endpoint == "" {
+		return
+	}
+	p := otlpTracePayload{ResourceSpans: []otlpResourceSpans{{ScopeSpans: []otlpScopeSpans{{Spans: []otlpSpan{{TraceID: s.TraceID, SpanID: s.SpanID, Name: s.Name, StartTimeUnixNano: s.Start.UnixNano(), EndTimeUnixNano: s.End.UnixNano(), Status: otlpStatus{Code: s.Status}, Attributes: otlpAttributes(s.Attributes)}}}}}}}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.Endpoint, strings.NewReader(string(b)))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := e.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
+}
+
+type otlpTracePayload struct {
+	ResourceSpans []otlpResourceSpans `json:"resourceSpans"`
+}
+type otlpResourceSpans struct {
+	ScopeSpans []otlpScopeSpans `json:"scopeSpans"`
+}
+type otlpScopeSpans struct {
+	Spans []otlpSpan `json:"spans"`
+}
+type otlpSpan struct {
+	TraceID           string          `json:"traceId"`
+	SpanID            string          `json:"spanId"`
+	Name              string          `json:"name"`
+	StartTimeUnixNano int64           `json:"startTimeUnixNano,string"`
+	EndTimeUnixNano   int64           `json:"endTimeUnixNano,string"`
+	Attributes        []otlpAttribute `json:"attributes,omitempty"`
+	Status            otlpStatus      `json:"status"`
+}
+type otlpAttribute struct {
+	Key   string    `json:"key"`
+	Value otlpValue `json:"value"`
+}
+type otlpValue struct {
+	StringValue string `json:"stringValue,omitempty"`
+}
+type otlpStatus struct {
+	Code int `json:"code,omitempty"`
+}
+
+func otlpAttributes(in map[string]string) []otlpAttribute {
+	out := make([]otlpAttribute, 0, len(in))
+	for k, v := range in {
+		out = append(out, otlpAttribute{Key: k, Value: otlpValue{StringValue: v}})
+	}
+	return out
+}
+
 type MemoryExporter struct {
 	mu    sync.Mutex
 	Spans []Span
@@ -40,13 +119,22 @@ func (e *MemoryExporter) Snapshot() []Span {
 type ctxKey struct{}
 
 var defaultExporter Exporter = &MemoryExporter{}
+var exporterMu sync.RWMutex
 
 func SetExporter(e Exporter) {
+	exporterMu.Lock()
+	defer exporterMu.Unlock()
 	if e == nil {
 		defaultExporter = &MemoryExporter{}
 	} else {
 		defaultExporter = e
 	}
+}
+
+func currentExporter() Exporter {
+	exporterMu.RLock()
+	defer exporterMu.RUnlock()
+	return defaultExporter
 }
 func NewTraceID() string {
 	b := make([]byte, 16)
@@ -87,7 +175,7 @@ func HTTPMiddleware(next http.Handler) http.Handler {
 		sw := &statusWriter{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(sw, r)
-		defaultExporter.Export(r.Context(), Span{TraceID: trace, SpanID: span, Name: r.Method + " " + r.URL.Path, Start: start, End: time.Now(), Status: sw.status, Attributes: map[string]string{"http.method": r.Method, "http.route": r.URL.Path}})
+		currentExporter().Export(r.Context(), Span{TraceID: trace, SpanID: span, Name: r.Method + " " + r.URL.Path, Start: start, End: time.Now(), Status: sw.status, Attributes: map[string]string{"http.method": r.Method, "http.route": r.URL.Path}})
 	})
 }
 
