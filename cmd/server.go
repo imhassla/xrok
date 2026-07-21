@@ -37,6 +37,7 @@ import (
 	"golang.org/x/time/rate"
 	"xrok/cmd/config"
 	"xrok/cmd/p2p"
+	"xrok/cmd/telemetry"
 	"xrok/cmd/transport"
 )
 
@@ -73,10 +74,11 @@ type serializableClientInfoForSave struct {
 
 // ServerTunnelConfig represents a tunnel configuration on the server
 type ServerTunnelConfig struct {
-	Name       string `json:"name"`
-	Target     string `json:"target"`
-	BasicAuth  string `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
-	Capability string `json:"capability,omitempty"`
+	Name               string `json:"name"`
+	Target             string `json:"target"`
+	BasicAuth          string `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
+	Capability         string `json:"capability,omitempty"`
+	CapabilityAudience string `json:"capability_audience,omitempty"`
 }
 
 // ServerTunnelInfo contains server-side tunnel info
@@ -123,12 +125,13 @@ type serverClientInfo struct {
 
 // TunnelRoute maps a subdomain to client and tunnel info
 type TunnelRoute struct {
-	ClientID   string
-	TunnelName string
-	Target     string
-	BasicAuth  string            // user:password for HTTP Basic Auth
-	Headers    map[string]string // Custom headers to inject
-	Capability string            // Optional capability token required by route
+	ClientID           string
+	TunnelName         string
+	Target             string
+	BasicAuth          string            // user:password for HTTP Basic Auth
+	Headers            map[string]string // Custom headers to inject
+	Capability         string            // Optional capability token required by route
+	CapabilityAudience string            // JWT audience when capability is an HS256 secret
 }
 
 // Server globals
@@ -921,7 +924,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			tunnels = append(tunnels, ServerTunnelConfig{Name: name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability})
+			tunnels = append(tunnels, ServerTunnelConfig{Name: name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability, CapabilityAudience: t.CapabilityAudience})
 			tunnelMap[name] = t.Target
 
 			url := fmt.Sprintf("https://%s.%s", name, serverDomain)
@@ -967,12 +970,13 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	for _, t := range tunnels {
 		log.Printf("Registering tunnel route: name=%s, target=%s, auth_configured=%t, header_count=%d", t.Name, t.Target, t.BasicAuth != "", len(regReq.Headers))
 		serverTunnelRoutes[t.Name] = &TunnelRoute{
-			ClientID:   clientID,
-			TunnelName: t.Name,
-			Target:     t.Target,
-			BasicAuth:  t.BasicAuth,
-			Headers:    regReq.Headers,
-			Capability: t.Capability,
+			ClientID:           clientID,
+			TunnelName:         t.Name,
+			Target:             t.Target,
+			BasicAuth:          t.BasicAuth,
+			Headers:            regReq.Headers,
+			Capability:         t.Capability,
+			CapabilityAudience: t.CapabilityAudience,
 		}
 	}
 	serverTunnelRoutesMutex.Unlock()
@@ -1061,7 +1065,7 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 	}
 
 	// Create unified HTTP handler for both registration and proxy
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := telemetry.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
 			host = host[:colonIdx]
@@ -1175,7 +1179,13 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 				if provided == "" {
 					provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 				}
-				if subtle.ConstantTimeCompare([]byte(provided), []byte(route.Capability)) != 1 {
+				valid := subtle.ConstantTimeCompare([]byte(provided), []byte(route.Capability)) == 1
+				// A capability value containing a JWT-like token is treated as the
+				// HS256 signing secret, enabling short-lived signed bearer tokens.
+				if !valid && strings.Count(provided, ".") == 2 {
+					valid = verifyJWTCapability(provided, route.Capability, route.CapabilityAudience, time.Now())
+				}
+				if !valid {
 					srvCapabilityDenied.Inc()
 					http.Error(w, "tunnel capability required", http.StatusForbidden)
 					return
@@ -1198,7 +1208,7 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 
 		// Handle the proxy connection with the buffered data
 		go handleHijackedProxyConnection(conn, buf, r, client, tunnelName, basicAuth, customHeaders)
-	})
+	}))
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},

@@ -35,10 +35,11 @@ import (
 
 // TunnelConfig represents a single tunnel configuration
 type TunnelConfig struct {
-	Name       string `json:"name"`                 // Subdomain name (e.g., "app", "api")
-	Target     string `json:"target"`               // Local target (e.g., "localhost:8080")
-	BasicAuth  string `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
-	Capability string `json:"capability,omitempty"` // optional capability required by the public route
+	Name               string `json:"name"`                 // Subdomain name (e.g., "app", "api")
+	Target             string `json:"target"`               // Local target (e.g., "localhost:8080")
+	BasicAuth          string `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
+	Capability         string `json:"capability,omitempty"` // optional capability required by the public route
+	CapabilityAudience string `json:"capability_audience,omitempty"`
 }
 
 // tunnelFlag implements flag.Value for multiple --tunnel flags
@@ -363,7 +364,7 @@ func RunClient(args []string) {
 		}
 		if len(tunnels) == 0 && len(cfg.Tunnels) > 0 {
 			for _, t := range cfg.Tunnels {
-				tunnels = append(tunnels, TunnelConfig{Name: t.Name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability})
+				tunnels = append(tunnels, TunnelConfig{Name: t.Name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability, CapabilityAudience: t.CapabilityAudience})
 			}
 		}
 		if len(udpTunnels) == 0 && len(cfg.UDP) > 0 {
