@@ -4,9 +4,11 @@ set -euo pipefail
 BASELINE=${BASELINE:-bench/baseline.json}
 SCALE=${SCALE:-bench/results-scale.json}
 APPLES=${APPLES:-bench/results.csv}
-python3 - "$BASELINE" "$SCALE" "$APPLES" <<'PY'
+ANALYTICS_OUT=${ANALYTICS_OUT:-${ARTIFACT_DIR:-.artifacts/benchmark}/summary.json}
+mkdir -p "$(dirname "$ANALYTICS_OUT")"
+python3 - "$BASELINE" "$SCALE" "$APPLES" "$ANALYTICS_OUT" <<'PY'
 import csv, json, os, sys
-base_path, scale_path, apples_path = sys.argv[1:]
+base_path, scale_path, apples_path, analytics_path = sys.argv[1:]
 base = json.load(open(base_path))
 failed = []
 if os.path.exists(scale_path):
@@ -43,8 +45,7 @@ if os.path.exists(apples_path):
                          "error_rate": (len(records)-len(ok))/len(records) if records else 0,
                          "throughput_bytes_per_sec": sum(x[2] for x in ok) / (sum(x[0] for x in ok)/1000) if ok and sum(x[0] for x in ok) else 0}
         print(f"{impl}: p50={summary[impl]['p50_ms']:.2f}ms p95={summary[impl]['p95_ms']:.2f}ms p99={summary[impl]['p99_ms']:.2f}ms errors={summary[impl]['error_rate']:.1%} throughput={summary[impl]['throughput_bytes_per_sec']:.0f}B/s")
-    if os.environ.get("ANALYTICS_OUT"):
-        json.dump(summary, open(os.environ["ANALYTICS_OUT"], "w"), indent=2)
+    json.dump({"schema_version":"xrok.benchmark-summary/v1", "baseline":base_path, "implementations":summary}, open(analytics_path, "w"), indent=2)
     if summary.get("xrok") and summary.get("frp"):
         x = summary["xrok"]; f = summary["frp"]
         pct = (x["p95_ms"]/f["p95_ms"]-1)*100 if f["p95_ms"] else 0
@@ -54,6 +55,8 @@ if os.path.exists(apples_path):
         if x["error_rate"] > float(lim.get("max_error_rate", 0.05)): failed.append(f"xrok error rate {x['error_rate']:.1%}")
 else:
     print(f"warning: {apples_path} not found; run scripts/benchmark-apples.sh")
+if not os.path.exists(analytics_path):
+    json.dump({"schema_version":"xrok.benchmark-summary/v1", "baseline":base_path, "implementations":{}}, open(analytics_path,"w"), indent=2)
 if failed:
     print("REGRESSION FAILED")
     print("\n".join("- "+x for x in failed))

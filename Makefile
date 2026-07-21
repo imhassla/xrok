@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench regression e2e fuzz security api-compat ci-local check
+.PHONY: build test race vet bench regression e2e fuzz security fault-injection api-compat ci-local check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -18,6 +18,9 @@ vet:
 
 fuzz:
 	$(GO_ENV) go test ./cmd/config ./cmd/p2p -run '^$$' -fuzz=Fuzz -fuzztime=10s
+
+fault-injection:
+	$(GO_ENV) go test ./cmd/p2p -run 'TestFault' -count=1
 
 security: vet fuzz
 
