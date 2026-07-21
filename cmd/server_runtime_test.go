@@ -34,3 +34,25 @@ func TestServerRuntimeStartOnce(t *testing.T) {
 		t.Fatal("expected start-once error")
 	}
 }
+
+func TestServerRuntimeInjectableRunner(t *testing.T) {
+	called := make(chan []string, 1)
+	r, err := NewServerRuntimeWithDeps(config.ServerConfig{Domain: "test.local", ProxyPort: 0}, ServerRuntimeDeps{
+		Run: func(args []string) { called <- args },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.Wait()
+	select {
+	case args := <-called:
+		if len(args) == 0 || args[0] != "--domain" {
+			t.Fatalf("unexpected args: %v", args)
+		}
+	default:
+		t.Fatal("injected runner was not called")
+	}
+}

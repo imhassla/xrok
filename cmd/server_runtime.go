@@ -19,6 +19,7 @@ type ServerRuntime struct {
 	start bool
 	stop  sync.Once
 	done  chan struct{}
+	run   func([]string)
 }
 
 func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
@@ -26,6 +27,21 @@ func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
 		return nil, err
 	}
 	return &ServerRuntime{cfg: cfg, done: make(chan struct{})}, nil
+}
+
+// ServerRuntimeDeps allows embedders and tests to inject the serving loop.
+// When Run is nil, the legacy CLI runner is used for backwards compatibility.
+type ServerRuntimeDeps struct {
+	Run func([]string)
+}
+
+func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error) {
+	r, err := NewServerRuntime(cfg)
+	if err != nil {
+		return nil, err
+	}
+	r.run = deps.Run
+	return r, nil
 }
 
 // Start launches the server asynchronously and returns when listeners are
@@ -43,7 +59,11 @@ func (r *ServerRuntime) Start(ctx context.Context) error {
 
 	args := r.args()
 	go func() {
-		RunServer(args)
+		if r.run != nil {
+			r.run(args)
+		} else {
+			RunServer(args)
+		}
 		close(r.done)
 	}()
 	go func() {

@@ -34,3 +34,15 @@ func TestClientRuntimeContextAndClose(t *testing.T) {
 	// Close is intentionally idempotent.
 	r.Close()
 }
+
+func TestCurrentClientStatePrefersInjectedRuntime(t *testing.T) {
+	oldRuntime, oldState := clientRuntime_, clientState_
+	defer func() { clientRuntime_, clientState_ = oldRuntime, oldState }()
+	r := NewClientRuntime(nil)
+	r.Update(func(s *clientState) { s.ServerAddr = "runtime" })
+	clientRuntime_ = r
+	clientState_ = &clientState{ServerAddr: "legacy"}
+	if got := currentClientState().ServerAddr; got != "runtime" {
+		t.Fatalf("currentClientState() = %q, want runtime state", got)
+	}
+}

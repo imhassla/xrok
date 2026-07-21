@@ -261,6 +261,20 @@ func NewClientRuntime(l *logger.Logger) *ClientRuntime {
 // diagnostics. It returns nil until RunClient has initialized the client.
 func CurrentClientRuntime() *ClientRuntime { return clientRuntime_ }
 
+// currentClientState resolves the active state through the injected runtime.
+// The global pointer is retained only as a compatibility fallback for legacy
+// callers; new handlers should use this accessor instead of clientState_.
+func currentClientState() *clientState {
+	if r := clientRuntime_; r != nil {
+		if s := r.State(); s != nil {
+			return s
+		}
+	}
+	clientStateMutex.Lock()
+	defer clientStateMutex.Unlock()
+	return clientState_
+}
+
 // State returns a snapshot pointer for read-only inspection. Mutations should
 // use Update to preserve lifecycle synchronization.
 func (r *ClientRuntime) State() *clientState { r.mu.RLock(); defer r.mu.RUnlock(); return r.state }
@@ -624,10 +638,10 @@ func RunClient(args []string) {
 		P2PTunnels:     make(map[string]*p2p.P2PTunnel),
 	}
 	clientRuntime_.replaceState(clientState_)
-	clientState_ = clientRuntime_.State()
+	state := clientRuntime_.State()
 	// For backwards compatibility with single tunnel
 	if len(tunnelConfigs) == 1 {
-		clientState_.LocalPort = tunnelConfigs[0].Target
+		state.LocalPort = tunnelConfigs[0].Target
 	}
 
 	rootCAs, err := loadRootCAs(*caCert)
@@ -648,10 +662,10 @@ func RunClient(args []string) {
 			os.Exit(1)
 		}
 		baseTLSConfig.Certificates = []tls.Certificate{cert}
-		clientState_.TLSConfig = baseTLSConfig
+		state.TLSConfig = baseTLSConfig
 		clientLog.Info("mTLS enabled with client certificate")
 	} else {
-		clientState_.TLSConfig = baseTLSConfig
+		state.TLSConfig = baseTLSConfig
 	}
 
 	// Log HTTP proxy if configured
@@ -668,9 +682,9 @@ func RunClient(args []string) {
 			clientLog.Warn("P2P discovery failed: %v, continuing without P2P", err)
 		} else {
 			clientStateMutex.Lock()
-			clientState_.P2PManager = p2pMgr
-			clientState_.P2PEnabled = true
-			clientState_.P2PInfo = peerInfo
+			state.P2PManager = p2pMgr
+			state.P2PEnabled = true
+			state.P2PInfo = peerInfo
 			clientStateMutex.Unlock()
 			clientLog.Info("P2P enabled: %s (NAT: %s)", peerInfo.PublicAddr, peerInfo.NATType)
 		}
@@ -682,7 +696,7 @@ func RunClient(args []string) {
 			clientLog.Error("--stdio-target is required when using --stdio mode")
 			os.Exit(1)
 		}
-		runStdioMode(clientState_, *apiToken)
+		runStdioMode(state, *apiToken)
 		return
 	}
 
@@ -709,12 +723,12 @@ func RunClient(args []string) {
 		}
 		folderAddr := fmt.Sprintf("127.0.0.1:%d", port)
 		clientStateMutex.Lock()
-		clientState_.LocalPort = folderAddr
+		state.LocalPort = folderAddr
 		// Update TunnelMap with actual folder server port
-		for i := range clientState_.Tunnels {
-			if clientState_.Tunnels[i].Target == "folder-placeholder" {
-				clientState_.Tunnels[i].Target = folderAddr
-				clientState_.TunnelMap[clientState_.Tunnels[i].Name] = folderAddr
+		for i := range state.Tunnels {
+			if state.Tunnels[i].Target == "folder-placeholder" {
+				state.Tunnels[i].Target = folderAddr
+				state.TunnelMap[state.Tunnels[i].Name] = folderAddr
 			}
 		}
 		clientStateMutex.Unlock()
@@ -722,7 +736,7 @@ func RunClient(args []string) {
 		go serveFolderLocally(ctx, *folderPath, folderAddr, &wg)
 	} else {
 		clientStateMutex.Lock()
-		clientState_.LocalPort = *localPort
+		state.LocalPort = *localPort
 		clientStateMutex.Unlock()
 	}
 
@@ -730,7 +744,7 @@ func RunClient(args []string) {
 		wg.Add(1)
 		go startLocalProxy(ctx, *proxyAddr, &wg)
 		clientStateMutex.Lock()
-		clientState_.LocalPort = *proxyAddr
+		state.LocalPort = *proxyAddr
 		clientStateMutex.Unlock()
 	}
 
@@ -775,7 +789,7 @@ func RunClient(args []string) {
 	}
 
 	wg.Add(1)
-	go runWithReconnect(ctx, clientState_, *apiToken, &wg)
+	go runWithReconnect(ctx, state, *apiToken, &wg)
 
 	wg.Wait()
 
@@ -903,13 +917,11 @@ func openDynamicStream(target string) (net.Conn, error) {
 	if len(target) == 0 || len(target) > 255 {
 		return nil, fmt.Errorf("invalid dynamic target length")
 	}
-	clientStateMutex.Lock()
-	state := clientState_
+	state := currentClientState()
 	var session *yamux.Session
 	if state != nil {
 		session = state.MuxSession
 	}
-	clientStateMutex.Unlock()
 	if session == nil {
 		return nil, fmt.Errorf("no tunnel connection available")
 	}
@@ -1075,7 +1087,7 @@ func registerClient(state *clientState, token string) bool {
 		Reverse:        reverseConfigs,
 		Headers:        state.Headers,
 		Compress:       state.Compress,
-		P2PInfo:        clientState_.P2PInfo,
+		P2PInfo:        state.P2PInfo,
 	}
 
 	// Build HTTP transport with optional proxy support
@@ -2156,9 +2168,11 @@ func runUDPTunnel(ctx context.Context, localAddr, remoteAddr string) {
 		}
 
 		// Get mux session
-		clientStateMutex.Lock()
-		session := clientState_.MuxSession
-		clientStateMutex.Unlock()
+		state := currentClientState()
+		var session *yamux.Session
+		if state != nil {
+			session = state.MuxSession
+		}
 
 		if session == nil {
 			log.Printf("UDP: No tunnel connection available")
