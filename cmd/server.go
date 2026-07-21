@@ -35,6 +35,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quic-go/quic-go"
 	"golang.org/x/time/rate"
+	"xrok/cmd/config"
 	"xrok/cmd/p2p"
 	"xrok/cmd/transport"
 )
@@ -115,6 +116,7 @@ type serverClientInfo struct {
 	p2pSignalMutex      sync.Mutex            // Mutex for P2P signaling
 	p2pConnections      map[string]net.Conn   // Active P2P connections (peerID -> conn)
 	p2pConnMutex        sync.RWMutex          // Mutex for P2P connections
+	sessionToken        string                // Credential for data-plane connections
 	decrementOnce       sync.Once             // Ensure active clients counter only decremented once
 }
 
@@ -129,15 +131,16 @@ type TunnelRoute struct {
 
 // Server globals
 var (
-	serverDebug                    bool
-	serverClientCA                 string
-	serverRequestLog               bool
-	serverClients                  = make(map[string]*serverClientInfo)
-	serverClientsMutex             sync.Mutex
-	serverDomain                   string
-	serverCertFile                 string
-	serverKeyFile                  string
-	serverUpgrader                 = websocket.Upgrader{
+	serverDebug        bool
+	serverClientCA     string
+	serverRequestLog   bool
+	serverClients      = make(map[string]*serverClientInfo)
+	serverClientsMutex sync.Mutex
+	serverDomain       string
+	serverCertFile     string
+	serverKeyFile      string
+	serverPort         = 443
+	serverUpgrader     = websocket.Upgrader{
 		CheckOrigin:       func(r *http.Request) bool { return true },
 		EnableCompression: true,
 	}
@@ -146,6 +149,7 @@ var (
 	serverUsedPorts                = make(map[int]bool)
 	serverPortMutex                sync.Mutex
 	serverInactivityTimeout        = 60 * time.Minute
+	serverStartTime                = time.Now()
 
 	serverBasePortNoTLS     = 4000
 	serverBaseClientPortTLS = 7000
@@ -176,10 +180,10 @@ var (
 	serverRateLimiters     = make(map[string]*rate.Limiter)
 	serverRateLimiterMutex sync.Mutex
 
-	serverRateLimit  = rate.Limit(10)
-	serverRateBurst  = 20
-	serverRegLimit   = rate.Limit(1)
-	serverRegBurst   = 5
+	serverRateLimit   = rate.Limit(10)
+	serverRateBurst   = 20
+	serverRegLimit    = rate.Limit(1)
+	serverRegBurst    = 5
 	serverRegLimiters = make(map[string]*rate.Limiter)
 )
 
@@ -257,14 +261,52 @@ func (t *srvConnectionTimer) observe() {
 
 // RunServer runs the xrok server with the given arguments
 func RunServer(args []string) {
-	setupServerLogging()
+	var loadedConfig *config.ServerConfig
+	for i, arg := range args {
+		if (arg == "-config" || arg == "--config") && i+1 < len(args) {
+			cfg, err := config.LoadServerConfig(args[i+1])
+			if err != nil {
+				fmt.Printf("Failed to load server config: %v\n", err)
+				return
+			}
+			loadedConfig = cfg
+			break
+		}
+	}
+	if loadedConfig != nil {
+		serverDomain = loadedConfig.Domain
+		serverPort = loadedConfig.ProxyPort
+		serverDebug = loadedConfig.Debug
+		serverRequestLog = loadedConfig.RequestLog
+		serverClientCA = loadedConfig.ClientCAPath
+		serverCertFile = loadedConfig.TLSCertPath
+		serverKeyFile = loadedConfig.TLSKeyPath
+		if loadedConfig.StateFile != "" {
+			serverStateFile = loadedConfig.StateFile
+		}
+		if loadedConfig.LogFile != "" {
+			serverLogFile = loadedConfig.LogFile
+		}
+		if loadedConfig.RateLimit > 0 {
+			serverRateLimit = rate.Limit(loadedConfig.RateLimit)
+			serverRateBurst = loadedConfig.RateLimit * 2
+		}
+		serverApiToken = loadedConfig.APIToken
+	}
 
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	fs.String("config", "", "Path to YAML config file")
 	fs.StringVar(&serverDomain, "domain", "", "Domain to use in URLs (required)")
-	fs.BoolVar(&serverDebug, "debug", false, "Enable debug logging")
-	fs.BoolVar(&serverRequestLog, "request-log", false, "Enable HTTP request logging")
-	fs.StringVar(&serverClientCA, "client-ca", "", "Path to CA certificate for mTLS client verification")
+	fs.IntVar(&serverPort, "port", serverPort, "Unified HTTPS and QUIC port")
+	fs.StringVar(&serverCertFile, "tls-cert", serverCertFile, "Path to TLS certificate")
+	fs.StringVar(&serverKeyFile, "tls-key", serverKeyFile, "Path to TLS private key")
+	fs.StringVar(&serverStateFile, "state-file", serverStateFile, "Path to persisted server state")
+	fs.StringVar(&serverLogFile, "log-file", serverLogFile, "Path to server log")
+	fs.BoolVar(&serverDebug, "debug", serverDebug, "Enable debug logging")
+	fs.BoolVar(&serverRequestLog, "request-log", serverRequestLog, "Enable HTTP request logging")
+	fs.StringVar(&serverClientCA, "client-ca", serverClientCA, "Path to CA certificate for mTLS client verification")
 	fs.Parse(args)
+	setupServerLogging()
 
 	if serverDomain == "" {
 		fmt.Println("Flag -domain is required.")
@@ -294,14 +336,14 @@ func RunServer(args []string) {
 	serverWg.Add(1)
 	go func() {
 		defer serverWg.Done()
-		waitForProxyConnectionTLS(ctx, 443)
+		waitForProxyConnectionTLS(ctx, serverPort)
 	}()
 
 	// Start QUIC listener on port 443 (UDP)
 	serverWg.Add(1)
 	go func() {
 		defer serverWg.Done()
-		waitForQUICConnections(ctx, 443)
+		waitForQUICConnections(ctx, serverPort)
 	}()
 
 	defer func() {
@@ -327,12 +369,24 @@ func setupServerLogging() {
 }
 
 func initServerCertificates() {
-	serverCertFile = fmt.Sprintf("/etc/letsencrypt/live/%s/fullchain.pem", serverDomain)
-	serverKeyFile = fmt.Sprintf("/etc/letsencrypt/live/%s/privkey.pem", serverDomain)
+	if serverCertFile == "" {
+		serverCertFile = fmt.Sprintf("/etc/letsencrypt/live/%s/fullchain.pem", serverDomain)
+	}
+	if serverKeyFile == "" {
+		serverKeyFile = fmt.Sprintf("/etc/letsencrypt/live/%s/privkey.pem", serverDomain)
+	}
 }
 
 func initServerAuth() {
-	serverApiToken = os.Getenv("XROK_API_TOKEN")
+	if token := os.Getenv("XROK_API_TOKEN"); token != "" {
+		serverApiToken = token
+	}
+	if configuredLimit := os.Getenv("XROK_RATE_LIMIT"); configuredLimit != "" {
+		if n, err := strconv.Atoi(configuredLimit); err == nil && n > 0 {
+			serverRateLimit = rate.Limit(n)
+			serverRateBurst = n * 2
+		}
+	}
 	if serverApiToken != "" {
 		serverAuthEnabled = true
 		log.Printf("API authentication enabled")
@@ -764,6 +818,10 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	if regReq.ConnectionType == "" {
 		regReq.ConnectionType = "tls" // default
 	}
+	if regReq.ConnectionType != "tls" && regReq.ConnectionType != "quic" && regReq.ConnectionType != "non-tls" {
+		http.Error(w, "Invalid connection_type parameter", http.StatusBadRequest)
+		return
+	}
 
 	portNoTLS, clientPortTLS := generateServerPorts()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -853,11 +911,12 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		wsConnChans:    make(map[string]chan *websocket.Conn),
 		tunnels:        tunnels,
 		tunnelMap:      tunnelMap,
-		reverseConfigs:  regReq.Reverse,
-		customHeaders:   regReq.Headers,
-		compress:        regReq.Compress,
-		p2pInfo:         regReq.P2PInfo,
-		p2pConnections:  make(map[string]net.Conn),
+		reverseConfigs: regReq.Reverse,
+		customHeaders:  regReq.Headers,
+		compress:       regReq.Compress,
+		p2pInfo:        regReq.P2PInfo,
+		p2pConnections: make(map[string]net.Conn),
+		sessionToken:   generateServerToken(),
 	}
 	client.SetLastActivity(time.Now())
 
@@ -868,7 +927,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	// Register tunnel routes
 	serverTunnelRoutesMutex.Lock()
 	for _, t := range tunnels {
-		log.Printf("Registering tunnel route: name=%s, target=%s, basicAuth=%q, headers=%v", t.Name, t.Target, t.BasicAuth, regReq.Headers)
+		log.Printf("Registering tunnel route: name=%s, target=%s, auth_configured=%t, header_count=%d", t.Name, t.Target, t.BasicAuth != "", len(regReq.Headers))
 		serverTunnelRoutes[t.Name] = &TunnelRoute{
 			ClientID:   clientID,
 			TunnelName: t.Name,
@@ -907,9 +966,6 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			defer serverWg.Done()
 			waitForProxyConnectionNoTLS(ctx, client, client.PortNoTLS)
 		}()
-	default:
-		http.Error(w, "Invalid connection_type parameter", http.StatusBadRequest)
-		return
 	}
 
 	serverWg.Add(1)
@@ -929,6 +985,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		ProxyURLNoTLS string             `json:"proxy_url_notls"`
 		ProxyURLTLS   string             `json:"proxy_url_tls,omitempty"`
 		Tunnels       []ServerTunnelInfo `json:"tunnels,omitempty"`
+		SessionToken  string             `json:"session_token"`
 	}
 
 	response := regResponse{
@@ -936,6 +993,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		ClientPortTLS: strconv.Itoa(clientPortTLS),
 		ProxyURLNoTLS: fmt.Sprintf("%s:%d", serverDomain, portNoTLS),
 		Tunnels:       tunnelInfos,
+		SessionToken:  client.sessionToken,
 	}
 
 	if regReq.ConnectionType == "tls" {
@@ -1021,8 +1079,13 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 				w.Write([]byte("=================\n"))
 				w.Write([]byte(fmt.Sprintf("Active Clients: %d\n", clientCount)))
 				return
+			case "/status":
+				serverAuthMiddleware(serverStatusHandler)(w, r)
+				return
 			case "/metrics":
-				promhttp.Handler().ServeHTTP(w, r)
+				serverAuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+					promhttp.Handler().ServeHTTP(w, r)
+				})(w, r)
 				return
 			default:
 				http.Error(w, "Not Found", http.StatusNotFound)
@@ -1101,7 +1164,7 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 			caCertPool := x509.NewCertPool()
 			if caCertPool.AppendCertsFromPEM(caCert) {
 				tlsConfig.ClientCAs = caCertPool
-				tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven // Optional client cert
+				tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 				log.Printf("mTLS enabled: client certificates will be verified against %s", serverClientCA)
 			} else {
 				log.Printf("Failed to parse client CA certificate")
@@ -1129,6 +1192,33 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 	if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 		log.Printf("HTTPS server error: %v", err)
 	}
+}
+
+func serverStatusHandler(w http.ResponseWriter, _ *http.Request) {
+	serverClientsMutex.Lock()
+	clients := len(serverClients)
+	serverClientsMutex.Unlock()
+
+	serverTunnelRoutesMutex.RLock()
+	tunnels := make([]TunnelStatus, 0, len(serverTunnelRoutes))
+	for _, route := range serverTunnelRoutes {
+		tunnels = append(tunnels, TunnelStatus{
+			Name:     route.TunnelName,
+			Target:   route.Target,
+			URL:      fmt.Sprintf("https://%s.%s", route.TunnelName, serverDomain),
+			ClientID: route.ClientID,
+		})
+	}
+	serverTunnelRoutesMutex.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ServerStatus{
+		Status:  "healthy",
+		Uptime:  time.Since(serverStartTime).Round(time.Second).String(),
+		Version: "2.0.0",
+		Clients: clients,
+		Tunnels: tunnels,
+	})
 }
 
 // waitForQUICConnections handles QUIC connections
@@ -1190,19 +1280,20 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 	}
 
 	regMsg := string(regBuf[:n])
-	if !strings.HasPrefix(regMsg, "XROK:") {
+	parts := strings.SplitN(regMsg, ":", 3)
+	if len(parts) != 3 || parts[0] != "XROK" {
 		log.Printf("QUIC: Invalid registration message")
 		conn.Close()
 		return
 	}
 
-	clientID := strings.TrimPrefix(regMsg, "XROK:")
+	clientID, sessionToken := parts[1], parts[2]
 
 	serverClientsMutex.Lock()
 	client, exists := serverClients[clientID]
 	serverClientsMutex.Unlock()
 
-	if !exists {
+	if !exists || subtle.ConstantTimeCompare([]byte(sessionToken), []byte(client.sessionToken)) != 1 {
 		log.Printf("QUIC: Unknown client %s", clientID)
 		conn.Close()
 		return
@@ -2267,21 +2358,28 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	serverClientsMutex.Lock()
+	client, exists := serverClients[clientID]
+	serverClientsMutex.Unlock()
+	if !exists {
+		http.Error(w, "Unknown client", http.StatusNotFound)
+		return
+	}
+	sessionToken := r.Header.Get("X-Xrok-Session")
+	if sessionToken == "" {
+		sessionToken = r.URL.Query().Get("session_token")
+	}
+	if subtle.ConstantTimeCompare([]byte(sessionToken), []byte(client.sessionToken)) != 1 {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	wsConn, err := serverUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Failed to upgrade mux WebSocket: %v", err)
 		return
 	}
 	srvWsUpgrades.Inc()
-
-	serverClientsMutex.Lock()
-	client, exists := serverClients[clientID]
-	serverClientsMutex.Unlock()
-	if !exists {
-		log.Printf("Client not found for mux: %s", clientID)
-		wsConn.Close()
-		return
-	}
 
 	config := yamux.DefaultConfig()
 	config.AcceptBacklog = 256
@@ -2722,11 +2820,11 @@ func handleP2PSignaling(w http.ResponseWriter, r *http.Request) {
 // handleP2PClients returns list of P2P-enabled clients for debugging
 func handleP2PClients(w http.ResponseWriter, r *http.Request) {
 	type clientInfo struct {
-		ClientID   string       `json:"client_id"`
-		Tunnels    []string     `json:"tunnels"`
-		P2PEnabled bool         `json:"p2p_enabled"`
+		ClientID   string        `json:"client_id"`
+		Tunnels    []string      `json:"tunnels"`
+		P2PEnabled bool          `json:"p2p_enabled"`
 		P2PInfo    *p2p.PeerInfo `json:"p2p_info,omitempty"`
-		HasSignal  bool         `json:"has_signal"`
+		HasSignal  bool          `json:"has_signal"`
 	}
 
 	serverClientsMutex.Lock()
@@ -2819,8 +2917,8 @@ func handleP2PTunnelOwner(w http.ResponseWriter, r *http.Request) {
 	serverClientsMutex.Unlock()
 
 	response := map[string]interface{}{
-		"tunnel":     tunnelName,
-		"client_id":  route.ClientID,
+		"tunnel":      tunnelName,
+		"client_id":   route.ClientID,
 		"p2p_enabled": false,
 	}
 

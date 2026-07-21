@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -34,9 +35,9 @@ import (
 
 // TunnelConfig represents a single tunnel configuration
 type TunnelConfig struct {
-	Name      string `json:"name"`                   // Subdomain name (e.g., "app", "api")
-	Target    string `json:"target"`                 // Local target (e.g., "localhost:8080")
-	BasicAuth string `json:"basic_auth,omitempty"`   // HTTP Basic Auth (user:password)
+	Name      string `json:"name"`                 // Subdomain name (e.g., "app", "api")
+	Target    string `json:"target"`               // Local target (e.g., "localhost:8080")
+	BasicAuth string `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
 }
 
 // tunnelFlag implements flag.Value for multiple --tunnel flags
@@ -185,39 +186,41 @@ type TunnelInfo struct {
 }
 
 type clientState struct {
-	ProxyURL       string
-	ClientPort     string
-	ServerAddr     string
-	LocalPort      string // Legacy single tunnel
-	Tunnels        []TunnelConfig
-	TunnelMap      map[string]string // name -> target mapping
-	UDPTunnels     []UDPTunnelConfig // UDP tunnel configurations
-	ReverseTunnels []ReverseConfig   // Reverse forwarding configurations
-	ReverseMap     map[string]string // remote -> local mapping
-	UseTLS         bool
-	UseProxy       bool
-	Socks5Addr     string // SOCKS5 proxy address
-	ConnectionID   string
-	MuxSession     *yamux.Session
-	QUICConn       *transport.QUICConn // QUIC connection
-	UseQUIC        bool                // Use QUIC transport
-	Headers        map[string]string   // Custom headers to inject
-	Compress       bool                // Enable compression
-	HTTPProxy      string              // HTTP CONNECT proxy URL
-	ClientCert     string              // Path to client certificate for mTLS
-	ClientKey      string              // Path to client private key for mTLS
-	TLSConfig      *tls.Config         // TLS config with mTLS if configured
-	StdioMode      bool                // Stdio tunneling mode
-	StdioTarget    string              // Target for stdio mode
-	P2PManager       *p2p.P2PManager
-	P2PEnabled       bool
-	P2PInfo          *p2p.PeerInfo
-	P2PSignalConn    *websocket.Conn         // WebSocket for P2P signaling
-	P2PSignalMutex   sync.Mutex              // Mutex for P2P signaling
-	P2PConnections   map[string]net.Conn     // Active P2P connections (peerID -> conn)
-	P2PConnMutex     sync.RWMutex            // Mutex for P2P connections
-	P2PTunnels       map[string]*p2p.P2PTunnel // P2P tunnels for HTTP traffic (peerID -> tunnel)
-	P2PTunnelsMutex  sync.RWMutex            // Mutex for P2P tunnels
+	ProxyURL        string
+	ClientPort      string
+	ServerAddr      string
+	LocalPort       string // Legacy single tunnel
+	Tunnels         []TunnelConfig
+	TunnelMap       map[string]string // name -> target mapping
+	UDPTunnels      []UDPTunnelConfig // UDP tunnel configurations
+	ReverseTunnels  []ReverseConfig   // Reverse forwarding configurations
+	ReverseMap      map[string]string // remote -> local mapping
+	UseTLS          bool
+	UseProxy        bool
+	Socks5Addr      string // SOCKS5 proxy address
+	ConnectionID    string
+	MuxSession      *yamux.Session
+	QUICConn        *transport.QUICConn // QUIC connection
+	UseQUIC         bool                // Use QUIC transport
+	Headers         map[string]string   // Custom headers to inject
+	Compress        bool                // Enable compression
+	HTTPProxy       string              // HTTP CONNECT proxy URL
+	ClientCert      string              // Path to client certificate for mTLS
+	ClientKey       string              // Path to client private key for mTLS
+	TLSConfig       *tls.Config         // TLS config with mTLS if configured
+	SessionToken    string              // Credential returned by registration
+	APIToken        string              // Control-plane credential
+	StdioMode       bool                // Stdio tunneling mode
+	StdioTarget     string              // Target for stdio mode
+	P2PManager      *p2p.P2PManager
+	P2PEnabled      bool
+	P2PInfo         *p2p.PeerInfo
+	P2PSignalConn   *websocket.Conn           // WebSocket for P2P signaling
+	P2PSignalMutex  sync.Mutex                // Mutex for P2P signaling
+	P2PConnections  map[string]net.Conn       // Active P2P connections (peerID -> conn)
+	P2PConnMutex    sync.RWMutex              // Mutex for P2P connections
+	P2PTunnels      map[string]*p2p.P2PTunnel // P2P tunnels for HTTP traffic (peerID -> tunnel)
+	P2PTunnelsMutex sync.RWMutex              // Mutex for P2P tunnels
 }
 
 type registerResponse struct {
@@ -226,6 +229,7 @@ type registerResponse struct {
 	ProxyURLNoTLS string       `json:"proxy_url_notls"`
 	ClientPortTLS string       `json:"client_port_tls"`
 	Tunnels       []TunnelInfo `json:"tunnels,omitempty"`
+	SessionToken  string       `json:"session_token"`
 }
 
 var (
@@ -298,6 +302,8 @@ func RunClient(args []string) {
 	// mTLS client certificates
 	clientCert := fs.String("client-cert", "", "Path to client certificate for mTLS")
 	clientKey := fs.String("client-key", "", "Path to client private key for mTLS")
+	caCert := fs.String("ca-cert", "", "Path to CA certificate for server verification")
+	insecureTLS := fs.Bool("insecure", false, "Skip TLS verification (development only)")
 
 	// Stdio tunneling mode
 	stdioMode := fs.Bool("stdio", false, "Run in stdio mode for SSH ProxyCommand")
@@ -398,6 +404,12 @@ func RunClient(args []string) {
 		}
 		if *clientKey == "" && cfg.ClientKey != "" {
 			*clientKey = cfg.ClientKey
+		}
+		if *caCert == "" && cfg.CACert != "" {
+			*caCert = cfg.CACert
+		}
+		if cfg.Insecure {
+			*insecureTLS = true
 		}
 
 		// Apply P2P config
@@ -501,14 +513,25 @@ func RunClient(args []string) {
 		HTTPProxy:      *httpProxy,
 		ClientCert:     *clientCert,
 		ClientKey:      *clientKey,
-		StdioMode:       *stdioMode,
-		StdioTarget:     *stdioTarget,
-		P2PConnections:  make(map[string]net.Conn),
-		P2PTunnels:      make(map[string]*p2p.P2PTunnel),
+		APIToken:       *apiToken,
+		StdioMode:      *stdioMode,
+		StdioTarget:    *stdioTarget,
+		P2PConnections: make(map[string]net.Conn),
+		P2PTunnels:     make(map[string]*p2p.P2PTunnel),
 	}
 	// For backwards compatibility with single tunnel
 	if len(tunnelConfigs) == 1 {
 		clientState_.LocalPort = tunnelConfigs[0].Target
+	}
+
+	rootCAs, err := loadRootCAs(*caCert)
+	if err != nil {
+		clientLog.Error("Failed to load CA certificate: %v", err)
+		os.Exit(1)
+	}
+	baseTLSConfig := &tls.Config{RootCAs: rootCAs, InsecureSkipVerify: *insecureTLS, MinVersion: tls.VersionTLS12}
+	if *insecureTLS {
+		clientLog.Warn("TLS certificate verification is disabled")
 	}
 
 	// Initialize mTLS if client certificates are provided
@@ -518,15 +541,11 @@ func RunClient(args []string) {
 			clientLog.Error("Failed to load client certificate: %v", err)
 			os.Exit(1)
 		}
-		clientState_.TLSConfig = &tls.Config{
-			Certificates:       []tls.Certificate{cert},
-			InsecureSkipVerify: true, // Server cert validation handled separately
-		}
+		baseTLSConfig.Certificates = []tls.Certificate{cert}
+		clientState_.TLSConfig = baseTLSConfig
 		clientLog.Info("mTLS enabled with client certificate")
 	} else {
-		clientState_.TLSConfig = &tls.Config{
-			InsecureSkipVerify: true,
-		}
+		clientState_.TLSConfig = baseTLSConfig
 	}
 
 	// Log HTTP proxy if configured
@@ -715,6 +734,24 @@ func setupClientLogging() {
 // loadClientConfigFile loads client configuration from a YAML file
 func loadClientConfigFile(path string) (*config.ClientConfig, error) {
 	return config.LoadClientConfig(path)
+}
+
+func loadRootCAs(path string) (*x509.CertPool, error) {
+	if path == "" {
+		return nil, nil
+	}
+	pemData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pemData) {
+		return nil, fmt.Errorf("no certificates found in %s", path)
+	}
+	return pool, nil
 }
 
 func getRandomFreePort(min, max int) (int, error) {
@@ -979,6 +1016,7 @@ func registerClient(state *clientState, token string) bool {
 		}
 
 		clientID = res.UDID
+		state.SessionToken = res.SessionToken
 		state.ClientPort = res.ClientPortTLS
 
 		if state.UseTLS {
@@ -1164,7 +1202,7 @@ func connectQUICWithDisconnect(ctx context.Context, state *clientState, disconne
 	}
 
 	// Send client ID for association
-	regMsg := []byte(fmt.Sprintf("XROK:%s", clientID))
+	regMsg := []byte(fmt.Sprintf("XROK:%s:%s", clientID, state.SessionToken))
 	if _, err := regStream.Write(regMsg); err != nil {
 		clientLog.Error("Failed to send QUIC registration: %v", err)
 		conn.Close()
@@ -1330,7 +1368,9 @@ func connectMuxWithDisconnect(ctx context.Context, state *clientState, disconnec
 		dialer.Proxy = http.ProxyURL(proxyURL)
 	}
 
-	conn, _, err := dialer.Dial(u.String(), nil)
+	headers := http.Header{}
+	headers.Set("X-Xrok-Session", state.SessionToken)
+	conn, _, err := dialer.Dial(u.String(), headers)
 	if err != nil {
 		log.Printf("Failed to establish mux connection: %v", err)
 		return
@@ -1581,7 +1621,11 @@ func connectAndForwardSession(ctx context.Context, state *clientState) {
 		dialer.Proxy = http.ProxyURL(proxyURL)
 	}
 
-	conn, resp, err := dialer.Dial(u.String(), nil)
+	headers := http.Header{}
+	if state.APIToken != "" {
+		headers.Set("X-API-Token", state.APIToken)
+	}
+	conn, resp, err := dialer.Dial(u.String(), headers)
 	if err != nil {
 		if resp != nil {
 			log.Printf("WebSocket connection failed with status: %d %s", resp.StatusCode, resp.Status)
@@ -1872,7 +1916,9 @@ func runStdioMode(state *clientState, token string) {
 		},
 	}
 
-	conn, _, err := dialer.Dial(u.String(), nil)
+	headers := http.Header{}
+	headers.Set("X-Xrok-Session", state.SessionToken)
+	conn, _, err := dialer.Dial(u.String(), headers)
 	if err != nil {
 		clientLog.Error("Failed to establish mux connection: %v", err)
 		os.Exit(1)

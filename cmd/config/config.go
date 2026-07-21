@@ -11,29 +11,31 @@ import (
 
 // ClientConfig represents client configuration
 type ClientConfig struct {
-	Server    string         `yaml:"server"`
-	Token     string         `yaml:"token,omitempty"`
-	TLS       bool           `yaml:"tls"`
-	Debug     bool           `yaml:"debug"`
-	Quiet     bool           `yaml:"quiet"`
-	Verbose   bool           `yaml:"verbose"`
-	Tunnels   []TunnelConfig `yaml:"tunnels,omitempty"`
-	Socks5    string         `yaml:"socks5,omitempty"`
-	UDP       []UDPConfig    `yaml:"udp,omitempty"`
-	Reverse   []ReverseConfig `yaml:"reverse,omitempty"`
-	Reconnect ReconnectConfig `yaml:"reconnect"`
+	Server    string            `yaml:"server"`
+	Token     string            `yaml:"token,omitempty"`
+	TLS       bool              `yaml:"tls"`
+	Debug     bool              `yaml:"debug"`
+	Quiet     bool              `yaml:"quiet"`
+	Verbose   bool              `yaml:"verbose"`
+	Tunnels   []TunnelConfig    `yaml:"tunnels,omitempty"`
+	Socks5    string            `yaml:"socks5,omitempty"`
+	UDP       []UDPConfig       `yaml:"udp,omitempty"`
+	Reverse   []ReverseConfig   `yaml:"reverse,omitempty"`
+	Reconnect ReconnectConfig   `yaml:"reconnect"`
 	Headers   map[string]string `yaml:"headers,omitempty"`
-	Compress  bool           `yaml:"compress"`
-	LogFile   string         `yaml:"log_file,omitempty"`
+	Compress  bool              `yaml:"compress"`
+	LogFile   string            `yaml:"log_file,omitempty"`
 	// Transport protocol: "websocket" (default), "quic"
-	Transport string         `yaml:"transport,omitempty"`
+	Transport string `yaml:"transport,omitempty"`
 	// P2P configuration
 	P2P P2PConfig `yaml:"p2p,omitempty"`
 	// HTTP CONNECT proxy for corporate environments
-	HTTPProxy  string `yaml:"http_proxy,omitempty"`
+	HTTPProxy string `yaml:"http_proxy,omitempty"`
 	// mTLS client certificates
 	ClientCert string `yaml:"client_cert,omitempty"`
 	ClientKey  string `yaml:"client_key,omitempty"`
+	CACert     string `yaml:"ca_cert,omitempty"`
+	Insecure   bool   `yaml:"insecure,omitempty"`
 }
 
 // TunnelConfig represents a tunnel configuration
@@ -72,25 +74,26 @@ type P2PConfig struct {
 
 // ServerConfig represents server configuration
 type ServerConfig struct {
-	Domain       string        `yaml:"domain"`
-	TLSCertPath  string        `yaml:"tls_cert_path,omitempty"`
-	TLSKeyPath   string        `yaml:"tls_key_path,omitempty"`
-	Port         int           `yaml:"port"`
-	ProxyPort    int           `yaml:"proxy_port"`
-	MetricsPort  int           `yaml:"metrics_port"`
-	Debug        bool          `yaml:"debug"`
-	Quiet        bool          `yaml:"quiet"`
-	Verbose      bool          `yaml:"verbose"`
-	APIToken     string        `yaml:"api_token,omitempty"`
-	RateLimit    int           `yaml:"rate_limit"`
-	LogFile      string        `yaml:"log_file,omitempty"`
-	StateFile    string        `yaml:"state_file,omitempty"`
-	IPWhitelist  []string      `yaml:"ip_whitelist,omitempty"`
-	RequestLog   bool          `yaml:"request_log"`
-	Compress     bool          `yaml:"compress"`
-	HealthCheck  HealthCheckConfig `yaml:"health_check"`
+	Domain      string            `yaml:"domain"`
+	TLSCertPath string            `yaml:"tls_cert_path,omitempty"`
+	TLSKeyPath  string            `yaml:"tls_key_path,omitempty"`
+	Port        int               `yaml:"port"`
+	ProxyPort   int               `yaml:"proxy_port"`
+	MetricsPort int               `yaml:"metrics_port"`
+	Debug       bool              `yaml:"debug"`
+	Quiet       bool              `yaml:"quiet"`
+	Verbose     bool              `yaml:"verbose"`
+	APIToken    string            `yaml:"api_token,omitempty"`
+	RateLimit   int               `yaml:"rate_limit"`
+	LogFile     string            `yaml:"log_file,omitempty"`
+	StateFile   string            `yaml:"state_file,omitempty"`
+	IPWhitelist []string          `yaml:"ip_whitelist,omitempty"`
+	RequestLog  bool              `yaml:"request_log"`
+	Compress    bool              `yaml:"compress"`
+	HealthCheck HealthCheckConfig `yaml:"health_check"`
 	// mTLS: CA certificate for verifying client certificates
 	ClientCAPath string `yaml:"client_ca_path,omitempty"`
+	Insecure     bool   `yaml:"insecure,omitempty"`
 }
 
 // HealthCheckConfig holds health check settings
@@ -103,10 +106,10 @@ type HealthCheckConfig struct {
 // DefaultClientConfig returns default client configuration
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
-		TLS:     true,
-		Debug:   false,
-		Quiet:   false,
-		Verbose: false,
+		TLS:      true,
+		Debug:    false,
+		Quiet:    false,
+		Verbose:  false,
 		Compress: false,
 		Reconnect: ReconnectConfig{
 			Enabled:     true,
@@ -121,7 +124,7 @@ func DefaultClientConfig() *ClientConfig {
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
 		Port:        7645,
-		ProxyPort:   444,
+		ProxyPort:   443,
 		MetricsPort: 9090,
 		Debug:       false,
 		Quiet:       false,

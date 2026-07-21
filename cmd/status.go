@@ -14,24 +14,24 @@ import (
 
 // ServerStatus represents the server status response
 type ServerStatus struct {
-	Status       string        `json:"status"`
-	Uptime       string        `json:"uptime"`
-	Version      string        `json:"version"`
-	Clients      int           `json:"clients"`
-	Connections  int           `json:"connections"`
-	BytesSent    int64         `json:"bytes_sent"`
-	BytesRecv    int64         `json:"bytes_received"`
-	Tunnels      []TunnelStatus `json:"tunnels,omitempty"`
+	Status      string         `json:"status"`
+	Uptime      string         `json:"uptime"`
+	Version     string         `json:"version"`
+	Clients     int            `json:"clients"`
+	Connections int            `json:"connections"`
+	BytesSent   int64          `json:"bytes_sent"`
+	BytesRecv   int64          `json:"bytes_received"`
+	Tunnels     []TunnelStatus `json:"tunnels,omitempty"`
 }
 
 // TunnelStatus represents a tunnel's status
 type TunnelStatus struct {
-	Name       string `json:"name"`
-	Target     string `json:"target"`
-	URL        string `json:"url"`
-	ClientID   string `json:"client_id"`
-	Connected  string `json:"connected"`
-	Requests   int64  `json:"requests"`
+	Name      string `json:"name"`
+	Target    string `json:"target"`
+	URL       string `json:"url"`
+	ClientID  string `json:"client_id"`
+	Connected string `json:"connected"`
+	Requests  int64  `json:"requests"`
 }
 
 // RunStatus runs the status command
@@ -40,8 +40,11 @@ func RunStatus(args []string) {
 
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	serverAddr := fs.String("server", "", "Server address to check status")
-	metricsPort := fs.Int("metrics-port", 9090, "Metrics port")
+	serverPort := fs.Int("port", 443, "Server HTTPS port")
 	jsonOutput := fs.Bool("json", false, "Output in JSON format")
+	apiToken := fs.String("token", "", "API token")
+	caCert := fs.String("ca-cert", "", "Path to CA certificate")
+	insecure := fs.Bool("insecure", false, "Skip TLS verification (development only)")
 	fs.Parse(args)
 
 	if *serverAddr == "" {
@@ -51,13 +54,18 @@ func RunStatus(args []string) {
 	}
 
 	// Try to fetch status from server
-	statusURL := fmt.Sprintf("http://%s:%d/status", *serverAddr, *metricsPort)
-	healthURL := fmt.Sprintf("http://%s:%d/health", *serverAddr, *metricsPort)
+	statusURL := fmt.Sprintf("https://%s:%d/status", *serverAddr, *serverPort)
+	healthURL := fmt.Sprintf("https://%s:%d/health", *serverAddr, *serverPort)
+	rootCAs, err := loadRootCAs(*caCert)
+	if err != nil {
+		log.Error("Failed to load CA certificate: %v", err)
+		return
+	}
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: *insecure, RootCAs: rootCAs, MinVersion: tls.VersionTLS12},
 		},
 	}
 
@@ -75,7 +83,11 @@ func RunStatus(args []string) {
 	}
 
 	// Try to get detailed status
-	statusResp, err := client.Get(statusURL)
+	statusReq, _ := http.NewRequest(http.MethodGet, statusURL, nil)
+	if *apiToken != "" {
+		statusReq.Header.Set("X-API-Token", *apiToken)
+	}
+	statusResp, err := client.Do(statusReq)
 	if err != nil || statusResp.StatusCode != http.StatusOK {
 		// Fallback to basic health info
 		if *jsonOutput {
