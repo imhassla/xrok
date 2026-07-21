@@ -1,0 +1,22 @@
+.PHONY: build test race vet e2e check
+
+GOCACHE ?= /tmp/xrok-go-build
+GOMODCACHE ?= /tmp/xrok-go-mod
+GO_ENV = GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE)
+
+build:
+	$(GO_ENV) go build ./...
+
+test:
+	$(GO_ENV) go test ./...
+
+race:
+	$(GO_ENV) go test -race ./...
+
+vet:
+	$(GO_ENV) go vet ./...
+
+e2e:
+	$(GO_ENV) go test -tags=e2e ./e2e -count=1
+
+check: test vet race

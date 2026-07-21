@@ -27,3 +27,11 @@ func TestInjectHeadersReplacesExistingValue(t *testing.T) {
 		t.Fatalf("new header missing:\n%s", result)
 	}
 }
+
+func TestInjectHeadersDoesNotRewriteBody(t *testing.T) {
+	request := []byte("POST / HTTP/1.1\r\nX-Env: old\r\nHost: app.localhost\r\nContent-Length: 11\r\n\r\nX-Env: old")
+	result := string(injectHeaders(request, map[string]string{"X-Env": "test"}))
+	if !strings.HasSuffix(result, "\r\n\r\nX-Env: old") {
+		t.Fatalf("body was modified:\n%s", result)
+	}
+}

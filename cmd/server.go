@@ -559,8 +559,14 @@ func injectHeaders(requestData []byte, headers map[string]string) []byte {
 		blocked[strings.ToLower(strings.TrimSpace(key))] = struct{}{}
 	}
 	filtered := make([]string, 0, len(lines))
+	inHeaders := true
 	for i, line := range lines {
-		if i == 0 || line == "" {
+		if i == 0 || !inHeaders {
+			filtered = append(filtered, line)
+			continue
+		}
+		if line == "" {
+			inHeaders = false
 			filtered = append(filtered, line)
 			continue
 		}
