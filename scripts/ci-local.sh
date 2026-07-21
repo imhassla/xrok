@@ -37,6 +37,9 @@ run api-compat ./scripts/api-snapshot.sh
 run go-race go test -race ./cmd/...
 # Short fuzz smoke verifies targets compile and execute deterministically.
 run fuzz-smoke bash -c 'go test ./cmd/config -run "^$" -fuzz=FuzzLoadServerConfigBytes -fuzztime=100ms && go test ./cmd/config -run "^$" -fuzz=FuzzLoadClientConfigBytes -fuzztime=100ms && go test ./cmd/p2p -run "^$" -fuzz=FuzzDecodeSignal -fuzztime=100ms'
+if [[ "${CI_RUN_E2E_SOAK:-0}" == 1 ]]; then
+  run e2e-soak ./scripts/e2e-soak.sh
+fi
 {
   echo "status=PASS"
   echo "artifact_dir=$ARTIFACT_DIR"
