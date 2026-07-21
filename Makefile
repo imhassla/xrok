@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench regression e2e fuzz security fault-injection api-compat ci-local check
+.PHONY: build test race vet bench regression e2e fuzz security fault-injection api-compat ci-local soak supply-chain check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -39,6 +39,12 @@ bench:
 
 regression:
 	./scripts/benchmark-regression.sh
+
+soak:
+	./scripts/soak-local.sh
+
+supply-chain:
+	./scripts/supply-chain-local.sh
 
 e2e:
 	$(GO_ENV) go test -tags=e2e ./e2e -count=1

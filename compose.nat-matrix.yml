@@ -1,0 +1,22 @@
+name: xrok-nat-matrix
+services:
+  coturn:
+    image: coturn/coturn:4.6.3
+    command: ["-n", "--no-cli", "--log-file=stdout", "--listening-port=3478", "--min-port=49160", "--max-port=49200", "--realm=xrok.local", "--lt-cred-mech", "--user=matrix:matrix-pass"]
+    networks: [public]
+  nat-host:
+    image: alpine:3.20
+    command: ["sh", "-c", "sleep infinity"]
+    network_mode: host
+  nat-bridge:
+    image: alpine:3.20
+    command: ["sh", "-c", "sleep infinity"]
+    networks: [private]
+  nat-relay:
+    image: coturn/coturn:4.6.3
+    command: ["sh", "-c", "sleep infinity"]
+    networks: [private, public]
+networks:
+  public: {}
+  private:
+    internal: true

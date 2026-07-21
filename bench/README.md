@@ -38,3 +38,12 @@ dependencies plus two xrok server replicas; `smoke` starts the stack and checks
 all healthchecks. Redis/Postgres endpoints are supplied through
 `XROK_HA_REDIS_ADDR` and `XROK_HA_POSTGRES_DSN` for injectable state-store and
 failover tests.
+
+For the real Docker integration (adapter-style load plus transient database
+failures), run `make ha-integration`. It performs bounded writes against both
+services, stops/starts each dependency, verifies persistence and replica
+recovery, and writes `.artifacts/ha-integration.json`:
+
+```sh
+HA_INTEGRATION_LOAD_ITERATIONS=250 HA_SMOKE_RETRIES=60 make ha-integration
+```
