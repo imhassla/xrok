@@ -11,6 +11,8 @@ import (
 
 // ClientConfig represents client configuration
 type ClientConfig struct {
+	// Version is the schema version. Zero denotes the legacy unversioned format.
+	Version   int               `yaml:"version,omitempty"`
 	Server    string            `yaml:"server"`
 	Token     string            `yaml:"token,omitempty"`
 	TLS       bool              `yaml:"tls"`
@@ -78,6 +80,7 @@ type P2PConfig struct {
 
 // ServerConfig represents server configuration
 type ServerConfig struct {
+	Version     int               `yaml:"version,omitempty"`
 	Domain      string            `yaml:"domain"`
 	TLSCertPath string            `yaml:"tls_cert_path,omitempty"`
 	TLSKeyPath  string            `yaml:"tls_key_path,omitempty"`
@@ -98,6 +101,26 @@ type ServerConfig struct {
 	// mTLS: CA certificate for verifying client certificates
 	ClientCAPath string `yaml:"client_ca_path,omitempty"`
 	Insecure     bool   `yaml:"insecure,omitempty"`
+}
+
+// CurrentVersion is the on-disk configuration schema version.
+const CurrentVersion = 1
+
+// MigrateClientConfig upgrades legacy configs in memory and is idempotent.
+func MigrateClientConfig(c *ClientConfig) {
+	if c.Version < CurrentVersion {
+		if c.Transport == "" && c.ConnectionType != "" {
+			c.Transport = c.ConnectionType
+		}
+		c.Version = CurrentVersion
+	}
+}
+
+// MigrateServerConfig upgrades legacy configs in memory and is idempotent.
+func MigrateServerConfig(c *ServerConfig) {
+	if c.Version < CurrentVersion {
+		c.Version = CurrentVersion
+	}
 }
 
 // HealthCheckConfig holds health check settings
@@ -176,6 +199,7 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+	MigrateClientConfig(cfg)
 
 	return cfg, nil
 }
@@ -192,12 +216,14 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+	MigrateServerConfig(cfg)
 
 	return cfg, nil
 }
 
 // SaveClientConfig saves client configuration to file
 func SaveClientConfig(cfg *ClientConfig, path string) error {
+	MigrateClientConfig(cfg)
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
@@ -217,6 +243,7 @@ func SaveClientConfig(cfg *ClientConfig, path string) error {
 
 // SaveServerConfig saves server configuration to file
 func SaveServerConfig(cfg *ServerConfig, path string) error {
+	MigrateServerConfig(cfg)
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)

@@ -7,6 +7,23 @@ import (
 	"time"
 )
 
+func TestConfigMigrationIsIdempotent(t *testing.T) {
+	c := &ClientConfig{ConnectionType: "quic"}
+	MigrateClientConfig(c)
+	if c.Version != CurrentVersion || c.Transport != "quic" {
+		t.Fatalf("migration failed: %+v", c)
+	}
+	MigrateClientConfig(c)
+	if c.Version != CurrentVersion || c.Transport != "quic" {
+		t.Fatalf("migration not idempotent: %+v", c)
+	}
+	s := &ServerConfig{}
+	MigrateServerConfig(s)
+	if s.Version != CurrentVersion {
+		t.Fatalf("server version=%d", s.Version)
+	}
+}
+
 func TestClientConfigRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client.yaml")
 	want := DefaultClientConfig()

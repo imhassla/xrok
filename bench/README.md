@@ -29,3 +29,12 @@ runs; pin compose image tags before publishing a result. Failed requests are
 recorded as HTTP code `000`, keeping reconnect/flakiness visible.
 
 All image tags and service ports are explicit so CI or a later performance run can reproduce the same topology. The compose file does not publish credentials beyond the local benchmark network.
+
+## Local HA lab
+
+`./scripts/ha-local.sh config` validates the two-replica HA exercise without
+starting containers. `up`/`down` manage pinned Redis 7.4.2 and PostgreSQL 16.6
+dependencies plus two xrok server replicas; `smoke` starts the stack and checks
+all healthchecks. Redis/Postgres endpoints are supplied through
+`XROK_HA_REDIS_ADDR` and `XROK_HA_POSTGRES_DSN` for injectable state-store and
+failover tests.
