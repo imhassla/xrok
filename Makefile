@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench e2e fuzz security ci-local check
+.PHONY: build test race vet bench regression e2e fuzz security ci-local check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -26,6 +26,9 @@ ci-local:
 
 bench:
 	$(GO_ENV) go test -run '^$$' -bench=. -benchmem ./...
+
+regression:
+	./scripts/benchmark-regression.sh
 
 e2e:
 	$(GO_ENV) go test -tags=e2e ./e2e -count=1

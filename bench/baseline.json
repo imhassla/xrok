@@ -1,0 +1,7 @@
+{
+  "scale": {
+    "1000": {"put_ms": 250, "get_ms": 250},
+    "10000": {"put_ms": 2500, "get_ms": 2500}
+  },
+  "apples": {"max_latency_regression_pct": 25}
+}
