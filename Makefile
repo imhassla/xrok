@@ -34,6 +34,9 @@ ci-local:
 ha-integration:
 	./scripts/ha-docker-integration.sh
 
+ports:
+	./scripts/allocate-ports.sh
+
 bench:
 	$(GO_ENV) go test -run '^$$' -bench=. -benchmem ./...
 

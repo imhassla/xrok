@@ -7,13 +7,43 @@ set -euo pipefail
 
 compose_file="${XROK_HA_COMPOSE_FILE:-compose.ha.local.yml}"
 artifact="${HA_INTEGRATION_ARTIFACT:-.artifacts/ha-integration.json}"
-compose=(docker compose -f "$compose_file")
+project="${COMPOSE_PROJECT_NAME:-xrok-ha-$RANDOM-$$}"
+compose=(docker compose -p "$project" -f "$compose_file")
 mkdir -p "$(dirname "$artifact")"
+
+pick_port() {
+  local avoid="${1:-}"
+  python3 - <<'PY'
+import socket
+import os
+avoid=int(os.environ.get('PORT_AVOID','0'))
+for p in range(18000, 28000):
+    ss=[]
+    if p == avoid: continue
+    try:
+        for typ in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+            s=socket.socket(socket.AF_INET, typ); s.bind(('127.0.0.1', p)); ss.append(s)
+        print(p); break
+    except OSError: pass
+    finally:
+        [s.close() for s in ss]
+PY
+}
+export XROK_HA_PORT_A="${XROK_HA_PORT_A:-$(pick_port)}"
+export XROK_HA_UDP_A="${XROK_HA_UDP_A:-$XROK_HA_PORT_A}"
+PORT_AVOID="$XROK_HA_PORT_A"; export PORT_AVOID
+export XROK_HA_PORT_B="${XROK_HA_PORT_B:-$(pick_port "$XROK_HA_PORT_A")}"
+export XROK_HA_UDP_B="${XROK_HA_UDP_B:-$XROK_HA_PORT_B}"
 
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   printf '{"status":"skipped","reason":"docker daemon unavailable"}\n' >"$artifact"
   echo "HA Docker integration: SKIP (Docker daemon unavailable)"
   exit 0
+fi
+
+# Allocate host ports per run so multiple labs can execute concurrently.
+if [[ -z "${XROK_HA_PORT_A:-}" ]]; then
+  while IFS='=' read -r k v; do export "$k=$v"; done < <("$(dirname "$0")/allocate-ports.sh")
 fi
 
 retries="${HA_SMOKE_RETRIES:-30}"

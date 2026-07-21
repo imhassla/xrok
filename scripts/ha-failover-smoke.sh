@@ -5,7 +5,8 @@
 set -euo pipefail
 
 compose_file="${XROK_HA_COMPOSE_FILE:-compose.ha.local.yml}"
-compose=(docker compose -f "$compose_file")
+project="${COMPOSE_PROJECT_NAME:-xrok-ha-smoke-$RANDOM-$$}"
+compose=(docker compose -p "$project" -f "$compose_file")
 retries="${HA_SMOKE_RETRIES:-30}"
 interval="${HA_SMOKE_INTERVAL:-2}"
 
@@ -23,6 +24,10 @@ wait_running() {
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   echo "HA failover smoke: SKIP (Docker daemon unavailable)"
   exit 0
+fi
+
+if [[ -z "${XROK_HA_PORT_A:-}" ]]; then
+  while IFS='=' read -r k v; do export "$k=$v"; done < <("$(dirname "$0")/allocate-ports.sh")
 fi
 
 "${compose[@]}" config >/dev/null
