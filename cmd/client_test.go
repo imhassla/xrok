@@ -1,9 +1,86 @@
 package cmd
 
 import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
 	"testing"
 	"time"
 )
+
+func TestSOCKS5ConnectDomainAndCloseIdempotent(t *testing.T) {
+	up, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback sockets unavailable in this environment: %v", err)
+	}
+	defer up.Close()
+	go func() {
+		c, e := up.Accept()
+		if e == nil {
+			defer c.Close()
+			io.Copy(c, c)
+		}
+	}()
+	s, err := NewSOCKS5Server("127.0.0.1:0", func(target string) (net.Conn, error) { return net.Dial("tcp", target) })
+	if err != nil {
+		t.Skipf("loopback sockets unavailable in this environment: %v", err)
+	}
+	go s.Serve()
+	defer s.Close()
+	defer s.Close()
+	c, err := net.Dial("tcp", s.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err = c.Write([]byte{5, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	resp := make([]byte, 2)
+	if _, err = io.ReadFull(c, resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp[0] != 5 || resp[1] != 0 {
+		t.Fatalf("auth=%v", resp)
+	}
+	host, port, _ := net.SplitHostPort(up.Addr().String())
+	ip := net.ParseIP(host).To4()
+	request := []byte{5, 1, 0, 1}
+	request = append(request, ip...)
+	p := make([]byte, 2)
+	binary.BigEndian.PutUint16(p, uint16(mustPort(t, port)))
+	request = append(request, p...)
+	if _, err = c.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 10)
+	if _, err = io.ReadFull(c, reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply[1] != 0 {
+		t.Fatalf("reply=%v", reply)
+	}
+	if _, err = c.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 5)
+	if _, err = io.ReadFull(c, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func mustPort(t *testing.T, s string) int {
+	t.Helper()
+	var p int
+	if _, err := fmt.Sscan(s, &p); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
 
 func TestTunnelFlag(t *testing.T) {
 	var tunnels tunnelFlag

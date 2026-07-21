@@ -86,6 +86,58 @@ func TestHTTPRelayEndToEnd(t *testing.T) {
 	}
 }
 
+func TestQUICHTTPRelayEndToEnd(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	caFile, certFile, keyFile := generateTestPKI(t, tmp)
+	binary := filepath.Join(tmp, "xrok")
+	run(t, root, nil, "go", "build", "-o", binary, ".")
+
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Transport", "quic")
+		_, _ = fmt.Fprintf(w, "quic method=%s body=", r.Method)
+		_, _ = io.Copy(w, r.Body)
+	}))
+	target := strings.TrimPrefix(upstream.URL, "http://")
+	port := freePort(t)
+	token := "e2e-quic-token"
+	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
+		"server", "--domain", "localhost", "--port", fmt.Sprint(port),
+		"--tls-cert", certFile, "--tls-key", keyFile,
+		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
+	defer stopProcess(t, server)
+	tlsClient := newTLSClient(t, caFile)
+	waitFor(t, 10*time.Second, func() bool {
+		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", port))
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+	client := startProcess(t, tmp, nil, binary,
+		"client", "--server", "localhost", "--rp", fmt.Sprint(port), "--quic",
+		"--ca-cert", caFile, "--token", token, "--id", "quic-client",
+		"--tunnel", "app:"+target, "--retry-interval", "50ms", "--max-interval", "250ms")
+	defer stopProcess(t, client)
+	var body string
+	waitFor(t, 20*time.Second, func() bool {
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("https://localhost:%d/quic", port), strings.NewReader("payload"))
+		req.Host = "app.localhost"
+		resp, err := tlsClient.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		body = string(data)
+		return resp.StatusCode == http.StatusOK && resp.Header.Get("X-Transport") == "quic"
+	})
+	if body != "quic method=POST body=payload" {
+		t.Fatalf("unexpected QUIC response: %q", body)
+	}
+}
+
 func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
 	root := repositoryRoot(t)
 	tmp := t.TempDir()

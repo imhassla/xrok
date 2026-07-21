@@ -203,6 +203,7 @@ type clientState struct {
 	ProxyURL        string
 	ClientPort      string
 	ServerAddr      string
+	ServerPort      int    // Registration/QUIC server port
 	LocalPort       string // Legacy single tunnel
 	Tunnels         []TunnelConfig
 	TunnelMap       map[string]string // name -> target mapping
@@ -535,6 +536,7 @@ func RunClient(args []string) {
 	clientStateMutex.Lock()
 	clientState_ = &clientState{
 		ServerAddr:     *serverAddr,
+		ServerPort:     clientRp,
 		UseTLS:         *useTLS,
 		UseProxy:       *useProxy,
 		Tunnels:        tunnelConfigs,
@@ -1239,7 +1241,11 @@ func connectQUICWithDisconnect(ctx context.Context, state *clientState, disconne
 		}
 	}()
 
-	addr := fmt.Sprintf("%s:443", state.ServerAddr)
+	port := state.ServerPort
+	if port == 0 {
+		port = 443
+	}
+	addr := net.JoinHostPort(state.ServerAddr, fmt.Sprint(port))
 
 	tlsConfig := state.TLSConfig.Clone()
 	tlsConfig.NextProtos = []string{"xrok-quic"}

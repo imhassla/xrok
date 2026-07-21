@@ -40,3 +40,15 @@ func TestLoadServerConfig(t *testing.T) {
 		t.Fatalf("unexpected config: %#v", cfg)
 	}
 }
+
+func TestServerConfigValidate(t *testing.T) {
+	cfg := DefaultServerConfig()
+	cfg.Domain = "localhost"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.ProxyPort = 70000
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid proxy port")
+	}
+}

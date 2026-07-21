@@ -30,14 +30,14 @@ const (
 	socks5AddrIPv6   = 0x04
 
 	// Reply codes
-	socks5RepSuccess         = 0x00
-	socks5RepServerFailure   = 0x01
-	socks5RepNotAllowed      = 0x02
-	socks5RepNetUnreachable  = 0x03
-	socks5RepHostUnreachable = 0x04
-	socks5RepConnRefused     = 0x05
-	socks5RepTTLExpired      = 0x06
-	socks5RepCmdNotSupported = 0x07
+	socks5RepSuccess          = 0x00
+	socks5RepServerFailure    = 0x01
+	socks5RepNotAllowed       = 0x02
+	socks5RepNetUnreachable   = 0x03
+	socks5RepHostUnreachable  = 0x04
+	socks5RepConnRefused      = 0x05
+	socks5RepTTLExpired       = 0x06
+	socks5RepCmdNotSupported  = 0x07
 	socks5RepAddrNotSupported = 0x08
 )
 
@@ -89,7 +89,11 @@ func (s *SOCKS5Server) Serve() error {
 
 // Close shuts down the SOCKS5 server
 func (s *SOCKS5Server) Close() error {
-	close(s.done)
+	select {
+	case <-s.done:
+	default:
+		close(s.done)
+	}
 	err := s.listener.Close()
 	s.wg.Wait()
 	return err
@@ -114,6 +118,10 @@ func (s *SOCKS5Server) handleConnection(conn net.Conn) {
 	}
 
 	numMethods := int(buf[1])
+	if numMethods == 0 || numMethods > len(buf) {
+		log.Printf("SOCKS5: invalid auth method count: %d", numMethods)
+		return
+	}
 	if _, err := io.ReadFull(conn, buf[:numMethods]); err != nil {
 		log.Printf("SOCKS5: failed to read auth methods: %v", err)
 		return

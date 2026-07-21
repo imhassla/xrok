@@ -105,6 +105,26 @@ type HealthCheckConfig struct {
 	Timeout  time.Duration `yaml:"timeout"`
 }
 
+// Validate checks settings that would otherwise fail only after the runtime
+// has started goroutines and opened partial listeners.
+func (c *ServerConfig) Validate() error {
+	if c.Domain == "" {
+		return fmt.Errorf("server domain is required")
+	}
+	if c.ProxyPort < 0 || c.ProxyPort > 65535 {
+		return fmt.Errorf("proxy_port must be between 0 and 65535")
+	}
+	if c.Port < 0 || c.Port > 65535 {
+		return fmt.Errorf("port must be between 0 and 65535")
+	}
+	if c.MetricsPort < 0 || c.MetricsPort > 65535 {
+		return fmt.Errorf("metrics_port must be between 0 and 65535")
+	}
+	// Empty certificate paths are valid: the server derives the Let's Encrypt
+	// paths from domain, or the CLI can supply them after loading this config.
+	return nil
+}
+
 // DefaultClientConfig returns default client configuration
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{

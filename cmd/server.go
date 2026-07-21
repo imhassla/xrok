@@ -269,6 +269,10 @@ func RunServer(args []string) {
 				fmt.Printf("Failed to load server config: %v\n", err)
 				return
 			}
+			if err := cfg.Validate(); err != nil {
+				fmt.Printf("Invalid server config: %v\n", err)
+				return
+			}
 			loadedConfig = cfg
 			break
 		}

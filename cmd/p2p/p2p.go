@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -270,7 +271,11 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 			}
 
 			msg := string(buf[:n])
-			if len(msg) > 15 && msg[:15] == "XROK-P2P-PUNCH:" {
+			// Do not accept arbitrary UDP traffic as a successful punch.  The
+			// sender identity is carried in the probe and must match the peer
+			// discovered through authenticated signaling.
+			const punchPrefix = "XROK-P2P-PUNCH:"
+			if strings.HasPrefix(msg, punchPrefix) && strings.TrimSpace(strings.TrimPrefix(msg, punchPrefix)) == peerInfo.PeerID {
 				// Received punch packet from peer - connection established!
 				conn.SetReadDeadline(time.Time{})
 

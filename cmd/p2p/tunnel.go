@@ -21,6 +21,7 @@ type P2PTunnel struct {
 	streamID   uint32
 	streams    map[uint32]*P2PStream
 	streamsMu  sync.RWMutex
+	writeMu    sync.Mutex // serialize frames on stream transports
 	nextID     uint32
 	closed     int32
 }
@@ -39,9 +40,9 @@ type P2PStream struct {
 // [0:4] - stream ID (uint32 big endian)
 // [4:8] - payload length (uint32 big endian)
 const (
-	p2pHeaderSize   = 8
-	p2pMaxPayload   = 65000 // Max UDP payload
-	p2pMagic        = 0x5852 // "XR" - xrok P2P
+	p2pHeaderSize = 8
+	p2pMaxPayload = 65000  // Max UDP payload
+	p2pMagic      = 0x5852 // "XR" - xrok P2P
 )
 
 // Message types for tunnel protocol
@@ -234,10 +235,14 @@ func (t *P2PTunnel) Close() error {
 	}
 
 	t.streamsMu.Lock()
+	streams := make([]*P2PStream, 0, len(t.streams))
 	for _, stream := range t.streams {
-		stream.Close()
+		streams = append(streams, stream)
 	}
 	t.streamsMu.Unlock()
+	for _, stream := range streams {
+		stream.Close()
+	}
 
 	return t.conn.Close()
 }
@@ -281,12 +286,20 @@ func (s *P2PStream) Write(p []byte) (int, error) {
 }
 
 func (s *P2PStream) writeFrame(msgType byte, payload []byte) error {
+	if len(payload) > p2pMaxPayload-p2pHeaderSize-1 {
+		return fmt.Errorf("p2p payload too large: %d", len(payload))
+	}
+	if atomic.LoadInt32(&s.tunnel.closed) != 0 {
+		return fmt.Errorf("tunnel closed")
+	}
 	frame := make([]byte, p2pHeaderSize+1+len(payload))
 	frame[0] = msgType
 	binary.BigEndian.PutUint32(frame[1:5], s.id)
 	binary.BigEndian.PutUint32(frame[5:9], uint32(len(payload)))
 	copy(frame[p2pHeaderSize+1:], payload)
 
+	s.tunnel.writeMu.Lock()
+	defer s.tunnel.writeMu.Unlock()
 	_, err := s.tunnel.conn.Write(frame)
 	return err
 }
