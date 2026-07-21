@@ -3,8 +3,11 @@ package telemetry
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -119,5 +122,113 @@ func TestHTTPMiddlewareRecordsImplicitOKAndFirstStatus(t *testing.T) {
 	spans = e.Snapshot()
 	if len(spans) != 1 || spans[0].Status != http.StatusOK {
 		t.Fatalf("implicit response status=%+v", spans)
+	}
+}
+
+func TestAsyncOTLPBatchesAndFlushesOnClose(t *testing.T) {
+	var mu sync.Mutex
+	var sizes []int
+	e := newAsyncOTLPExporter(AsyncOTLPConfig{QueueSize: 8, BatchSize: 3, FlushInterval: time.Hour, ExportTimeout: time.Second}, func(_ context.Context, spans []Span) error {
+		mu.Lock()
+		sizes = append(sizes, len(spans))
+		mu.Unlock()
+		return nil
+	})
+	for i := 0; i < 5; i++ {
+		e.Export(context.Background(), Span{Name: "batch"})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := e.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stats := e.Stats()
+	if stats.Accepted != 5 || stats.Exported != 5 || stats.Batches != 2 || stats.Dropped != 0 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sizes) != 2 || sizes[0] != 3 || sizes[1] != 2 {
+		t.Fatalf("batch sizes = %v", sizes)
+	}
+}
+
+func TestAsyncOTLPRetriesRetryableFailures(t *testing.T) {
+	var calls atomic.Int32
+	e := newAsyncOTLPExporter(AsyncOTLPConfig{QueueSize: 2, BatchSize: 1, FlushInterval: time.Hour, ExportTimeout: time.Second, MaxRetries: 3, RetryBackoff: time.Millisecond}, func(context.Context, []Span) error {
+		if calls.Add(1) < 3 {
+			return retryableExportError{err: errors.New("collector unavailable")}
+		}
+		return nil
+	})
+	e.Export(context.Background(), Span{Name: "retry"})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := e.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stats := e.Stats()
+	if calls.Load() != 3 || stats.Retries != 2 || stats.Exported != 1 || stats.Dropped != 0 {
+		t.Fatalf("unexpected retry result: calls=%d stats=%+v", calls.Load(), stats)
+	}
+}
+
+func TestAsyncOTLPDropsWhenQueueIsFull(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	e := newAsyncOTLPExporter(AsyncOTLPConfig{QueueSize: 2, BatchSize: 1, FlushInterval: time.Hour, ExportTimeout: time.Second}, func(context.Context, []Span) error {
+		once.Do(func() { close(started) })
+		<-release
+		return nil
+	})
+	e.Export(context.Background(), Span{Name: "active"})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("export did not start")
+	}
+	e.Export(context.Background(), Span{Name: "queued-1"})
+	e.Export(context.Background(), Span{Name: "queued-2"})
+	e.Export(context.Background(), Span{Name: "dropped"})
+	if got := e.Stats(); got.Dropped != 1 || got.QueueDepth != 2 || got.QueueCapacity != 2 {
+		t.Fatalf("queue was not bounded: %+v", got)
+	}
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := e.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Stats(); got.Accepted != 3 || got.Exported != 3 || got.Dropped != 1 {
+		t.Fatalf("unexpected final stats: %+v", got)
+	}
+}
+
+func TestAsyncOTLPDoesNotRetryPermanentFailure(t *testing.T) {
+	var calls atomic.Int32
+	e := newAsyncOTLPExporter(AsyncOTLPConfig{QueueSize: 1, BatchSize: 1, FlushInterval: time.Hour, ExportTimeout: time.Second, MaxRetries: 5}, func(context.Context, []Span) error {
+		calls.Add(1)
+		return errors.New("bad request")
+	})
+	e.Export(context.Background(), Span{Name: "invalid"})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := e.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Stats(); calls.Load() != 1 || got.Failed != 1 || got.Dropped != 1 || got.Retries != 0 {
+		t.Fatalf("permanent failure retried: calls=%d stats=%+v", calls.Load(), got)
+	}
+}
+
+func TestAsyncOTLPRejectsExportAfterClose(t *testing.T) {
+	e := newAsyncOTLPExporter(AsyncOTLPConfig{QueueSize: 1, BatchSize: 1}, func(context.Context, []Span) error { return nil })
+	if err := e.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e.Export(context.Background(), Span{Name: "late"})
+	if got := e.Stats(); got.Dropped != 1 || got.Accepted != 0 {
+		t.Fatalf("late export stats: %+v", got)
 	}
 }

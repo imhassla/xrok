@@ -6,10 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,17 +41,25 @@ func NewOTLPHTTPExporter(endpoint string) *OTLPHTTPExporter {
 }
 
 func (e *OTLPHTTPExporter) Export(ctx context.Context, s Span) {
+	_ = e.exportBatch(ctx, []Span{s})
+}
+
+func (e *OTLPHTTPExporter) exportBatch(ctx context.Context, spans []Span) error {
 	if e == nil || e.Endpoint == "" {
-		return
+		return errors.New("telemetry: OTLP endpoint is empty")
 	}
-	p := otlpTracePayload{ResourceSpans: []otlpResourceSpans{{ScopeSpans: []otlpScopeSpans{{Spans: []otlpSpan{{TraceID: s.TraceID, SpanID: s.SpanID, Name: s.Name, StartTimeUnixNano: s.Start.UnixNano(), EndTimeUnixNano: s.End.UnixNano(), Status: otlpStatusForHTTP(s.Status), Attributes: otlpAttributes(s.Attributes)}}}}}}}
+	otlpSpans := make([]otlpSpan, 0, len(spans))
+	for _, s := range spans {
+		otlpSpans = append(otlpSpans, otlpSpan{TraceID: s.TraceID, SpanID: s.SpanID, Name: s.Name, StartTimeUnixNano: s.Start.UnixNano(), EndTimeUnixNano: s.End.UnixNano(), Status: otlpStatusForHTTP(s.Status), Attributes: otlpAttributes(s.Attributes)})
+	}
+	p := otlpTracePayload{ResourceSpans: []otlpResourceSpans{{ScopeSpans: []otlpScopeSpans{{Spans: otlpSpans}}}}}
 	b, err := json.Marshal(p)
 	if err != nil {
-		return
+		return err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.Endpoint, strings.NewReader(string(b)))
 	if err != nil {
-		return
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := e.Client
@@ -56,8 +67,216 @@ func (e *OTLPHTTPExporter) Export(ctx context.Context, s Span) {
 		client = http.DefaultClient
 	}
 	resp, err := client.Do(req)
-	if err == nil {
-		resp.Body.Close()
+	if err != nil {
+		return retryableExportError{err: err}
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	err = fmt.Errorf("telemetry: collector returned HTTP %d", resp.StatusCode)
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		return retryableExportError{err: err}
+	}
+	return err
+}
+
+type retryableExportError struct{ err error }
+
+func (e retryableExportError) Error() string { return e.err.Error() }
+func (e retryableExportError) Unwrap() error { return e.err }
+
+type retryable interface{ Retryable() bool }
+
+func (e retryableExportError) Retryable() bool { return true }
+
+// AsyncOTLPConfig bounds every resource used by AsyncOTLPExporter. A slow or
+// unavailable collector can therefore never apply backpressure to tunnel
+// request handling or grow memory without limit.
+type AsyncOTLPConfig struct {
+	QueueSize     int
+	BatchSize     int
+	FlushInterval time.Duration
+	ExportTimeout time.Duration
+	MaxRetries    int
+	RetryBackoff  time.Duration
+}
+
+func DefaultAsyncOTLPConfig() AsyncOTLPConfig {
+	return AsyncOTLPConfig{QueueSize: 2048, BatchSize: 128, FlushInterval: time.Second, ExportTimeout: 5 * time.Second, MaxRetries: 3, RetryBackoff: 100 * time.Millisecond}
+}
+
+type AsyncOTLPStats struct {
+	Accepted      uint64
+	Exported      uint64
+	Dropped       uint64
+	Failed        uint64
+	Retries       uint64
+	Batches       uint64
+	QueueDepth    int
+	QueueCapacity int
+}
+
+type batchExportFunc func(context.Context, []Span) error
+
+// AsyncOTLPExporter batches OTLP spans in a bounded in-memory queue. Export is
+// deliberately non-blocking; QueueFull drops are counted rather than delaying
+// the data plane. Close flushes pending spans until its context expires.
+type AsyncOTLPExporter struct {
+	cfg       AsyncOTLPConfig
+	queue     chan Span
+	export    batchExportFunc
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+	lifecycle sync.RWMutex
+	closed    atomic.Bool
+	accepted  atomic.Uint64
+	exported  atomic.Uint64
+	dropped   atomic.Uint64
+	failed    atomic.Uint64
+	retries   atomic.Uint64
+	batches   atomic.Uint64
+}
+
+func NewAsyncOTLPHTTPExporter(endpoint string, cfg AsyncOTLPConfig) *AsyncOTLPExporter {
+	httpExporter := NewOTLPHTTPExporter(endpoint)
+	return newAsyncOTLPExporter(cfg, httpExporter.exportBatch)
+}
+
+func newAsyncOTLPExporter(cfg AsyncOTLPConfig, export batchExportFunc) *AsyncOTLPExporter {
+	defaults := DefaultAsyncOTLPConfig()
+	if cfg.QueueSize <= 0 {
+		cfg.QueueSize = defaults.QueueSize
+	}
+	if cfg.BatchSize <= 0 {
+		cfg.BatchSize = defaults.BatchSize
+	}
+	if cfg.BatchSize > cfg.QueueSize {
+		cfg.BatchSize = cfg.QueueSize
+	}
+	if cfg.FlushInterval <= 0 {
+		cfg.FlushInterval = defaults.FlushInterval
+	}
+	if cfg.ExportTimeout <= 0 {
+		cfg.ExportTimeout = defaults.ExportTimeout
+	}
+	if cfg.MaxRetries < 0 {
+		cfg.MaxRetries = 0
+	}
+	if cfg.RetryBackoff <= 0 {
+		cfg.RetryBackoff = defaults.RetryBackoff
+	}
+	if export == nil {
+		export = func(context.Context, []Span) error { return errors.New("telemetry: nil batch exporter") }
+	}
+	e := &AsyncOTLPExporter{cfg: cfg, queue: make(chan Span, cfg.QueueSize), export: export, stop: make(chan struct{}), done: make(chan struct{})}
+	go e.run()
+	return e
+}
+
+func (e *AsyncOTLPExporter) Export(_ context.Context, span Span) {
+	if e == nil {
+		return
+	}
+	e.lifecycle.RLock()
+	defer e.lifecycle.RUnlock()
+	if e.closed.Load() {
+		e.dropped.Add(1)
+		return
+	}
+	select {
+	case e.queue <- span:
+		e.accepted.Add(1)
+	default:
+		e.dropped.Add(1)
+	}
+}
+
+func (e *AsyncOTLPExporter) Stats() AsyncOTLPStats {
+	if e == nil {
+		return AsyncOTLPStats{}
+	}
+	return AsyncOTLPStats{Accepted: e.accepted.Load(), Exported: e.exported.Load(), Dropped: e.dropped.Load(), Failed: e.failed.Load(), Retries: e.retries.Load(), Batches: e.batches.Load(), QueueDepth: len(e.queue), QueueCapacity: cap(e.queue)}
+}
+
+func (e *AsyncOTLPExporter) Close(ctx context.Context) error {
+	if e == nil {
+		return nil
+	}
+	e.closeOnce.Do(func() {
+		e.lifecycle.Lock()
+		e.closed.Store(true)
+		close(e.stop)
+		e.lifecycle.Unlock()
+	})
+	select {
+	case <-e.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *AsyncOTLPExporter) run() {
+	defer close(e.done)
+	ticker := time.NewTicker(e.cfg.FlushInterval)
+	defer ticker.Stop()
+	batch := make([]Span, 0, e.cfg.BatchSize)
+	flush := func() {
+		if len(batch) > 0 {
+			e.send(batch)
+			batch = batch[:0]
+		}
+	}
+	for {
+		select {
+		case span := <-e.queue:
+			batch = append(batch, span)
+			if len(batch) >= e.cfg.BatchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-e.stop:
+			for {
+				select {
+				case span := <-e.queue:
+					batch = append(batch, span)
+					if len(batch) >= e.cfg.BatchSize {
+						flush()
+					}
+				default:
+					flush()
+					return
+				}
+			}
+		}
+	}
+}
+
+func (e *AsyncOTLPExporter) send(batch []Span) {
+	for attempt := 0; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), e.cfg.ExportTimeout)
+		err := e.export(ctx, batch)
+		cancel()
+		if err == nil {
+			e.exported.Add(uint64(len(batch)))
+			e.batches.Add(1)
+			return
+		}
+		var r retryable
+		if attempt >= e.cfg.MaxRetries || !errors.As(err, &r) || !r.Retryable() {
+			e.failed.Add(uint64(len(batch)))
+			e.dropped.Add(uint64(len(batch)))
+			return
+		}
+		e.retries.Add(1)
+		delay := e.cfg.RetryBackoff << attempt
+		select {
+		case <-time.After(delay):
+		case <-e.stop:
+		}
 	}
 }
 
