@@ -89,6 +89,136 @@ func TestHTTPRelayEndToEnd(t *testing.T) {
 	}
 }
 
+func TestPerClientIdentityPolicyEndToEnd(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	caFile, certFile, keyFile := generateTestPKI(t, tmp)
+	binary := filepath.Join(tmp, "xrok")
+	run(t, root, nil, "go", "build", "-o", binary, ".")
+
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "identity-ok")
+	}))
+	target := strings.TrimPrefix(upstream.URL, "http://")
+	port := freePort(t)
+	configPath := filepath.Join(tmp, "server.yaml")
+	configData := fmt.Sprintf(`domain: localhost
+proxy_port: %d
+tls_cert_path: %s
+tls_key_path: %s
+state_file: %s
+log_file: %s
+client_identities:
+  - id: alice
+    token: alice-secret
+    scopes: [client, "p2p:signal"]
+  - id: bob
+    token: bob-secret
+    scopes: [client]
+  - id: auditor
+    token: auditor-secret
+    scopes: ["p2p:read"]
+`, port, certFile, keyFile, filepath.Join(tmp, "state.dat"), filepath.Join(tmp, "server.log"))
+	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := startProcess(t, tmp, nil, binary, "server", "--config", configPath)
+	defer stopProcess(t, server)
+	tlsClient := newTLSClient(t, caFile)
+	waitFor(t, 10*time.Second, func() bool {
+		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", port))
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+
+	client := startProcess(t, tmp, nil, binary,
+		"client", "--server", "localhost", "--rp", fmt.Sprint(port),
+		"--ca-cert", caFile, "--token", "alice-secret", "--id", "alice",
+		"--tunnel", "identity:"+target, "--retry-interval", "50ms", "--max-interval", "250ms")
+	defer stopProcess(t, client)
+	waitFor(t, 15*time.Second, func() bool {
+		req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/", port), nil)
+		req.Host = "identity.localhost"
+		resp, err := tlsClient.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode == http.StatusOK && string(body) == "identity-ok"
+	})
+
+	registration := map[string]interface{}{
+		"connection_type": "tls",
+		"client_id":       "mallory",
+	}
+	assertControlStatus(t, tlsClient, port, "/register_client", "alice-secret", registration, http.StatusForbidden)
+
+	discoverAsBob := map[string]interface{}{
+		"type":      "p2p_discover",
+		"from_peer": "bob",
+		"to_peer":   "alice",
+	}
+	assertControlStatus(t, tlsClient, port, "/p2p/signal", "bob-secret", discoverAsBob, http.StatusForbidden)
+
+	impersonateBob := map[string]interface{}{
+		"type":      "p2p_discover",
+		"from_peer": "bob",
+		"to_peer":   "alice",
+	}
+	assertControlStatus(t, tlsClient, port, "/p2p/signal", "alice-secret", impersonateBob, http.StatusForbidden)
+
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/p2p/clients", port), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-API-Token", "auditor-secret")
+	resp, err := tlsClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("scoped auditor request failed: status=%s body=%q", resp.Status, body)
+	}
+}
+
+func TestP2PReplayRejectedAcrossProcess(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	helper := filepath.Join(tmp, "p2p-replay-e2e")
+	run(t, root, nil, "go", "build", "-o", helper, "./e2e/testdata/p2p_replay_helper.go")
+	run(t, root, nil, helper)
+}
+
+func assertControlStatus(t *testing.T, client *http.Client, port int, path, token string, payload interface{}, want int) {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("https://localhost:%d%s", port, path), strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Token", token)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != want {
+		responseBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("%s: status=%s, want=%d body=%q", path, resp.Status, want, responseBody)
+	}
+}
+
 func TestQUICHTTPRelayEndToEnd(t *testing.T) {
 	root := repositoryRoot(t)
 	tmp := t.TempDir()
