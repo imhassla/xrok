@@ -5,8 +5,14 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// legacyServerDepsFallbacks tracks requests still served through the global
+// compatibility bridge. It is intentionally process-local so tests and
+// embedded runtimes can assert migration progress without exporting metrics.
+var legacyServerDepsFallbacks atomic.Uint64
 
 // ServerDeps contains the mutable services a server handler needs.  New
 // handlers should receive this value (directly or through ServerContext)
@@ -19,6 +25,22 @@ type ServerDeps struct {
 	Domain    string
 	StartTime time.Time
 }
+
+// NewServerDeps constructs an isolated dependency set for an embedded server.
+// Registries are created when omitted, making each runtime independent.
+func NewServerDeps(domain string, start time.Time, logger *log.Logger) *ServerDeps {
+	if logger == nil {
+		logger = log.Default()
+	}
+	if start.IsZero() {
+		start = time.Now()
+	}
+	return &ServerDeps{Clients: NewClientRegistry(), Routes: NewRouteRegistry(), Logger: logger, Domain: domain, StartTime: start}
+}
+
+// LegacyServerDepsFallbacks reports how often a handler had to use package
+// globals because no injected ServerDeps were present.
+func LegacyServerDepsFallbacks() uint64 { return legacyServerDepsFallbacks.Load() }
 
 type ClientRegistry struct {
 	mu sync.RWMutex
@@ -107,10 +129,20 @@ func serverDepsFromRequest(r *http.Request) *ServerDeps {
 		}
 		return d
 	}
+	legacyServerDepsFallbacks.Add(1)
 	return serverDepsFromGlobals()
 }
 
 // serverDepsFromGlobals is a compatibility bridge for legacy CLI handlers.
 func serverDepsFromGlobals() *ServerDeps {
-	return &ServerDeps{Clients: &ClientRegistry{m: serverClients}, Routes: &RouteRegistry{m: serverTunnelRoutes}, Logger: log.Default(), Domain: serverDomain, StartTime: serverStartTime}
+	// Keep a stable registry instance while the legacy CLI is being migrated.
+	// Creating a wrapper per request loses synchronization and makes injected
+	// handlers observe different registry locks. The backing maps remain the
+	// compatibility state until all call sites move to ServerDeps.
+	return &ServerDeps{Clients: legacyClientRegistry, Routes: legacyRouteRegistry, Logger: log.Default(), Domain: serverDomain, StartTime: serverStartTime}
 }
+
+var (
+	legacyClientRegistry = &ClientRegistry{m: serverClients}
+	legacyRouteRegistry  = &RouteRegistry{m: serverTunnelRoutes}
+)

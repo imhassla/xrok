@@ -30,3 +30,15 @@ func TestServerDepsContext(t *testing.T) {
 		t.Fatal("unexpected dependencies in empty context")
 	}
 }
+
+func TestServerDepsGlobalBridgeIsStable(t *testing.T) {
+
+	a := serverDepsFromGlobals()
+	b := serverDepsFromGlobals()
+	if a.Clients != b.Clients || a.Routes != b.Routes {
+		t.Fatal("legacy bridge must reuse registry instances")
+	}
+	if a.Clients == nil || a.Routes == nil {
+		t.Fatal("legacy bridge returned nil registries")
+	}
+}

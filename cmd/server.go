@@ -1057,6 +1057,22 @@ func extractServerClientIDFromHost(host string) string {
 	return parts[0]
 }
 
+// resolveServerTunnel resolves a public subdomain through injected registries.
+// It is intentionally side-effect free so embedded runtimes can test routing
+// without opening sockets.
+func resolveServerTunnel(deps *ServerDeps, subdomain string) (*serverClientInfo, *TunnelRoute, string) {
+	if deps == nil || deps.Clients == nil || deps.Routes == nil {
+		return nil, nil, ""
+	}
+	route, ok := deps.Routes.Get(subdomain)
+	if ok {
+		client, _ := deps.Clients.Get(route.ClientID)
+		return client, route, route.TunnelName
+	}
+	client, _ := deps.Clients.Get(subdomain)
+	return client, nil, subdomain
+}
+
 func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 	cert, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
 	if err != nil {
@@ -1065,7 +1081,13 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 	}
 
 	// Create unified HTTP handler for both registration and proxy
+	deps := serverDepsFromGlobals()
 	handler := telemetry.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Propagate runtime-owned dependencies through the request context. This
+		// keeps migrated handlers isolated while legacy endpoints are transitioned.
+		if _, ok := ServerDepsFromContext(r.Context()); !ok {
+			r = r.WithContext(WithServerDeps(r.Context(), deps))
+		}
 		host := r.Host
 		if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
 			host = host[:colonIdx]
@@ -1144,24 +1166,9 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 		}
 
 		// Look up tunnel route
-		serverTunnelRoutesMutex.RLock()
-		route, routeExists := serverTunnelRoutes[subdomain]
-		serverTunnelRoutesMutex.RUnlock()
-
-		var client *serverClientInfo
-		var tunnelName string
-
-		if routeExists {
-			serverClientsMutex.Lock()
-			client = serverClients[route.ClientID]
-			serverClientsMutex.Unlock()
-			tunnelName = route.TunnelName
-		} else {
-			serverClientsMutex.Lock()
-			client = serverClients[subdomain]
-			serverClientsMutex.Unlock()
-			tunnelName = subdomain
-		}
+		requestDeps := serverDepsFromRequest(r)
+		client, route, tunnelName := resolveServerTunnel(requestDeps, subdomain)
+		routeExists := route != nil
 
 		if client == nil {
 			http.Error(w, "Tunnel not found", http.StatusBadGateway)
