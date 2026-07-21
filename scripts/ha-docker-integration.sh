@@ -7,8 +7,8 @@ set -euo pipefail
 
 compose_file="${XROK_HA_COMPOSE_FILE:-compose.ha.local.yml}"
 artifact="${HA_INTEGRATION_ARTIFACT:-.artifacts/ha-integration.json}"
-project="${COMPOSE_PROJECT_NAME:-xrok-ha-$RANDOM-$$}"
-compose=(docker compose -p "$project" -f "$compose_file")
+project="${COMPOSE_PROJECT_NAME:-}"
+compose=()
 mkdir -p "$(dirname "$artifact")"
 
 pick_port() {
@@ -29,21 +29,10 @@ for p in range(18000, 28000):
         [s.close() for s in ss]
 PY
 }
-export XROK_HA_PORT_A="${XROK_HA_PORT_A:-$(pick_port)}"
-export XROK_HA_UDP_A="${XROK_HA_UDP_A:-$XROK_HA_PORT_A}"
-PORT_AVOID="$XROK_HA_PORT_A"; export PORT_AVOID
-export XROK_HA_PORT_B="${XROK_HA_PORT_B:-$(pick_port "$XROK_HA_PORT_A")}"
-export XROK_HA_UDP_B="${XROK_HA_UDP_B:-$XROK_HA_PORT_B}"
-
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   printf '{"status":"skipped","reason":"docker daemon unavailable"}\n' >"$artifact"
   echo "HA Docker integration: SKIP (Docker daemon unavailable)"
   exit 0
-fi
-
-# Allocate host ports per run so multiple labs can execute concurrently.
-if [[ -z "${XROK_HA_PORT_A:-}" ]]; then
-  while IFS='=' read -r k v; do export "$k=$v"; done < <("$(dirname "$0")/allocate-ports.sh")
 fi
 
 retries="${HA_SMOKE_RETRIES:-30}"
@@ -69,8 +58,26 @@ wait_running() {
   fail "$svc did not become running (state: ${state:-unknown})"
 }
 
-"${compose[@]}" config >/dev/null
-"${compose[@]}" up -d --build >/dev/null
+up_attempts="${HA_COMPOSE_UP_RETRIES:-5}"
+up_ok=0
+for attempt in $(seq 1 "$up_attempts"); do
+  project="${COMPOSE_PROJECT_NAME:-xrok-ha-$RANDOM-$$-$attempt}"
+  compose=(docker compose -p "$project" -f "$compose_file")
+  export XROK_HA_PORT_A="${XROK_HA_PORT_A_OVERRIDE:-$(pick_port)}"
+  export XROK_HA_UDP_A="${XROK_HA_UDP_A_OVERRIDE:-$XROK_HA_PORT_A}"
+  PORT_AVOID="$XROK_HA_PORT_A"; export PORT_AVOID
+  export XROK_HA_PORT_B="${XROK_HA_PORT_B_OVERRIDE:-$(pick_port "$XROK_HA_PORT_A")}" 
+  export XROK_HA_UDP_B="${XROK_HA_UDP_B_OVERRIDE:-$XROK_HA_PORT_B}"
+  if "${compose[@]}" config >/dev/null 2>&1 && "${compose[@]}" up -d --build >/dev/null 2>&1; then
+    up_ok=1
+    break
+  fi
+  # Docker performs the actual bind only during `up`; a prior socket probe is
+  # therefore advisory. Tear down the partial project, choose a fresh set of
+  # ports, and retry when another lab wins the race.
+  "${compose[@]}" down --remove-orphans >/dev/null 2>&1 || true
+done
+[[ "$up_ok" == 1 ]] || fail "compose up failed after $up_attempts attempts (likely port collision)"
 for svc in redis postgres xrok-a xrok-b; do wait_running "$svc"; done
 
 # Redis AOF persistence check.

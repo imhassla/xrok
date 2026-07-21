@@ -9,6 +9,9 @@ project="${COMPOSE_PROJECT_NAME:-xrok-ha-smoke-$RANDOM-$$}"
 compose=(docker compose -p "$project" -f "$compose_file")
 retries="${HA_SMOKE_RETRIES:-30}"
 interval="${HA_SMOKE_INTERVAL:-2}"
+up_attempts="${HA_SMOKE_UP_ATTEMPTS:-5}"
+fixed_ports=0
+if [[ -n "${XROK_HA_PORT_A:-}" && -n "${XROK_HA_PORT_B:-}" ]]; then fixed_ports=1; fi
 
 fail() { echo "HA failover smoke: FAIL: $*" >&2; exit 1; }
 wait_running() {
@@ -26,15 +29,37 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   exit 0
 fi
 
-if [[ -z "${XROK_HA_PORT_A:-}" ]]; then
-  while IFS='=' read -r k v; do export "$k=$v"; done < <("$(dirname "$0")/allocate-ports.sh")
-fi
-
-"${compose[@]}" config >/dev/null
 cleanup() { "${compose[@]}" down >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-"${compose[@]}" up -d --build
+up_ok=0
+up_log="${TMPDIR:-/tmp}/xrok-ha-up-${project}.log"
+for attempt in $(seq 1 "$up_attempts"); do
+  # Port selection is advisory: another process may claim a port before
+  # Docker publishes it. Generate a fresh set for every attempt and let
+  # Compose be the source of truth for reservation.
+  if (( fixed_ports )); then
+    : # caller supplied a complete fixed port set; Compose still validates it.
+  elif [[ -z "${XROK_HA_PORT_A_OVERRIDE:-}" ]]; then
+    while IFS='=' read -r k v; do export "$k=$v"; done < <("$(dirname "$0")/allocate-ports.sh")
+  else
+    export XROK_HA_PORT_A="$XROK_HA_PORT_A_OVERRIDE"
+    export XROK_HA_UDP_A="${XROK_HA_UDP_A_OVERRIDE:-$((XROK_HA_PORT_A + 1))}"
+    export XROK_HA_PORT_B="${XROK_HA_PORT_B_OVERRIDE:-$((XROK_HA_PORT_A + 2))}"
+    export XROK_HA_UDP_B="${XROK_HA_UDP_B_OVERRIDE:-$((XROK_HA_PORT_A + 3))}"
+  fi
+  echo "HA failover smoke: compose up attempt ${attempt}/${up_attempts} ports=${XROK_HA_PORT_A},${XROK_HA_PORT_B}" >&2
+  if "${compose[@]}" config >/dev/null 2>"$up_log" && "${compose[@]}" up -d --build >>"$up_log" 2>&1; then
+    up_ok=1
+    break
+  fi
+  "${compose[@]}" down --remove-orphans >/dev/null 2>&1 || true
+  if (( attempt < up_attempts )); then sleep 1; fi
+done
+if (( ! up_ok )); then
+  cat "$up_log" >&2
+  fail "compose up failed after ${up_attempts} attempts (possible port collision)"
+fi
 for svc in redis postgres xrok-a xrok-b; do
   wait_running "$svc"
 done
