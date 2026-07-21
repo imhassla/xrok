@@ -14,6 +14,7 @@ type ClientConfig struct {
 	// Version is the schema version. Zero denotes the legacy unversioned format.
 	Version   int               `yaml:"version,omitempty"`
 	Server    string            `yaml:"server"`
+	ID        string            `yaml:"id,omitempty"`
 	Token     string            `yaml:"token,omitempty"`
 	TLS       bool              `yaml:"tls"`
 	Debug     bool              `yaml:"debug"`
@@ -80,24 +81,27 @@ type P2PConfig struct {
 
 // ServerConfig represents server configuration
 type ServerConfig struct {
-	Version     int               `yaml:"version,omitempty"`
-	Domain      string            `yaml:"domain"`
-	TLSCertPath string            `yaml:"tls_cert_path,omitempty"`
-	TLSKeyPath  string            `yaml:"tls_key_path,omitempty"`
-	Port        int               `yaml:"port"`
-	ProxyPort   int               `yaml:"proxy_port"`
-	MetricsPort int               `yaml:"metrics_port"`
-	Debug       bool              `yaml:"debug"`
-	Quiet       bool              `yaml:"quiet"`
-	Verbose     bool              `yaml:"verbose"`
-	APIToken    string            `yaml:"api_token,omitempty"`
-	RateLimit   int               `yaml:"rate_limit"`
-	LogFile     string            `yaml:"log_file,omitempty"`
-	StateFile   string            `yaml:"state_file,omitempty"`
-	IPWhitelist []string          `yaml:"ip_whitelist,omitempty"`
-	RequestLog  bool              `yaml:"request_log"`
-	Compress    bool              `yaml:"compress"`
-	HealthCheck HealthCheckConfig `yaml:"health_check"`
+	Version     int    `yaml:"version,omitempty"`
+	Domain      string `yaml:"domain"`
+	TLSCertPath string `yaml:"tls_cert_path,omitempty"`
+	TLSKeyPath  string `yaml:"tls_key_path,omitempty"`
+	Port        int    `yaml:"port"`
+	ProxyPort   int    `yaml:"proxy_port"`
+	MetricsPort int    `yaml:"metrics_port"`
+	Debug       bool   `yaml:"debug"`
+	Quiet       bool   `yaml:"quiet"`
+	Verbose     bool   `yaml:"verbose"`
+	APIToken    string `yaml:"api_token,omitempty"`
+	// ClientIdentities enables per-client control-plane credentials. APIToken is
+	// retained as an administrator/legacy fallback during migration.
+	ClientIdentities []ClientIdentityConfig `yaml:"client_identities,omitempty"`
+	RateLimit        int                    `yaml:"rate_limit"`
+	LogFile          string                 `yaml:"log_file,omitempty"`
+	StateFile        string                 `yaml:"state_file,omitempty"`
+	IPWhitelist      []string               `yaml:"ip_whitelist,omitempty"`
+	RequestLog       bool                   `yaml:"request_log"`
+	Compress         bool                   `yaml:"compress"`
+	HealthCheck      HealthCheckConfig      `yaml:"health_check"`
 	// mTLS: CA certificate for verifying client certificates
 	ClientCAPath string `yaml:"client_ca_path,omitempty"`
 	Insecure     bool   `yaml:"insecure,omitempty"`
@@ -106,6 +110,14 @@ type ServerConfig struct {
 	RedisAddr     string `yaml:"redis_addr,omitempty"`
 	RedisPassword string `yaml:"redis_password,omitempty"`
 	PostgresDSN   string `yaml:"postgres_dsn,omitempty"`
+}
+
+// ClientIdentityConfig binds a credential to one stable client ID and an
+// explicit set of control-plane scopes (for example client or p2p).
+type ClientIdentityConfig struct {
+	ID     string   `yaml:"id"`
+	Token  string   `yaml:"token"`
+	Scopes []string `yaml:"scopes,omitempty"`
 }
 
 // CurrentVersion is the on-disk configuration schema version.
@@ -168,6 +180,26 @@ func (c *ServerConfig) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unsupported state_backend %q (want memory, redis, or postgres)", c.StateBackend)
+	}
+	ids := make(map[string]struct{}, len(c.ClientIdentities))
+	tokens := make(map[string]struct{}, len(c.ClientIdentities))
+	for i, identity := range c.ClientIdentities {
+		if identity.ID == "" || identity.Token == "" {
+			return fmt.Errorf("client_identities[%d] requires id and token", i)
+		}
+		if _, exists := ids[identity.ID]; exists {
+			return fmt.Errorf("duplicate client identity %q", identity.ID)
+		}
+		if _, exists := tokens[identity.Token]; exists {
+			return fmt.Errorf("credential token is reused by multiple client identities")
+		}
+		ids[identity.ID] = struct{}{}
+		tokens[identity.Token] = struct{}{}
+		for _, scope := range identity.Scopes {
+			if scope == "" {
+				return fmt.Errorf("client identity %q contains an empty scope", identity.ID)
+			}
+		}
 	}
 	// Empty certificate paths are valid: the server derives the Let's Encrypt
 	// paths from domain, or the CLI can supply them after loading this config.
@@ -315,6 +347,7 @@ func FindConfigFile(name string) string {
 func GenerateExampleClientConfig() string {
 	return `# xrok client configuration
 server: xrok.example.com
+id: client-a
 token: your-api-token
 tls: true
 
@@ -377,6 +410,12 @@ metrics_port: 9090
 
 # Authentication
 api_token: your-secret-token
+
+# Prefer per-client identities for least-privilege control-plane access.
+client_identities:
+  - id: client-a
+    token: replace-with-a-unique-secret
+    scopes: [client, p2p]
 
 # Rate limiting (requests per second, 0 = unlimited)
 rate_limit: 100

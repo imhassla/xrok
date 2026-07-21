@@ -440,6 +440,9 @@ func RunClient(args []string) {
 		if *apiToken == "" {
 			*apiToken = cfg.Token
 		}
+		if clientID == "" {
+			clientID = cfg.ID
+		}
 		if len(tunnels) == 0 && len(cfg.Tunnels) > 0 {
 			for _, t := range cfg.Tunnels {
 				tunnels = append(tunnels, TunnelConfig{Name: t.Name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability, CapabilityAudience: t.CapabilityAudience})
@@ -680,6 +683,11 @@ func RunClient(args []string) {
 		*enableP2P = false
 	}
 	if *enableP2P {
+		// P2P identities must be stable before registration because the punch
+		// session and signaling authorization are both bound to this ID.
+		if clientID == "" {
+			clientID = fmt.Sprintf("client-%08x", rand.Uint32())
+		}
 		p2pMgr := p2p.NewP2PManager(clientID, *p2pStunServer)
 		peerInfo, err := p2pMgr.DiscoverPublicAddr()
 		if err != nil {

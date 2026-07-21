@@ -11,6 +11,7 @@ func SaveServerConfig(cfg *ServerConfig, path string) error
 type ClientConfig struct{ ... }
     func DefaultClientConfig() *ClientConfig
     func LoadClientConfig(path string) (*ClientConfig, error)
+type ClientIdentityConfig struct{ ... }
 type HealthCheckConfig struct{ ... }
 type P2PConfig struct{ ... }
 type ReconnectConfig struct{ ... }

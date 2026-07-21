@@ -25,6 +25,9 @@ type PeerInfo struct {
 	// AuthToken is a short-lived capability shared out-of-band via signaling.
 	// It is never logged and is only used to authenticate punch probes.
 	AuthToken string `json:"auth_token,omitempty"`
+	// SessionID rotates with each P2P manager lifecycle and binds authenticated
+	// connectivity probes to this exact signaling session.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // P2PManager handles P2P connections
@@ -35,6 +38,8 @@ type P2PManager struct {
 	localAddr   string
 	natType     stun.NATType
 	authToken   string
+	sessionID   string
+	replay      *PunchReplayCache
 	connections map[string]*P2PConnection
 	mu          sync.RWMutex
 }
@@ -57,6 +62,8 @@ func NewP2PManager(peerID, stunServer string) *P2PManager {
 		peerID:      peerID,
 		stunServer:  stunServer,
 		authToken:   newPunchToken(),
+		sessionID:   newPunchSessionID(),
+		replay:      NewPunchReplayCache(defaultReplayEntries),
 		connections: make(map[string]*P2PConnection),
 	}
 }
@@ -133,6 +140,7 @@ func (m *P2PManager) DiscoverPublicAddr() (*PeerInfo, error) {
 			LocalAddr:  m.localAddr,
 			NATType:    natType.String(),
 			AuthToken:  m.authToken,
+			SessionID:  m.sessionID,
 		}, nil
 	}
 
@@ -148,6 +156,7 @@ func (m *P2PManager) DiscoverPublicAddr() (*PeerInfo, error) {
 		LocalAddr:  m.localAddr,
 		NATType:    "unknown",
 		AuthToken:  m.authToken,
+		SessionID:  m.sessionID,
 	}, nil
 }
 
@@ -270,7 +279,7 @@ func (m *P2PManager) simpleSTUNBinding() (publicAddr, localAddr string, err erro
 
 // PunchHole attempts UDP hole punching to peer
 func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PConnection, error) {
-	if peerInfo == nil || peerInfo.PeerID == "" || peerInfo.AuthToken == "" || m.authToken == "" {
+	if peerInfo == nil || peerInfo.PeerID == "" || peerInfo.AuthToken == "" || peerInfo.SessionID == "" || m.authToken == "" || m.sessionID == "" {
 		return nil, fmt.Errorf("authenticated P2P peer capability is required")
 	}
 	// Resolve peer address
@@ -302,7 +311,10 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 		// Prove possession of the target's capability. The peer performs the
 		// mirror operation using our token received through authenticated
 		// signaling.
-		punchMsg := punchMessage(peerInfo.AuthToken, m.peerID)
+		punchMsg, err := authenticatedPunchMessage(peerInfo.AuthToken, m.peerID, peerInfo.SessionID, time.Now())
+		if err != nil {
+			return
+		}
 
 		for {
 			select {
@@ -342,7 +354,7 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 			// Do not accept arbitrary UDP traffic as a successful punch.  The
 			// sender identity is carried in the probe and must match the peer
 			// discovered through authenticated signaling.
-			valid := validPunchMessage(msg, m.authToken, peerInfo.PeerID)
+			valid := validateAuthenticatedPunch(msg, m.authToken, peerInfo.PeerID, m.sessionID, time.Now(), defaultPunchMaxSkew, m.replay)
 			if valid {
 				// Received punch packet from peer - connection established!
 				conn.SetReadDeadline(time.Time{})

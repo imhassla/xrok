@@ -184,8 +184,9 @@ func deleteServerClient(id string) {
 
 // Auth globals
 var (
-	serverApiToken    string
-	serverAuthEnabled bool
+	serverApiToken             string
+	serverAuthEnabled          bool
+	serverClientIdentityPolicy = newControlIdentityPolicy(nil)
 
 	serverRateLimiters     = make(map[string]*rate.Limiter)
 	serverRateLimiterMutex sync.Mutex
@@ -307,6 +308,7 @@ func RunServer(args []string) {
 			serverRateBurst = loadedConfig.RateLimit * 2
 		}
 		serverApiToken = loadedConfig.APIToken
+		serverClientIdentityPolicy = newControlIdentityPolicy(loadedConfig.ClientIdentities)
 	}
 
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
@@ -401,6 +403,7 @@ func initServerCertificates() {
 }
 
 func initServerAuth() {
+	serverAuthEnabled = false
 	if token := os.Getenv("XROK_API_TOKEN"); token != "" {
 		serverApiToken = token
 	}
@@ -410,9 +413,9 @@ func initServerAuth() {
 			serverRateBurst = n * 2
 		}
 	}
-	if serverApiToken != "" {
+	if serverApiToken != "" || len(serverClientIdentityPolicy.credentials) > 0 {
 		serverAuthEnabled = true
-		log.Printf("API authentication enabled")
+		log.Printf("API authentication enabled (client identities: %d)", len(serverClientIdentityPolicy.credentials))
 	} else {
 		log.Printf("Warning: XROK_API_TOKEN not set, authentication disabled")
 	}
@@ -427,16 +430,8 @@ func generateServerToken() string {
 }
 
 func validateServerToken(r *http.Request) bool {
-	if !serverAuthEnabled {
-		return true
-	}
-
-	token := r.Header.Get("X-API-Token")
-	if token == "" {
-		token = r.URL.Query().Get("token")
-	}
-
-	return subtle.ConstantTimeCompare([]byte(token), []byte(serverApiToken)) == 1
+	_, ok := authenticateControlRequest(r)
+	return ok
 }
 
 func getServerRateLimiter(ip string, limiters map[string]*rate.Limiter, r rate.Limit, b int) *rate.Limiter {
@@ -503,14 +498,7 @@ func serverRegRateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func serverAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !validateServerToken(r) {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			log.Printf("Unauthorized request from IP: %s", getServerClientIP(r))
-			return
-		}
-		next(w, r)
-	}
+	return serverAuthScopeMiddleware(scopeAdmin, next)
 }
 
 // logRequest logs HTTP request details
@@ -873,7 +861,11 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	portNoTLS, clientPortTLS := generateServerPorts()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	clientID := regReq.ClientID
+	clientID, allowed := requirePrincipalClient(w, r, regReq.ClientID)
+	if !allowed {
+		cancel()
+		return
+	}
 	if clientID == "" {
 		clientID = uuid.New().String()
 	}
@@ -1094,28 +1086,28 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 			// Handle registration and control endpoints
 			switch r.URL.Path {
 			case "/register_client":
-				serverAuthMiddleware(serverRegRateLimitMiddleware(registerServerClientHandler))(w, r)
+				serverAuthScopeMiddleware(scopeClient, serverRegRateLimitMiddleware(registerServerClientHandler))(w, r)
 				return
 			case "/client_ws":
-				serverAuthMiddleware(serverRateLimitMiddleware(serverClientWebSocketHandler))(w, r)
+				serverAuthScopeMiddleware(scopeClient, serverRateLimitMiddleware(serverClientWebSocketHandler))(w, r)
 				return
 			case "/mux":
 				serverRateLimitMiddleware(serverMuxWebSocketHandler)(w, r)
 				return
 			case "/p2p/signal":
-				serverAuthMiddleware(handleP2PSignaling)(w, r)
+				serverAuthScopeMiddleware(scopeP2PSignal, handleP2PSignaling)(w, r)
 				return
 			case "/p2p/ws":
-				serverAuthMiddleware(handleP2PWebSocket)(w, r)
+				serverAuthScopeMiddleware(scopeP2PSignal, handleP2PWebSocket)(w, r)
 				return
 			case "/p2p/clients":
-				serverAuthMiddleware(handleP2PClients)(w, r)
+				serverAuthScopeMiddleware(scopeP2PRead, handleP2PClients)(w, r)
 				return
 			case "/p2p/discover":
-				serverAuthMiddleware(handleP2PDiscoverTrigger)(w, r)
+				serverAuthScopeMiddleware(scopeP2PAdmin, handleP2PDiscoverTrigger)(w, r)
 				return
 			case "/p2p/tunnel-owner":
-				serverAuthMiddleware(handleP2PTunnelOwner)(w, r)
+				serverAuthScopeMiddleware(scopeP2PRead, handleP2PTunnelOwner)(w, r)
 				return
 			case "/health":
 				w.Header().Set("Content-Type", "application/json")
@@ -2625,6 +2617,9 @@ func serverClientWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing connectionID or clientID", http.StatusBadRequest)
 		return
 	}
+	if _, ok := requirePrincipalClient(w, r, clientID); !ok {
+		return
+	}
 
 	if r.Header.Get("Upgrade") != "websocket" {
 		http.Error(w, "WebSocket upgrade required", http.StatusBadRequest)
@@ -2661,6 +2656,11 @@ func handleP2PWebSocket(w http.ResponseWriter, r *http.Request) {
 	clientID := r.URL.Query().Get("client_id")
 	if clientID == "" {
 		http.Error(w, "client_id required", http.StatusBadRequest)
+		return
+	}
+	var allowed bool
+	clientID, allowed = requirePrincipalClient(w, r, clientID)
+	if !allowed {
 		return
 	}
 
@@ -2801,6 +2801,11 @@ func handleP2PSignaling(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid signal", http.StatusBadRequest)
 		return
 	}
+	fromPeer, allowed := requirePrincipalClient(w, r, signal.FromPeer)
+	if !allowed {
+		return
+	}
+	signal.FromPeer = fromPeer
 
 	switch signal.Type {
 	case p2p.SignalTypeDiscover:

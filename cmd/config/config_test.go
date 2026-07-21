@@ -28,6 +28,7 @@ func TestClientConfigRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client.yaml")
 	want := DefaultClientConfig()
 	want.Server = "localhost"
+	want.ID = "client-a"
 	want.CACert = "/tmp/test-ca.pem"
 	want.Transport = "quic"
 	want.Tunnels = []TunnelConfig{{Name: "app", Target: "127.0.0.1:8080"}}
@@ -38,8 +39,29 @@ func TestClientConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Server != want.Server || got.CACert != want.CACert || got.Transport != "quic" || got.Reconnect.MaxWait != 5*time.Minute {
+	if got.Server != want.Server || got.ID != want.ID || got.CACert != want.CACert || got.Transport != "quic" || got.Reconnect.MaxWait != 5*time.Minute {
 		t.Fatalf("round trip mismatch: %#v", got)
+	}
+}
+
+func TestServerClientIdentitiesValidationAndRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.yaml")
+	want := DefaultServerConfig()
+	want.Domain = "localhost"
+	want.ClientIdentities = []ClientIdentityConfig{{ID: "alice", Token: "alice-secret", Scopes: []string{"client", "p2p"}}}
+	if err := SaveServerConfig(want, path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadServerConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.ClientIdentities) != 1 || got.ClientIdentities[0].ID != "alice" || len(got.ClientIdentities[0].Scopes) != 2 {
+		t.Fatalf("identity round trip mismatch: %#v", got.ClientIdentities)
+	}
+	got.ClientIdentities = append(got.ClientIdentities, got.ClientIdentities[0])
+	if err := got.Validate(); err == nil {
+		t.Fatal("duplicate client identity accepted")
 	}
 }
 

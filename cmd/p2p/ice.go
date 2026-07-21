@@ -37,9 +37,15 @@ type RelayProvider interface {
 }
 
 type ICEConfig struct {
-	STUNServer    string
-	Relay         RelayProvider
-	GatherTimeout time.Duration
+	STUNServer      string
+	Relay           RelayProvider
+	GatherTimeout   time.Duration
+	Checker         ConnectivityChecker
+	CheckTimeout    time.Duration
+	ConsentProbe    ConsentProbe
+	ConsentInterval time.Duration
+	ConsentFailures int
+	TickSource      TickSource
 	// DialUDP allows deterministic tests and custom transports. When nil,
 	// net.DialUDP is used.
 	DialUDP func(network string, laddr, raddr *net.UDPAddr) (udpConn, error)
@@ -57,6 +63,15 @@ type ICEAgent struct{ cfg ICEConfig }
 func NewICEAgent(cfg ICEConfig) *ICEAgent {
 	if cfg.GatherTimeout <= 0 {
 		cfg.GatherTimeout = 3 * time.Second
+	}
+	if cfg.CheckTimeout <= 0 {
+		cfg.CheckTimeout = 3 * time.Second
+	}
+	if cfg.ConsentInterval <= 0 {
+		cfg.ConsentInterval = 15 * time.Second
+	}
+	if cfg.ConsentFailures <= 0 {
+		cfg.ConsentFailures = 3
 	}
 	return &ICEAgent{cfg: cfg}
 }
