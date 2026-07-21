@@ -3,7 +3,9 @@ package p2p
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
@@ -54,6 +56,7 @@ func NewP2PManager(peerID, stunServer string) *P2PManager {
 	return &P2PManager{
 		peerID:      peerID,
 		stunServer:  stunServer,
+		authToken:   newPunchToken(),
 		connections: make(map[string]*P2PConnection),
 	}
 }
@@ -63,14 +66,39 @@ func NewP2PManager(peerID, stunServer string) *P2PManager {
 // authenticated signaling channel.
 func NewP2PManagerWithToken(peerID, stunServer, token string) *P2PManager {
 	m := NewP2PManager(peerID, stunServer)
-	m.authToken = token
+	if token != "" {
+		m.authToken = token
+	}
 	return m
+}
+
+func newPunchToken() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure means that authenticated P2P cannot be made safe.
+		// Leave the token empty so PunchHole fails closed.
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 func punchProof(token, peerID string) string {
 	h := hmac.New(sha256.New, []byte(token))
 	h.Write([]byte(peerID))
 	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func punchMessage(token, peerID string) []byte {
+	return []byte(fmt.Sprintf("XROK-P2P-PUNCH:v1:%s:%s", peerID, punchProof(token, peerID)))
+}
+
+func validPunchMessage(msg, token, peerID string) bool {
+	if token == "" || peerID == "" {
+		return false
+	}
+	parts := strings.Split(msg, ":")
+	return len(parts) == 4 && parts[0] == "XROK-P2P-PUNCH" && parts[1] == "v1" &&
+		parts[2] == peerID && hmac.Equal([]byte(parts[3]), []byte(punchProof(token, peerID)))
 }
 
 // DiscoverPublicAddr uses STUN to discover public address
@@ -156,9 +184,9 @@ func (m *P2PManager) simpleSTUNBinding() (publicAddr, localAddr string, err erro
 	request[5] = 0x12
 	request[6] = 0xa4
 	request[7] = 0x42
-	// Transaction ID (12 random bytes)
-	for i := 8; i < 20; i++ {
-		request[i] = byte(time.Now().UnixNano() >> (i * 4))
+	// Transaction ID (12 cryptographically random bytes).
+	if _, err := rand.Read(request[8:20]); err != nil {
+		return "", "", fmt.Errorf("failed to generate STUN transaction ID: %w", err)
 	}
 
 	// Send request
@@ -182,10 +210,16 @@ func (m *P2PManager) simpleSTUNBinding() (publicAddr, localAddr string, err erro
 	if response[0] != 0x01 || response[1] != 0x01 {
 		return "", "", fmt.Errorf("unexpected STUN response type")
 	}
+	if !hmac.Equal(response[4:20], request[4:20]) {
+		return "", "", fmt.Errorf("STUN response transaction mismatch")
+	}
 
 	// Parse attributes to find XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
 	offset := 20
 	msgLen := int(response[2])<<8 | int(response[3])
+	if msgLen%4 != 0 || msgLen > n-20 {
+		return "", "", fmt.Errorf("invalid STUN response length")
+	}
 
 	for offset < 20+msgLen && offset+4 <= n {
 		attrType := int(response[offset])<<8 | int(response[offset+1])
@@ -236,6 +270,9 @@ func (m *P2PManager) simpleSTUNBinding() (publicAddr, localAddr string, err erro
 
 // PunchHole attempts UDP hole punching to peer
 func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PConnection, error) {
+	if peerInfo == nil || peerInfo.PeerID == "" || peerInfo.AuthToken == "" || m.authToken == "" {
+		return nil, fmt.Errorf("authenticated P2P peer capability is required")
+	}
 	// Resolve peer address
 	peerAddr, err := net.ResolveUDPAddr("udp", peerInfo.PublicAddr)
 	if err != nil {
@@ -262,10 +299,10 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 
-		punchMsg := []byte(fmt.Sprintf("XROK-P2P-PUNCH:%s", m.peerID))
-		if m.authToken != "" {
-			punchMsg = []byte(fmt.Sprintf("XROK-P2P-PUNCH:v1:%s:%s", m.peerID, punchProof(m.authToken, m.peerID)))
-		}
+		// Prove possession of the target's capability. The peer performs the
+		// mirror operation using our token received through authenticated
+		// signaling.
+		punchMsg := punchMessage(peerInfo.AuthToken, m.peerID)
 
 		for {
 			select {
@@ -279,19 +316,24 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 
 	// Wait for response
 	buf := make([]byte, 1024)
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-
 	for {
 		select {
 		case <-punchCtx.Done():
 			conn.Close()
 			return nil, fmt.Errorf("hole punching timed out")
 		default:
+			readDeadline := time.Now().Add(250 * time.Millisecond)
+			if deadline, ok := punchCtx.Deadline(); ok && deadline.Before(readDeadline) {
+				readDeadline = deadline
+			}
+			if err := conn.SetReadDeadline(readDeadline); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("set P2P read deadline: %w", err)
+			}
 			n, remoteAddr, err := conn.ReadFromUDP(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					conn.Close()
-					return nil, fmt.Errorf("hole punching timed out")
+					continue
 				}
 				continue
 			}
@@ -300,14 +342,7 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 			// Do not accept arbitrary UDP traffic as a successful punch.  The
 			// sender identity is carried in the probe and must match the peer
 			// discovered through authenticated signaling.
-			const punchPrefix = "XROK-P2P-PUNCH:"
-			valid := false
-			if m.authToken != "" {
-				parts := strings.Split(msg, ":")
-				valid = len(parts) == 4 && parts[0]+":"+parts[1]+":" == "XROK-P2P-PUNCH:v1:" && parts[2] == peerInfo.PeerID && hmac.Equal([]byte(parts[3]), []byte(punchProof(m.authToken, peerInfo.PeerID)))
-			} else {
-				valid = strings.HasPrefix(msg, punchPrefix) && strings.TrimSpace(strings.TrimPrefix(msg, punchPrefix)) == peerInfo.PeerID
-			}
+			valid := validPunchMessage(msg, m.authToken, peerInfo.PeerID)
 			if valid {
 				// Received punch packet from peer - connection established!
 				conn.SetReadDeadline(time.Time{})
@@ -339,8 +374,16 @@ type UDPConn struct {
 }
 
 func (c *UDPConn) Read(b []byte) (n int, err error) {
-	n, _, err = c.conn.ReadFromUDP(b)
-	return
+	for {
+		var source *net.UDPAddr
+		n, source, err = c.conn.ReadFromUDP(b)
+		if err != nil {
+			return n, err
+		}
+		if source.Port == c.remoteAddr.Port && source.IP.Equal(c.remoteAddr.IP) {
+			return n, nil
+		}
+	}
 }
 
 func (c *UDPConn) Write(b []byte) (n int, err error) {

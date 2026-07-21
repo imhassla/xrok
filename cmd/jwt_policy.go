@@ -22,6 +22,9 @@ import (
 // verifyJWTCapability validates a compact HS256 JWT. The configured secret is
 // supplied per tunnel; audience is optional but, when set, must match aud.
 func verifyJWTCapability(token, secret, audience string, now time.Time) bool {
+	if len(token) == 0 || len(token) > maxJWTSize {
+		return false
+	}
 	p := strings.Split(token, ".")
 	if len(p) != 3 || secret == "" {
 		return false
@@ -92,25 +95,67 @@ type OIDCVerifier struct {
 	client           *http.Client
 	ttl              time.Duration
 	mu               sync.RWMutex
+	refreshMu        sync.Mutex
 	keys             map[string]*rsa.PublicKey
 	fetched          time.Time
+	lastRefresh      time.Time
+	lastRefreshErr   error
 	jwksURL          string
 }
 
+const (
+	maxJWTSize      = 16 << 10
+	maxOIDCBodySize = 1 << 20
+)
+
 func NewOIDCVerifier(issuer, audience string, client *http.Client, ttl time.Duration) *OIDCVerifier {
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: 5 * time.Second}
 	}
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
 	return &OIDCVerifier{issuer: strings.TrimRight(issuer, "/"), audience: audience, client: client, ttl: ttl, keys: make(map[string]*rsa.PublicKey)}
 }
-func (v *OIDCVerifier) refresh(ctx context.Context) error {
+func (v *OIDCVerifier) refresh(ctx context.Context, wantedKid string) (retErr error) {
+	v.refreshMu.Lock()
+	defer v.refreshMu.Unlock()
+
 	if v.issuer == "" {
 		return errors.New("oidc issuer is empty")
 	}
-	dreq, _ := http.NewRequestWithContext(ctx, http.MethodGet, v.issuer+"/.well-known/openid-configuration", nil)
+	now := time.Now()
+	v.mu.RLock()
+	_, alreadyLoaded := v.keys[wantedKid]
+	fresh := !v.fetched.IsZero() && now.Sub(v.fetched) <= v.ttl
+	lastRefresh := v.lastRefresh
+	lastRefreshErr := v.lastRefreshErr
+	v.mu.RUnlock()
+	if alreadyLoaded && fresh {
+		return nil
+	}
+	refreshCooldown := v.ttl
+	if refreshCooldown > 5*time.Second {
+		refreshCooldown = 5 * time.Second
+	}
+	if refreshCooldown <= 0 {
+		refreshCooldown = time.Second
+	}
+	if !lastRefresh.IsZero() && now.Sub(lastRefresh) < refreshCooldown {
+		return lastRefreshErr
+	}
+	v.mu.Lock()
+	v.lastRefresh = now
+	v.mu.Unlock()
+	defer func() {
+		v.mu.Lock()
+		v.lastRefreshErr = retErr
+		v.mu.Unlock()
+	}()
+	dreq, err := http.NewRequestWithContext(ctx, http.MethodGet, v.issuer+"/.well-known/openid-configuration", nil)
+	if err != nil {
+		return fmt.Errorf("oidc discovery request: %w", err)
+	}
 	resp, err := v.client.Do(dreq)
 	if err != nil {
 		return err
@@ -120,12 +165,19 @@ func (v *OIDCVerifier) refresh(ctx context.Context) error {
 		return fmt.Errorf("oidc discovery: %s", resp.Status)
 	}
 	var d struct {
+		Issuer  string `json:"issuer"`
 		JWKSURI string `json:"jwks_uri"`
 	}
-	if err = json.NewDecoder(resp.Body).Decode(&d); err != nil || d.JWKSURI == "" {
+	if err = decodeLimitedJSON(resp.Body, &d); err != nil || d.JWKSURI == "" {
 		return errors.New("oidc discovery missing jwks_uri")
 	}
-	jreq, _ := http.NewRequestWithContext(ctx, http.MethodGet, d.JWKSURI, nil)
+	if strings.TrimRight(d.Issuer, "/") != v.issuer {
+		return errors.New("oidc discovery issuer mismatch")
+	}
+	jreq, err := http.NewRequestWithContext(ctx, http.MethodGet, d.JWKSURI, nil)
+	if err != nil {
+		return fmt.Errorf("jwks request: %w", err)
+	}
 	jr, err := v.client.Do(jreq)
 	if err != nil {
 		return err
@@ -134,39 +186,41 @@ func (v *OIDCVerifier) refresh(ctx context.Context) error {
 	if jr.StatusCode/100 != 2 {
 		return fmt.Errorf("jwks: %s", jr.Status)
 	}
-	b, err := io.ReadAll(jr.Body)
-	if err != nil {
-		return err
-	}
 	var set struct {
 		Keys []struct {
 			Kid string `json:"kid"`
 			Kty string `json:"kty"`
+			Use string `json:"use"`
+			Alg string `json:"alg"`
 			N   string `json:"n"`
 			E   string `json:"e"`
 		} `json:"keys"`
 	}
-	if json.Unmarshal(b, &set) != nil {
+	if decodeLimitedJSON(jr.Body, &set) != nil {
 		return errors.New("invalid jwks")
 	}
 	keys := map[string]*rsa.PublicKey{}
 	for _, k := range set.Keys {
-		if k.Kty != "RSA" {
+		if k.Kty != "RSA" || k.Kid == "" || (k.Use != "" && k.Use != "sig") || (k.Alg != "" && k.Alg != "RS256") {
 			continue
 		}
 		n, e1 := base64.RawURLEncoding.DecodeString(k.N)
 		eb, e2 := base64.RawURLEncoding.DecodeString(k.E)
-		if e1 != nil || e2 != nil {
+		if e1 != nil || e2 != nil || len(eb) == 0 || len(eb) > 4 {
 			continue
 		}
 		ei := 0
 		for _, x := range eb {
 			ei = ei*256 + int(x)
 		}
-		if ei == 0 {
+		modulus := new(big.Int).SetBytes(n)
+		if modulus.BitLen() < 2048 || ei < 3 || ei > 1<<31-1 || ei%2 == 0 {
 			continue
 		}
-		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: ei}
+		if _, duplicate := keys[k.Kid]; duplicate {
+			return errors.New("jwks contains duplicate kid")
+		}
+		keys[k.Kid] = &rsa.PublicKey{N: modulus, E: ei}
 	}
 	if len(keys) == 0 {
 		return errors.New("jwks has no rsa keys")
@@ -178,7 +232,22 @@ func (v *OIDCVerifier) refresh(ctx context.Context) error {
 	v.mu.Unlock()
 	return nil
 }
+
+func decodeLimitedJSON(r io.Reader, dst interface{}) error {
+	b, err := io.ReadAll(io.LimitReader(r, maxOIDCBodySize+1))
+	if err != nil {
+		return err
+	}
+	if len(b) > maxOIDCBodySize {
+		return errors.New("oidc response too large")
+	}
+	return json.Unmarshal(b, dst)
+}
+
 func (v *OIDCVerifier) Verify(ctx context.Context, token string, now time.Time) error {
+	if len(token) == 0 || len(token) > maxJWTSize {
+		return errInvalidJWT
+	}
 	p := strings.Split(token, ".")
 	if len(p) != 3 {
 		return errInvalidJWT
@@ -197,7 +266,7 @@ func (v *OIDCVerifier) Verify(ctx context.Context, token string, now time.Time) 
 	stale := time.Since(v.fetched) > v.ttl
 	v.mu.RUnlock()
 	if key == nil || stale {
-		if err := v.refresh(ctx); err != nil {
+		if err := v.refresh(ctx, h.Kid); err != nil {
 			return err
 		}
 		v.mu.RLock()

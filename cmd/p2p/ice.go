@@ -6,6 +6,7 @@ package p2p
 // that UDP punching alone is a complete NAT traversal implementation.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -120,7 +121,9 @@ func (a *ICEAgent) gatherSrflx(ctx context.Context) (Candidate, error) {
 	}
 	defer c.Close()
 	var tx [12]byte
-	_, _ = rand.Read(tx[:])
+	if _, err := rand.Read(tx[:]); err != nil {
+		return Candidate{}, fmt.Errorf("generate STUN transaction ID: %w", err)
+	}
 	p := make([]byte, 20)
 	binary.BigEndian.PutUint16(p, 0x0001)
 	binary.BigEndian.PutUint16(p[2:], 0)
@@ -129,7 +132,13 @@ func (a *ICEAgent) gatherSrflx(ctx context.Context) (Candidate, error) {
 	if _, err = c.Write(p); err != nil {
 		return Candidate{}, err
 	}
-	_ = c.SetReadDeadline(time.Now().Add(a.cfg.GatherTimeout))
+	readDeadline := time.Now().Add(a.cfg.GatherTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(readDeadline) {
+		readDeadline = ctxDeadline
+	}
+	if err := c.SetReadDeadline(readDeadline); err != nil {
+		return Candidate{}, err
+	}
 	b := make([]byte, 1500)
 	n, err := c.Read(b)
 	if err != nil {
@@ -138,18 +147,23 @@ func (a *ICEAgent) gatherSrflx(ctx context.Context) (Candidate, error) {
 	if n < 20 || binary.BigEndian.Uint16(b) != 0x0101 {
 		return Candidate{}, fmt.Errorf("invalid STUN response")
 	}
-	for off := 20; off+4 <= n; {
+	msgLen := int(binary.BigEndian.Uint16(b[2:4]))
+	if msgLen%4 != 0 || msgLen > n-20 || binary.BigEndian.Uint32(b[4:8]) != 0x2112A442 || !bytes.Equal(b[8:20], tx[:]) {
+		return Candidate{}, fmt.Errorf("invalid STUN response transaction")
+	}
+	end := 20 + msgLen
+	for off := 20; off+4 <= end; {
 		typ, ln := binary.BigEndian.Uint16(b[off:]), int(binary.BigEndian.Uint16(b[off+2:]))
 		off += 4
-		if off+ln > n {
-			break
+		if off+ln > end {
+			return Candidate{}, fmt.Errorf("truncated STUN attribute")
 		}
-		if typ == 0x0020 && ln >= 8 {
+		if typ == 0x0020 && ln >= 8 && b[off+1] == 0x01 {
 			port := binary.BigEndian.Uint16(b[off+2:]) ^ 0x2112
 			ip := net.IPv4(b[off+4]^0x21, b[off+5]^0x12, b[off+6]^0xA4, b[off+7]^0x42)
 			return Candidate{ID: "srflx-" + ip.String(), Type: CandidateSrflx, Addr: net.JoinHostPort(ip.String(), fmt.Sprint(port)), Priority: 100}, nil
 		}
-		off += ln
+		off += (ln + 3) &^ 3
 	}
 	return Candidate{}, fmt.Errorf("STUN mapped address not found")
 }

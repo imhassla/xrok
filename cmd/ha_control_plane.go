@@ -70,6 +70,7 @@ type DrainController struct {
 	mu    sync.Mutex
 	hooks []DrainHook
 	once  sync.Once
+	err   error
 }
 
 func (d *DrainController) Add(h DrainHook) {
@@ -81,16 +82,15 @@ func (d *DrainController) Add(h DrainHook) {
 	d.mu.Unlock()
 }
 func (d *DrainController) Drain(ctx context.Context) error {
-	var first error
 	d.once.Do(func() {
 		d.mu.Lock()
 		hooks := append([]DrainHook(nil), d.hooks...)
 		d.mu.Unlock()
 		for _, h := range hooks {
-			if err := h(ctx); err != nil && first == nil {
-				first = err
+			if err := h(ctx); err != nil && d.err == nil {
+				d.err = err
 			}
 		}
 	})
-	return first
+	return d.err
 }

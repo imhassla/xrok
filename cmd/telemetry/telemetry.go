@@ -41,7 +41,7 @@ func (e *OTLPHTTPExporter) Export(ctx context.Context, s Span) {
 	if e == nil || e.Endpoint == "" {
 		return
 	}
-	p := otlpTracePayload{ResourceSpans: []otlpResourceSpans{{ScopeSpans: []otlpScopeSpans{{Spans: []otlpSpan{{TraceID: s.TraceID, SpanID: s.SpanID, Name: s.Name, StartTimeUnixNano: s.Start.UnixNano(), EndTimeUnixNano: s.End.UnixNano(), Status: otlpStatus{Code: s.Status}, Attributes: otlpAttributes(s.Attributes)}}}}}}}
+	p := otlpTracePayload{ResourceSpans: []otlpResourceSpans{{ScopeSpans: []otlpScopeSpans{{Spans: []otlpSpan{{TraceID: s.TraceID, SpanID: s.SpanID, Name: s.Name, StartTimeUnixNano: s.Start.UnixNano(), EndTimeUnixNano: s.End.UnixNano(), Status: otlpStatusForHTTP(s.Status), Attributes: otlpAttributes(s.Attributes)}}}}}}}
 	b, err := json.Marshal(p)
 	if err != nil {
 		return
@@ -88,6 +88,16 @@ type otlpValue struct {
 }
 type otlpStatus struct {
 	Code int `json:"code,omitempty"`
+}
+
+func otlpStatusForHTTP(status int) otlpStatus {
+	// OTLP StatusCode is an enum (UNSET=0, OK=1, ERROR=2), not an HTTP
+	// status code. Server spans mark 5xx responses as errors; 4xx describes
+	// a client-side request failure and remains unset per HTTP conventions.
+	if status >= http.StatusInternalServerError {
+		return otlpStatus{Code: 2}
+	}
+	return otlpStatus{}
 }
 
 func otlpAttributes(in map[string]string) []otlpAttribute {
@@ -152,10 +162,26 @@ func NewSpanID() string {
 }
 func ExtractTraceparent(h string) (trace, parent string, ok bool) {
 	p := strings.Split(strings.TrimSpace(h), "-")
-	if len(p) != 4 || len(p[1]) != 32 || len(p[2]) != 16 {
+	if len(p) != 4 || len(p[0]) != 2 || len(p[1]) != 32 || len(p[2]) != 16 || len(p[3]) != 2 {
+		return "", "", false
+	}
+	version, versionErr := hex.DecodeString(p[0])
+	traceBytes, traceErr := hex.DecodeString(p[1])
+	parentBytes, parentErr := hex.DecodeString(p[2])
+	_, flagsErr := hex.DecodeString(p[3])
+	if versionErr != nil || traceErr != nil || parentErr != nil || flagsErr != nil || version[0] == 0xff || allZero(traceBytes) || allZero(parentBytes) {
 		return "", "", false
 	}
 	return p[1], p[2], true
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 func InjectTraceparent(trace, span string) string { return "00-" + trace + "-" + span + "-01" }
 func ContextWithTrace(ctx context.Context, trace string) context.Context {
@@ -175,7 +201,11 @@ func HTTPMiddleware(next http.Handler) http.Handler {
 		sw := &statusWriter{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(sw, r)
-		currentExporter().Export(r.Context(), Span{TraceID: trace, SpanID: span, Name: r.Method + " " + r.URL.Path, Start: start, End: time.Now(), Status: sw.status, Attributes: map[string]string{"http.method": r.Method, "http.route": r.URL.Path}})
+		status := sw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		currentExporter().Export(r.Context(), Span{TraceID: trace, SpanID: span, Name: r.Method + " " + r.URL.Path, Start: start, End: time.Now(), Status: status, Attributes: map[string]string{"http.method": r.Method, "http.route": r.URL.Path}})
 	})
 }
 
@@ -197,7 +227,13 @@ func (w *statusWriter) Flush() {
 	}
 }
 
-func (w *statusWriter) WriteHeader(s int) { w.status = s; w.ResponseWriter.WriteHeader(s) }
+func (w *statusWriter) WriteHeader(s int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = s
+	w.ResponseWriter.WriteHeader(s)
+}
 func (w *statusWriter) Write(b []byte) (int, error) {
 	if w.status == 0 {
 		w.status = 200

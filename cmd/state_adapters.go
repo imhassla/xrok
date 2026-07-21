@@ -5,14 +5,21 @@ package cmd
 // can bring any driver they already use (no driver is linked by xrok).
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"time"
+)
+
+const (
+	maxRedisResponseLine = 64 << 10
+	maxRedisBulkResponse = 16 << 20
 )
 
 type RedisStateStore struct {
@@ -38,6 +45,9 @@ func (s *RedisStateStore) Save(ctx context.Context, st RuntimeState) error {
 	return err
 }
 func (s *RedisStateStore) Load(ctx context.Context, id string) (RuntimeState, bool, error) {
+	if id == "" {
+		return RuntimeState{}, false, fmt.Errorf("runtime state id is required")
+	}
 	v, err := s.command(ctx, "GET", s.Prefix+id)
 	if err != nil {
 		return RuntimeState{}, false, err
@@ -53,23 +63,39 @@ func (s *RedisStateStore) command(ctx context.Context, args ...string) (string, 
 	if s.Addr == "" {
 		return "", fmt.Errorf("redis address is required")
 	}
-	d := net.Dialer{Timeout: s.Timeout}
+	timeout := s.Timeout
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	d := net.Dialer{Timeout: timeout}
 	c, err := d.DialContext(ctx, "tcp", s.Addr)
 	if err != nil {
 		return "", err
 	}
 	defer c.Close()
-	if dl, ok := ctx.Deadline(); ok {
-		_ = c.SetDeadline(dl)
+	deadline := time.Time{}
+	deadline = time.Now().Add(timeout)
+	if dl, ok := ctx.Deadline(); ok && (deadline.IsZero() || dl.Before(deadline)) {
+		deadline = dl
 	}
-	if s.Password != "" {
-		if _, err = resp(c, "AUTH", s.Password); err != nil {
+	if !deadline.IsZero() {
+		if err := c.SetDeadline(deadline); err != nil {
 			return "", err
 		}
 	}
-	return resp(c, args...)
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = c.SetDeadline(time.Now())
+	})
+	defer stopCancel()
+	r := bufio.NewReader(c)
+	if s.Password != "" {
+		if _, err = resp(c, r, "AUTH", s.Password); err != nil {
+			return "", err
+		}
+	}
+	return resp(c, r, args...)
 }
-func resp(c net.Conn, args ...string) (string, error) {
+func resp(c net.Conn, r *bufio.Reader, args ...string) (string, error) {
 	var b []byte
 	b = append(b, '*')
 	b = append(b, []byte(strconv.Itoa(len(args)))...)
@@ -84,34 +110,65 @@ func resp(c net.Conn, args ...string) (string, error) {
 	if _, e := c.Write(b); e != nil {
 		return "", e
 	}
-	h := make([]byte, 1)
-	if _, e := io.ReadFull(c, h); e != nil {
+	h, e := r.ReadByte()
+	if e != nil {
 		return "", e
 	}
-	if h[0] == '-' {
-		return "", fmt.Errorf("redis error")
+	line, e := readRESPLine(r)
+	if e != nil {
+		return "", e
 	}
-	line := make([]byte, 256)
-	n := 0
-	for n < len(line) {
-		if _, e := io.ReadFull(c, line[n:n+1]); e != nil {
-			return "", e
-		}
-		if n > 0 && line[n-1] == '\r' && line[n] == '\n' {
-			break
-		}
-		n++
+	if h == '-' {
+		return "", fmt.Errorf("redis error: %s", line)
 	}
-	if h[0] == '$' {
-		l, _ := strconv.Atoi(string(line[:n-1]))
+	if h == '$' {
+		l, err := strconv.Atoi(line)
+		if err != nil {
+			return "", fmt.Errorf("invalid redis bulk length %q: %w", line, err)
+		}
 		if l < 0 {
+			if l != -1 {
+				return "", fmt.Errorf("invalid redis bulk length %d", l)
+			}
 			return "", nil
 		}
+		if l > maxRedisBulkResponse {
+			return "", fmt.Errorf("redis bulk response exceeds %d bytes", maxRedisBulkResponse)
+		}
 		v := make([]byte, l+2)
-		_, e := io.ReadFull(c, v)
-		return string(v[:l]), e
+		if _, err := io.ReadFull(r, v); err != nil {
+			return "", err
+		}
+		if v[l] != '\r' || v[l+1] != '\n' {
+			return "", fmt.Errorf("invalid redis bulk terminator")
+		}
+		return string(v[:l]), nil
 	}
-	return string(line[:n-1]), nil
+	if h != '+' && h != ':' {
+		return "", fmt.Errorf("unsupported redis response type %q", h)
+	}
+	return line, nil
+}
+
+func readRESPLine(r *bufio.Reader) (string, error) {
+	line := make([]byte, 0, 128)
+	for {
+		fragment, err := r.ReadSlice('\n')
+		if len(line)+len(fragment) > maxRedisResponseLine {
+			return "", fmt.Errorf("redis response line exceeds %d bytes", maxRedisResponseLine)
+		}
+		line = append(line, fragment...)
+		if err == nil {
+			break
+		}
+		if err != bufio.ErrBufferFull {
+			return "", err
+		}
+	}
+	if len(line) < 2 || line[len(line)-2] != '\r' || line[len(line)-1] != '\n' {
+		return "", fmt.Errorf("invalid redis response line terminator")
+	}
+	return string(line[:len(line)-2]), nil
 }
 
 type PostgresStateStore struct {
@@ -148,7 +205,7 @@ func (s *PostgresStateStore) Load(ctx context.Context, id string) (RuntimeState,
 	}
 	var st RuntimeState
 	e := s.DB.QueryRowContext(ctx, `SELECT id,status,updated_at FROM xrok_runtime_state WHERE id=$1`, id).Scan(&st.ID, &st.Status, &st.UpdatedAt)
-	if e == sql.ErrNoRows {
+	if errors.Is(e, sql.ErrNoRows) {
 		return RuntimeState{}, false, nil
 	}
 	return st, e == nil, e

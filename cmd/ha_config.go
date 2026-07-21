@@ -2,8 +2,10 @@ package cmd
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"xrok/cmd/config"
 )
 
@@ -61,6 +63,10 @@ func HAConfigFromServerConfig(c config.ServerConfig) (HAConfig, error) {
 }
 
 func validRedisAddr(v string) bool {
-	u, err := url.Parse("redis://" + v)
-	return err == nil && u.Host != ""
+	host, port, err := net.SplitHostPort(v)
+	if err != nil || host == "" || port == "" {
+		return false
+	}
+	n, err := strconv.Atoi(port)
+	return err == nil && n > 0 && n <= 65535
 }

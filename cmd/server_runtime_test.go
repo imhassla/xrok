@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
+	"time"
 
 	"xrok/cmd/config"
 )
@@ -99,4 +100,101 @@ func TestServerRuntimeInjectableRunner(t *testing.T) {
 	default:
 		t.Fatal("injected runner was not called")
 	}
+}
+
+func TestServerRuntimeContextRunnerIsIsolatedAndCancellable(t *testing.T) {
+	legacyShutdown := serverShutdownChan
+	started := make(chan struct{})
+	r, err := NewServerRuntimeWithDeps(config.ServerConfig{Domain: "test.local"}, ServerRuntimeDeps{
+		RunContext: func(ctx context.Context, _ []string) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	r.Shutdown()
+	if err := r.WaitErr(); err != context.Canceled {
+		t.Fatalf("WaitErr=%v, want context.Canceled", err)
+	}
+	if serverShutdownChan != legacyShutdown {
+		t.Fatal("injected runtime mutated legacy shutdown channel")
+	}
+	select {
+	case <-legacyShutdown:
+		t.Fatal("injected runtime closed legacy shutdown channel")
+	default:
+	}
+}
+
+func TestServerRuntimeShutdownBeforeStartDoesNotCloseGlobal(t *testing.T) {
+	legacyShutdown := serverShutdownChan
+	r, err := NewServerRuntimeWithDeps(config.ServerConfig{Domain: "test.local"}, ServerRuntimeDeps{
+		RunContext: func(context.Context, []string) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Shutdown()
+	select {
+	case <-legacyShutdown:
+		t.Fatal("unstarted runtime closed process-global shutdown channel")
+	default:
+	}
+}
+
+func TestServerRuntimeWaitContextIsBounded(t *testing.T) {
+	r, err := NewServerRuntimeWithDeps(config.ServerConfig{Domain: "test.local"}, ServerRuntimeDeps{
+		RunContext: func(ctx context.Context, _ []string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := r.WaitContext(waitCtx); err != context.DeadlineExceeded {
+		t.Fatalf("WaitContext=%v, want deadline", err)
+	}
+	r.Shutdown()
+	if err := r.WaitContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestServerRuntimeRejectsConcurrentLegacyOwners(t *testing.T) {
+	r1, err := NewServerRuntime(config.ServerConfig{Domain: "test.local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, err := NewServerRuntime(config.ServerConfig{Domain: "test.local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1.run = func([]string) { <-r1.shutdown }
+	r2.run = func([]string) { <-r2.shutdown }
+	if err := r1.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r2.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("err=%v, want active legacy runtime error", err)
+	}
+	r1.Shutdown()
+	r1.Wait()
+	if err := r2.Start(context.Background()); err != nil {
+		t.Fatalf("start after owner release: %v", err)
+	}
+	r2.Shutdown()
+	r2.Wait()
 }

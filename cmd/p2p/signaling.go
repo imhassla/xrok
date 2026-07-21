@@ -5,6 +5,8 @@ import (
 	"fmt"
 )
 
+const MaxSignalMessageSize = 64 << 10
+
 // SignalType represents P2P signaling message types
 type SignalType string
 
@@ -37,11 +39,27 @@ func EncodeSignal(msg *SignalMessage) ([]byte, error) {
 
 // DecodeSignal decodes a JSON signal message
 func DecodeSignal(data []byte) (*SignalMessage, error) {
+	if len(data) == 0 || len(data) > MaxSignalMessageSize {
+		return nil, fmt.Errorf("invalid signal size: %d", len(data))
+	}
 	var msg SignalMessage
 	if err := json.Unmarshal(data, &msg); err != nil {
 		return nil, fmt.Errorf("failed to decode signal: %w", err)
 	}
+	if !validSignalType(msg.Type) {
+		return nil, fmt.Errorf("unknown signal type %q", msg.Type)
+	}
 	return &msg, nil
+}
+
+func validSignalType(t SignalType) bool {
+	switch t {
+	case SignalTypeDiscover, SignalTypePeerInfo, SignalTypePunch, SignalTypeReady, SignalTypeFallback,
+		SignalTypeTunnelReq, SignalTypeTunnelResp, SignalTypeTunnelData, SignalTypeTunnelClose:
+		return true
+	default:
+		return false
+	}
 }
 
 // NewDiscoverSignal creates a peer discovery request

@@ -161,6 +161,7 @@ var (
 	serverLogFile   = "server.log"
 
 	serverShutdownChan = make(chan struct{})
+	serverShutdownMu   sync.Mutex
 	serverWg           sync.WaitGroup
 
 	serverBufferPool = sync.Pool{
@@ -337,7 +338,7 @@ func RunServer(args []string) {
 
 	loadServerState()
 
-	go gracefulServerShutdown()
+	go gracefulServerShutdown(serverShutdownChan)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -369,7 +370,15 @@ func RunServer(args []string) {
 
 	// Block until shutdown
 	<-serverShutdownChan
+	for clientID, client := range legacyClientRegistry.Snapshot() {
+		log.Printf("Closing client %s", clientID)
+		if client.cancelFunc != nil {
+			client.cancelFunc()
+		}
+	}
 	serverWg.Wait()
+	saveServerState()
+	log.Println("Server shutdown complete")
 }
 
 func setupServerLogging() {
@@ -2350,38 +2359,30 @@ func loadServerState() {
 	serverPortMutex.Unlock()
 }
 
-func gracefulServerShutdown() {
+func closeServerShutdown(shutdown chan struct{}) {
+	serverShutdownMu.Lock()
+	defer serverShutdownMu.Unlock()
+	select {
+	case <-shutdown:
+	default:
+		close(shutdown)
+	}
+}
+
+func gracefulServerShutdown(shutdown chan struct{}) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
-	sig := <-sigChan
+	var sig os.Signal
+	select {
+	case sig = <-sigChan:
+	case <-shutdown:
+		return
+	}
 	log.Printf("Received signal %v, initiating graceful shutdown...", sig)
 
-	close(serverShutdownChan)
-
-	for clientID, client := range legacyClientRegistry.Snapshot() {
-		log.Printf("Closing client %s", clientID)
-		if client.cancelFunc != nil {
-			client.cancelFunc()
-		}
-	}
-
-	done := make(chan struct{})
-	go func() {
-		serverWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		log.Println("All connections closed gracefully")
-	case <-time.After(30 * time.Second):
-		log.Println("Shutdown timeout, forcing exit")
-	}
-
-	saveServerState()
-	log.Println("Server shutdown complete")
-	os.Exit(0)
+	closeServerShutdown(shutdown)
 }
 
 func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
@@ -2676,6 +2677,7 @@ func handleP2PWebSocket(w http.ResponseWriter, r *http.Request) {
 		log.Printf("P2P WebSocket upgrade failed: %v", err)
 		return
 	}
+	conn.SetReadLimit(p2p.MaxSignalMessageSize)
 
 	// Store connection
 	client.p2pSignalMutex.Lock()
@@ -2794,6 +2796,7 @@ func handleP2PSignaling(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var signal p2p.SignalMessage
+	r.Body = http.MaxBytesReader(w, r.Body, p2p.MaxSignalMessageSize)
 	if err := json.NewDecoder(r.Body).Decode(&signal); err != nil {
 		http.Error(w, "Invalid signal", http.StatusBadRequest)
 		return
@@ -2832,6 +2835,14 @@ func handleP2PSignaling(w http.ResponseWriter, r *http.Request) {
 
 // handleP2PClients returns list of P2P-enabled clients for debugging
 func handleP2PClients(w http.ResponseWriter, r *http.Request) {
+	publicPeerInfo := func(info *p2p.PeerInfo) *p2p.PeerInfo {
+		if info == nil {
+			return nil
+		}
+		copy := *info
+		copy.AuthToken = ""
+		return &copy
+	}
 	type clientInfo struct {
 		ClientID   string        `json:"client_id"`
 		Tunnels    []string      `json:"tunnels"`
@@ -2851,7 +2862,7 @@ func handleP2PClients(w http.ResponseWriter, r *http.Request) {
 			ClientID:   id,
 			Tunnels:    tunnels,
 			P2PEnabled: client.p2pInfo != nil,
-			P2PInfo:    client.p2pInfo,
+			P2PInfo:    publicPeerInfo(client.p2pInfo),
 			HasSignal:  client.p2pSignalConn != nil,
 		})
 	}
@@ -2928,7 +2939,6 @@ func handleP2PTunnelOwner(w http.ResponseWriter, r *http.Request) {
 
 	if clientExists && client.p2pInfo != nil {
 		response["p2p_enabled"] = true
-		response["p2p_info"] = client.p2pInfo
 	}
 
 	w.Header().Set("Content-Type", "application/json")

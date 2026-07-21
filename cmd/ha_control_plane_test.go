@@ -30,7 +30,9 @@ func TestDrainControllerRunsOnceAndReturnsFirstError(t *testing.T) {
 	if err := d.Drain(context.Background()); !errors.Is(err, want) {
 		t.Fatalf("err=%v", err)
 	}
-	_ = d.Drain(context.Background())
+	if err := d.Drain(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("second drain err=%v, want stable first error", err)
+	}
 	if n != 2 {
 		t.Fatalf("hooks ran %d times", n)
 	}

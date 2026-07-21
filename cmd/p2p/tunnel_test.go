@@ -1,11 +1,13 @@
 package p2p
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestPunchProofDeterministicAndSecret(t *testing.T) {
@@ -21,6 +23,57 @@ func TestPunchProofDeterministicAndSecret(t *testing.T) {
 	}
 	if punchProof("other", "peer-a") == a {
 		t.Fatal("proof reused across tokens")
+	}
+}
+
+func TestP2PManagerCreatesAuthenticatedCapability(t *testing.T) {
+	m := NewP2PManager("peer-a", "stun.invalid:3478")
+	if m.authToken == "" || len(m.authToken) < 32 {
+		t.Fatalf("missing strong P2P capability: %q", m.authToken)
+	}
+	if !validPunchMessage(string(punchMessage(m.authToken, "peer-b")), m.authToken, "peer-b") {
+		t.Fatal("valid authenticated punch rejected")
+	}
+}
+
+func TestPunchMessageFailsClosed(t *testing.T) {
+	valid := string(punchMessage("target-capability", "peer-a"))
+	tests := []struct {
+		name, message, token, peer string
+	}{
+		{"legacy", "XROK-P2P-PUNCH:peer-a", "target-capability", "peer-a"},
+		{"empty token", valid, "", "peer-a"},
+		{"wrong token", valid, "other-capability", "peer-a"},
+		{"wrong peer", valid, "target-capability", "peer-b"},
+		{"extra field", valid + ":extra", "target-capability", "peer-a"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if validPunchMessage(tt.message, tt.token, tt.peer) {
+				t.Fatal("unauthenticated punch accepted")
+			}
+		})
+	}
+}
+
+func TestPunchHoleRequiresPeerCapability(t *testing.T) {
+	m := NewP2PManagerWithToken("local", "stun.invalid:3478", "local-capability")
+	if _, err := m.PunchHole(t.Context(), &PeerInfo{PeerID: "remote", PublicAddr: "127.0.0.1:9"}); err == nil {
+		t.Fatal("missing peer capability accepted")
+	}
+}
+
+func TestPunchHoleHonorsCancelledContext(t *testing.T) {
+	m := NewP2PManagerWithToken("local", "stun.invalid:3478", "local-capability")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	_, err := m.PunchHole(ctx, &PeerInfo{PeerID: "remote", PublicAddr: "127.0.0.1:9", AuthToken: "remote-capability"})
+	if err == nil {
+		t.Fatal("cancelled hole punch succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("cancelled hole punch blocked for %v", elapsed)
 	}
 }
 

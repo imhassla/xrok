@@ -675,6 +675,10 @@ func RunClient(args []string) {
 	clientStateMutex.Unlock()
 
 	// Initialize P2P if enabled
+	if *enableP2P && state.APIToken == "" {
+		clientLog.Warn("P2P requires authenticated signaling; configure an API token to enable it")
+		*enableP2P = false
+	}
 	if *enableP2P {
 		p2pMgr := p2p.NewP2PManager(clientID, *p2pStunServer)
 		peerInfo, err := p2pMgr.DiscoverPublicAddr()
@@ -2282,6 +2286,7 @@ func connectP2PSignaling(ctx context.Context, state *clientState) {
 		clientLog.Warn("P2P signaling connection failed: %v", err)
 		return
 	}
+	conn.SetReadLimit(p2p.MaxSignalMessageSize)
 
 	state.P2PSignalMutex.Lock()
 	state.P2PSignalConn = conn

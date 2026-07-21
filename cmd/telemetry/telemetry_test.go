@@ -18,6 +18,33 @@ func TestTraceparentRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTraceparentRejectsMalformedIdentifiers(t *testing.T) {
+	tests := []string{
+		"00-not-hex-not-hex-01",
+		"00-00000000000000000000000000000000-0123456789abcdef-01",
+		"00-0123456789abcdef0123456789abcdef-0000000000000000-01",
+		"ff-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+		"00-0123456789abcdef0123456789abcdef-0123456789abcdef-zz",
+	}
+	for _, header := range tests {
+		if _, _, ok := ExtractTraceparent(header); ok {
+			t.Fatalf("accepted malformed traceparent %q", header)
+		}
+	}
+}
+
+func TestOTLPStatusMapsHTTPToEnum(t *testing.T) {
+	if got := otlpStatusForHTTP(http.StatusOK).Code; got != 0 {
+		t.Fatalf("200 mapped to OTLP status %d", got)
+	}
+	if got := otlpStatusForHTTP(http.StatusBadRequest).Code; got != 0 {
+		t.Fatalf("400 mapped to OTLP status %d", got)
+	}
+	if got := otlpStatusForHTTP(http.StatusServiceUnavailable).Code; got != 2 {
+		t.Fatalf("503 mapped to OTLP status %d, want ERROR", got)
+	}
+}
+
 func TestOTLPHTTPExporter(t *testing.T) {
 	defer func() {
 		if recover() != nil {
@@ -67,4 +94,30 @@ func TestHTTPMiddlewareExportsAndPropagates(t *testing.T) {
 		t.Fatalf("span not exported")
 	}
 	_ = context.Background()
+}
+
+func TestHTTPMiddlewareRecordsImplicitOKAndFirstStatus(t *testing.T) {
+	e := &MemoryExporter{}
+	SetExporter(e)
+	defer SetExporter(nil)
+
+	h := HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://x/test", nil))
+	spans := e.Snapshot()
+	if rr.Code != http.StatusCreated || len(spans) != 1 || spans[0].Status != http.StatusCreated {
+		t.Fatalf("first status not preserved: response=%d spans=%+v", rr.Code, spans)
+	}
+
+	e = &MemoryExporter{}
+	SetExporter(e)
+	h = HTTPMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://x/implicit", nil))
+	spans = e.Snapshot()
+	if len(spans) != 1 || spans[0].Status != http.StatusOK {
+		t.Fatalf("implicit response status=%+v", spans)
+	}
 }

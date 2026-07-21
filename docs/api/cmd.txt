@@ -14,18 +14,24 @@ type ClientRuntime struct{ ... }
 type DrainController struct{ ... }
 type DrainHook func(context.Context) error
 type HAConfig struct{ ... }
+    func HAConfigFromServerConfig(c config.ServerConfig) (HAConfig, error)
     func LoadHAConfig(getenv func(string) string) (HAConfig, error)
 type InMemoryStateStore struct{ ... }
     func NewInMemoryStateStore(max int) *InMemoryStateStore
 type OIDCVerifier struct{ ... }
     func NewOIDCVerifier(issuer, audience string, client *http.Client, ttl time.Duration) *OIDCVerifier
+type PostgresStateStore struct{ ... }
+    func NewPostgresStateStore(db *sql.DB) *PostgresStateStore
 type ReconnectConfig struct{ ... }
+type RedisStateStore struct{ ... }
+    func NewRedisStateStore(addr string) *RedisStateStore
 type ReverseConfig struct{ ... }
 type ReverseConfigJSON struct{ ... }
 type RouteRegistry struct{ ... }
     func NewRouteRegistry() *RouteRegistry
 type RuntimeState struct{ ... }
 type RuntimeStateStore interface{ ... }
+    func NewRuntimeStateStore(ctx context.Context, cfg config.ServerConfig, deps StoreFactoryDeps) (RuntimeStateStore, error)
 type SOCKS5Server struct{ ... }
     func NewSOCKS5Server(addr string, dialFunc func(target string) (net.Conn, error)) (*SOCKS5Server, error)
 type ServerDeps struct{ ... }
@@ -39,6 +45,7 @@ type ServerRuntimeDeps struct{ ... }
 type ServerStatus struct{ ... }
 type ServerTunnelConfig struct{ ... }
 type ServerTunnelInfo struct{ ... }
+type StoreFactoryDeps struct{ ... }
 type TunnelConfig struct{ ... }
 type TunnelInfo struct{ ... }
 type TunnelRoute struct{ ... }
