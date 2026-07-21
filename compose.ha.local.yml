@@ -29,6 +29,9 @@ services:
 
   xrok-a:
     build: .
+    # Named volumes are mounted as root by Docker; use root only in this
+    # disposable local lab so the distroless runtime can write its journal.
+    user: "0:0"
     command: ["server", "--domain", "localhost", "--port", "8443", "--tls-cert", "/certs/server.pem", "--tls-key", "/certs/server-key.pem", "--state-file", "/data/state-a.dat", "--log-file", "/data/server-a.log"]
     environment:
       XROK_API_TOKEN: ${XROK_API_TOKEN:-local-ha-token}
@@ -47,6 +50,7 @@ services:
 
   xrok-b:
     build: .
+    user: "0:0"
     command: ["server", "--domain", "localhost", "--port", "8444", "--tls-cert", "/certs/server.pem", "--tls-key", "/certs/server-key.pem", "--state-file", "/data/state-b.dat", "--log-file", "/data/server-b.log"]
     environment:
       XROK_API_TOKEN: ${XROK_API_TOKEN:-local-ha-token}
