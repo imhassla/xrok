@@ -3,7 +3,15 @@ services:
   coturn:
     image: coturn/coturn:4.6.3
     command: ["-n", "--no-cli", "--log-file=stdout", "--listening-port=3478", "--min-port=49160", "--max-port=49200", "--realm=xrok.local", "--lt-cred-mech", "--user=matrix:matrix-pass"]
-    networks: [public]
+    networks:
+      public:
+        ipv4_address: 172.31.0.10
+  coturn-b:
+    image: coturn/coturn:4.6.3
+    command: ["-n", "--no-cli", "--log-file=stdout", "--listening-port=3478", "--realm=xrok.local"]
+    networks:
+      public:
+        ipv4_address: 172.31.0.11
   nat-host:
     image: alpine:3.20
     command: ["sh", "-c", "sleep infinity"]
@@ -17,7 +25,65 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command: ["sleep infinity"]
     networks: [private, public]
+  symmetric-router:
+    image: nicolaka/netshoot:v0.13
+    cap_add: [NET_ADMIN]
+    command:
+      - sh
+      - -ec
+      - |
+        socat UDP4-LISTEN:3478,reuseaddr,fork UDP4:172.31.0.10:3478 &
+        socat UDP4-LISTEN:3479,reuseaddr,fork UDP4:172.31.0.11:3478 &
+        wait
+    networks:
+      public:
+        ipv4_address: 172.31.0.20
+      symmetric_private:
+        ipv4_address: 172.30.0.2
+  nat-symmetric:
+    build:
+      context: ./bench/natprobe
+    cap_add: [NET_ADMIN]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["sleep infinity"]
+    networks:
+      symmetric_private:
+        ipv4_address: 172.30.0.3
+  degraded-router:
+    image: nicolaka/netshoot:v0.13
+    cap_add: [NET_ADMIN]
+    command:
+      - sh
+      - -ec
+      - |
+        public_if=$$(ip -o addr show | awk '$$4 ~ /^172\.31\.0\.21\// {print $$2; exit}')
+        tc qdisc add dev "$$public_if" root netem delay 80ms 15ms loss 25%
+        exec socat UDP4-LISTEN:3478,reuseaddr,fork UDP4:172.31.0.10:3478
+    networks:
+      public:
+        ipv4_address: 172.31.0.21
+      degraded_private:
+        ipv4_address: 172.32.0.2
+  nat-degraded:
+    build:
+      context: ./bench/natprobe
+    cap_add: [NET_ADMIN]
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["sleep infinity"]
+    networks:
+      degraded_private:
+        ipv4_address: 172.32.0.3
 networks:
-  public: {}
+  public:
+    ipam:
+      config: [{subnet: 172.31.0.0/24}]
   private:
     internal: true
+  symmetric_private:
+    internal: true
+    ipam:
+      config: [{subnet: 172.30.0.0/24}]
+  degraded_private:
+    internal: true
+    ipam:
+      config: [{subnet: 172.32.0.0/24}]
