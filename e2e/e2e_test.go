@@ -153,7 +153,7 @@ func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
 	port := freePort(t)
 	token := "e2e-auth-token"
 	configPath := filepath.Join(tmp, "client.yaml")
-	configData := fmt.Sprintf("server: localhost\ntls: true\ntunnels:\n  - name: protected\n    target: %s\n    basic_auth: user:secret\nheaders:\n  X-Injected: e2e\nreconnect:\n  enabled: true\n  initial_wait: 50ms\n  max_wait: 250ms\n", target)
+	configData := fmt.Sprintf("server: localhost\ntls: true\ntunnels:\n  - name: protected\n    target: %s\n    basic_auth: user:secret\n    capability: e2e-capability\nheaders:\n  X-Injected: e2e\nreconnect:\n  enabled: true\n  initial_wait: 50ms\n  max_wait: 250ms\n", target)
 	if err := os.WriteFile(configPath, []byte(configData), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -187,13 +187,14 @@ func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
 			return false
 		}
 		resp.Body.Close()
-		return resp.StatusCode == http.StatusUnauthorized
+		return resp.StatusCode == http.StatusForbidden
 	})
 
 	req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%d/", port), nil)
 	req.Host = "protected.localhost"
 	credentials := base64.StdEncoding.EncodeToString([]byte("user:secret"))
 	req.Header.Set("Authorization", "Basic "+credentials)
+	req.Header.Set("X-Xrok-Capability", "e2e-capability")
 	resp, err := tlsClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -273,6 +274,102 @@ func TestReverseTCPRelayEndToEnd(t *testing.T) {
 	}
 }
 
+// TestUDPTunnelEndToEnd exercises the real UDP data path with a deterministic
+// loss pattern. The first datagram is intentionally dropped by the upstream
+// echo server; subsequent packets (including a large near-MTU-safe payload) must relay.
+func TestUDPTunnelEndToEnd(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	caFile, certFile, keyFile := generateTestPKI(t, tmp)
+	binary := filepath.Join(tmp, "xrok")
+	run(t, root, nil, "go", "build", "-o", binary, ".")
+
+	upstream, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	// Deterministic fault injection: drop exactly the first packet.
+	go func() {
+		buf := make([]byte, 65535)
+		dropped := false
+		for {
+			n, addr, readErr := upstream.ReadFromUDP(buf)
+			if readErr != nil {
+				return
+			}
+			if !dropped {
+				dropped = true
+				continue
+			}
+			_, _ = upstream.WriteToUDP(buf[:n], addr)
+		}
+	}()
+
+	serverPort := freePort(t)
+	localPort := freeUDPPort(t)
+	token := "e2e-udp-token"
+	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
+		"server", "--domain", "localhost", "--port", fmt.Sprint(serverPort),
+		"--tls-cert", certFile, "--tls-key", keyFile,
+		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
+	defer stopProcess(t, server)
+	tlsClient := newTLSClient(t, caFile)
+	waitFor(t, 10*time.Second, func() bool {
+		resp, getErr := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", serverPort))
+		if getErr != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+
+	remote := upstream.LocalAddr().(*net.UDPAddr)
+	client := startProcess(t, tmp, nil, binary,
+		"client", "--server", "localhost", "--rp", fmt.Sprint(serverPort), "--ca-cert", caFile,
+		"--token", token, "--id", "udp-client", "--udp", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", localPort, remote.Port),
+		"--retry-interval", "50ms", "--max-interval", "250ms")
+	defer stopProcess(t, client)
+
+	conn, dialErr := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: localPort})
+	if dialErr != nil {
+		t.Fatal(dialErr)
+	}
+	defer conn.Close()
+	// Allow registration and the local UDP listener to become ready before the
+	// deliberate loss probe; otherwise the first packet can be lost before the
+	// tunnel exists at all.
+	time.Sleep(1500 * time.Millisecond)
+	// First packet is dropped; timeout is expected and must not tear down tunnel.
+	conn.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
+	if _, writeErr := conn.Write([]byte("drop-me")); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	buf := make([]byte, 65535)
+	if _, readErr := conn.Read(buf); readErr == nil {
+		t.Fatal("expected deterministic first-packet loss")
+	}
+
+	// Keep the process E2E portable across hosts whose loopback UDP MTU is
+	// smaller than the internet maximum; framing limits are covered separately
+	// by unit tests.
+	payload := make([]byte, 8000)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	if _, writeErr := conn.Write(payload); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, _, readErr := conn.ReadFromUDP(buf)
+	if readErr != nil {
+		t.Fatalf("UDP relay read: %v", readErr)
+	}
+	if n != len(payload) || string(buf[:n]) != string(payload) {
+		t.Fatalf("payload mismatch: got %d bytes, want %d", n, len(payload))
+	}
+}
+
 func newIPv4TestServer(t *testing.T, handler http.Handler) *httptest.Server {
 	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -303,6 +400,17 @@ func freePort(t *testing.T) int {
 	}
 	defer listener.Close()
 	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	conn.Close()
+	return port
 }
 
 func run(t *testing.T, dir string, env []string, name string, args ...string) {

@@ -35,9 +35,10 @@ import (
 
 // TunnelConfig represents a single tunnel configuration
 type TunnelConfig struct {
-	Name      string `json:"name"`                 // Subdomain name (e.g., "app", "api")
-	Target    string `json:"target"`               // Local target (e.g., "localhost:8080")
-	BasicAuth string `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
+	Name       string `json:"name"`                 // Subdomain name (e.g., "app", "api")
+	Target     string `json:"target"`               // Local target (e.g., "localhost:8080")
+	BasicAuth  string `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
+	Capability string `json:"capability,omitempty"` // optional capability required by the public route
 }
 
 // tunnelFlag implements flag.Value for multiple --tunnel flags
@@ -362,7 +363,7 @@ func RunClient(args []string) {
 		}
 		if len(tunnels) == 0 && len(cfg.Tunnels) > 0 {
 			for _, t := range cfg.Tunnels {
-				tunnels = append(tunnels, TunnelConfig{Name: t.Name, Target: t.Target, BasicAuth: t.BasicAuth})
+				tunnels = append(tunnels, TunnelConfig{Name: t.Name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability})
 			}
 		}
 		if len(udpTunnels) == 0 && len(cfg.UDP) > 0 {
@@ -2110,8 +2111,11 @@ func runUDPTunnel(ctx context.Context, localAddr, remoteAddr string) {
 		clients[clientKey] = clientAddr
 		clientsMutex.Unlock()
 
-		// Handle UDP packet forwarding in goroutine
-		go handleUDPPacket(ctx, stream, conn, clientAddr, remoteAddr, buf[:n], &clientsMutex)
+		// Copy the datagram before handing it to a goroutine. The receive buffer
+		// is reused by the next ReadFromUDP; sharing it races and corrupts
+		// concurrent packets (especially under bursty UDP traffic).
+		packet := append([]byte(nil), buf[:n]...)
+		go handleUDPPacket(ctx, stream, conn, clientAddr, remoteAddr, packet, &clientsMutex)
 	}
 }
 

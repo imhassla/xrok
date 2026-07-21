@@ -1,4 +1,4 @@
-.PHONY: build test race vet e2e check
+.PHONY: build test race vet bench e2e check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -15,6 +15,9 @@ race:
 
 vet:
 	$(GO_ENV) go vet ./...
+
+bench:
+	$(GO_ENV) go test -run '^$$' -bench=. -benchmem ./...
 
 e2e:
 	$(GO_ENV) go test -tags=e2e ./e2e -count=1

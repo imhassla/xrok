@@ -73,9 +73,10 @@ type serializableClientInfoForSave struct {
 
 // ServerTunnelConfig represents a tunnel configuration on the server
 type ServerTunnelConfig struct {
-	Name      string `json:"name"`
-	Target    string `json:"target"`
-	BasicAuth string `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
+	Name       string `json:"name"`
+	Target     string `json:"target"`
+	BasicAuth  string `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
+	Capability string `json:"capability,omitempty"`
 }
 
 // ServerTunnelInfo contains server-side tunnel info
@@ -127,6 +128,7 @@ type TunnelRoute struct {
 	Target     string
 	BasicAuth  string            // user:password for HTTP Basic Auth
 	Headers    map[string]string // Custom headers to inject
+	Capability string            // Optional capability token required by route
 }
 
 // Server globals
@@ -245,6 +247,7 @@ var (
 		Help:    "WebSocket ping-pong latency",
 		Buckets: prometheus.ExponentialBuckets(0.001, 2, 10),
 	})
+	srvCapabilityDenied = prometheus.NewCounter(prometheus.CounterOpts{Name: "xrok_capability_denied_total", Help: "Requests rejected by tunnel capability policy"})
 )
 
 type srvConnectionTimer struct {
@@ -708,6 +711,7 @@ func initServerMetrics() {
 		srvRegistrationSuccess,
 		srvWsUpgrades,
 		srvWsPingPongLatency,
+		srvCapabilityDenied,
 	)
 }
 
@@ -917,7 +921,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			tunnels = append(tunnels, ServerTunnelConfig{Name: name, Target: t.Target, BasicAuth: t.BasicAuth})
+			tunnels = append(tunnels, ServerTunnelConfig{Name: name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability})
 			tunnelMap[name] = t.Target
 
 			url := fmt.Sprintf("https://%s.%s", name, serverDomain)
@@ -968,6 +972,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			Target:     t.Target,
 			BasicAuth:  t.BasicAuth,
 			Headers:    regReq.Headers,
+			Capability: t.Capability,
 		}
 	}
 	serverTunnelRoutesMutex.Unlock()
@@ -1165,6 +1170,17 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 		if routeExists {
 			basicAuth = route.BasicAuth
 			customHeaders = route.Headers
+			if route.Capability != "" {
+				provided := r.Header.Get("X-Xrok-Capability")
+				if provided == "" {
+					provided = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+				}
+				if subtle.ConstantTimeCompare([]byte(provided), []byte(route.Capability)) != 1 {
+					srvCapabilityDenied.Inc()
+					http.Error(w, "tunnel capability required", http.StatusForbidden)
+					return
+				}
+			}
 		}
 
 		// Hijack connection for raw proxying

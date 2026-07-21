@@ -1,0 +1,28 @@
+services:
+  xrok:
+    build: .
+    command:
+      - server
+      - --domain
+      - localhost
+      - --port
+      - "8443"
+      - --tls-cert
+      - /certs/server.pem
+      - --tls-key
+      - /certs/server-key.pem
+      - --state-file
+      - /data/state.dat
+      - --log-file
+      - /data/server.log
+    environment:
+      XROK_API_TOKEN: ${XROK_API_TOKEN:-local-dev-token}
+    ports:
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
+    volumes:
+      - ./local-certs:/certs:ro
+      - xrok-data:/data
+
+volumes:
+  xrok-data:

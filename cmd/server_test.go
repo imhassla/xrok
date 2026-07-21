@@ -35,3 +35,12 @@ func TestInjectHeadersDoesNotRewriteBody(t *testing.T) {
 		t.Fatalf("body was modified:\n%s", result)
 	}
 }
+
+func BenchmarkInjectHeaders(b *testing.B) {
+	request := []byte("POST /benchmark HTTP/1.1\r\nHost: app.localhost\r\nContent-Length: 7\r\n\r\npayload")
+	headers := map[string]string{"X-Trace-ID": "bench", "X-Environment": "test"}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = injectHeaders(request, headers)
+	}
+}

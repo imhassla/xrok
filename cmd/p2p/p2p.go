@@ -2,6 +2,8 @@ package p2p
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"net"
@@ -18,6 +20,9 @@ type PeerInfo struct {
 	PublicAddr string `json:"public_addr"` // Public IP:port discovered via STUN
 	LocalAddr  string `json:"local_addr"`  // Local IP:port
 	NATType    string `json:"nat_type"`    // NAT type detected
+	// AuthToken is a short-lived capability shared out-of-band via signaling.
+	// It is never logged and is only used to authenticate punch probes.
+	AuthToken string `json:"auth_token,omitempty"`
 }
 
 // P2PManager handles P2P connections
@@ -27,6 +32,7 @@ type P2PManager struct {
 	publicAddr  string
 	localAddr   string
 	natType     stun.NATType
+	authToken   string
 	connections map[string]*P2PConnection
 	mu          sync.RWMutex
 }
@@ -50,6 +56,21 @@ func NewP2PManager(peerID, stunServer string) *P2PManager {
 		stunServer:  stunServer,
 		connections: make(map[string]*P2PConnection),
 	}
+}
+
+// NewP2PManagerWithToken creates a manager whose UDP probes are authenticated.
+// The token should be a short-lived per-session capability delivered by the
+// authenticated signaling channel.
+func NewP2PManagerWithToken(peerID, stunServer, token string) *P2PManager {
+	m := NewP2PManager(peerID, stunServer)
+	m.authToken = token
+	return m
+}
+
+func punchProof(token, peerID string) string {
+	h := hmac.New(sha256.New, []byte(token))
+	h.Write([]byte(peerID))
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // DiscoverPublicAddr uses STUN to discover public address
@@ -83,6 +104,7 @@ func (m *P2PManager) DiscoverPublicAddr() (*PeerInfo, error) {
 			PublicAddr: m.publicAddr,
 			LocalAddr:  m.localAddr,
 			NATType:    natType.String(),
+			AuthToken:  m.authToken,
 		}, nil
 	}
 
@@ -97,6 +119,7 @@ func (m *P2PManager) DiscoverPublicAddr() (*PeerInfo, error) {
 		PublicAddr: m.publicAddr,
 		LocalAddr:  m.localAddr,
 		NATType:    "unknown",
+		AuthToken:  m.authToken,
 	}, nil
 }
 
@@ -240,6 +263,9 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 		defer ticker.Stop()
 
 		punchMsg := []byte(fmt.Sprintf("XROK-P2P-PUNCH:%s", m.peerID))
+		if m.authToken != "" {
+			punchMsg = []byte(fmt.Sprintf("XROK-P2P-PUNCH:v1:%s:%s", m.peerID, punchProof(m.authToken, m.peerID)))
+		}
 
 		for {
 			select {
@@ -275,7 +301,14 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 			// sender identity is carried in the probe and must match the peer
 			// discovered through authenticated signaling.
 			const punchPrefix = "XROK-P2P-PUNCH:"
-			if strings.HasPrefix(msg, punchPrefix) && strings.TrimSpace(strings.TrimPrefix(msg, punchPrefix)) == peerInfo.PeerID {
+			valid := false
+			if m.authToken != "" {
+				parts := strings.Split(msg, ":")
+				valid = len(parts) == 4 && parts[0]+":"+parts[1]+":" == "XROK-P2P-PUNCH:v1:" && parts[2] == peerInfo.PeerID && hmac.Equal([]byte(parts[3]), []byte(punchProof(m.authToken, peerInfo.PeerID)))
+			} else {
+				valid = strings.HasPrefix(msg, punchPrefix) && strings.TrimSpace(strings.TrimPrefix(msg, punchPrefix)) == peerInfo.PeerID
+			}
+			if valid {
 				// Received punch packet from peer - connection established!
 				conn.SetReadDeadline(time.Time{})
 

@@ -42,9 +42,10 @@ type ClientConfig struct {
 
 // TunnelConfig represents a tunnel configuration
 type TunnelConfig struct {
-	Name      string `yaml:"name"`
-	Target    string `yaml:"target"`
-	BasicAuth string `yaml:"basic_auth,omitempty"` // user:password
+	Name       string `yaml:"name"`
+	Target     string `yaml:"target"`
+	BasicAuth  string `yaml:"basic_auth,omitempty"` // user:password
+	Capability string `yaml:"capability,omitempty"`
 }
 
 // UDPConfig represents UDP tunnel configuration

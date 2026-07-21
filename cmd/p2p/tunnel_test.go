@@ -1,9 +1,34 @@
 package p2p
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"fmt"
 	"net"
 	"testing"
 )
+
+func TestPunchProofDeterministicAndSecret(t *testing.T) {
+	a := punchProof("secret", "peer-a")
+	b := punchProof("secret", "peer-a")
+	if a != b || len(a) != 64 {
+		t.Fatalf("unexpected proof: %q %q", a, b)
+	}
+	h := hmac.New(sha256.New, []byte("secret"))
+	h.Write([]byte("peer-a"))
+	if !hmac.Equal([]byte(a), []byte(fmt.Sprintf("%x", h.Sum(nil)))) {
+		t.Fatal("proof is not HMAC-SHA256")
+	}
+	if punchProof("other", "peer-a") == a {
+		t.Fatal("proof reused across tokens")
+	}
+}
+
+func BenchmarkPunchProof(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_ = punchProof("benchmark-session-token", "peer-benchmark")
+	}
+}
 
 func TestP2PFrameRejectsOversizedPayload(t *testing.T) {
 	a, b := net.Pipe()
