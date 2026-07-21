@@ -28,9 +28,9 @@ services:
   grafana:
     image: grafana/grafana:11.4.0
     environment: ["GF_AUTH_ANONYMOUS_ENABLED=true", "GF_AUTH_ANONYMOUS_ORG_ROLE=Admin"]
-    volumes: ["reference-grafana:/var/lib/grafana", "./bench/grafana:/etc/grafana:ro"]
+    volumes: ["reference-grafana:/var/lib/grafana", "./bench/grafana/provisioning:/etc/grafana/provisioning:ro"]
     ports: ["3000:3000"]
   toxiproxy:
-    image: shopify/toxiproxy:2.9.0
+    image: ghcr.io/shopify/toxiproxy:2.9.0
     ports: ["8474:8474", "18080:18080", "18443:18443"]
 volumes: { reference-redis: {}, reference-postgres: {}, reference-prometheus: {}, reference-grafana: {} }

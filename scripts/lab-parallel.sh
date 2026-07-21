@@ -2,7 +2,7 @@
 # Run independent local labs concurrently with isolated Compose projects.
 set -euo pipefail
 root_dir="$(cd "$(dirname "$0")/.." && pwd)"
-artifact_dir="${LAB_PARALLEL_ARTIFACT_DIR:-$root_dir/.artifacts/lab-parallel-$(date +%s)}"
+artifact_dir="${LAB_PARALLEL_ARTIFACT_DIR:-$root_dir/.artifacts/lab-parallel-$(date +%s)-$$}"
 mkdir -p "$artifact_dir"
 run_id="${LAB_PARALLEL_RUN_ID:-xrok-lab-$(date +%s)-$$}"
 pids=(); names=(ha nat reference)
@@ -15,6 +15,7 @@ trap cleanup EXIT INT TERM
 
 run_one() {
   local name="$1" script="$2" project="$run_id-$name" out="$artifact_dir/$name.log"
+  local rc=0
   (
     export COMPOSE_PROJECT_NAME="$project"
     case "$name" in
@@ -23,52 +24,68 @@ run_one() {
         export XROK_CERT_DIR="$artifact_dir/$name-certs"
         HA_INTEGRATION_ARTIFACT="$artifact_dir/$name.json" "$script" ;;
       nat) NAT_MATRIX_ARTIFACT="$artifact_dir/$name.json" "$script" ;;
-      reference) XROK_ARTIFACT_DIR="$artifact_dir/reference" "$script" up-smoke ;;
+      reference)
+        XROK_ARTIFACT_DIR="$artifact_dir/reference" \
+          REFERENCE_LAB_ARTIFACT="$artifact_dir/$name.json" "$script" up-smoke ;;
     esac
-  ) >"$out" 2>&1
-  local rc=$?
-  [[ -f "$artifact_dir/$name.json" ]] || printf '{"status":"%s","log":"%s"}\n' \
-    "$([[ $rc == 0 ]] && echo passed || echo failed)" "$out" >"$artifact_dir/$name.json"
+  ) >"$out" 2>&1 || rc=$?
+  if [[ ! -f "$artifact_dir/$name.json" ]]; then
+    NAME="$name" RC="$rc" LOG="$out" OUT="$artifact_dir/$name.json" python3 - <<'PY'
+import json, os, time
+json.dump({
+    "schema_version": "xrok.lab-result/v1",
+    "lab": os.environ["NAME"],
+    "status": "failed",
+    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "reason": "runner exited without an artifact",
+    "exit_code": int(os.environ["RC"]),
+    "log": os.environ["LOG"],
+}, open(os.environ["OUT"], "w"), indent=2)
+PY
+    rc=1
+  fi
   return "$rc"
 }
 
 for i in "${!names[@]}"; do
   name="${names[$i]}"
   case "$name" in
-    ha) script="$root_dir/scripts/ha-docker-integration.sh";;
-    nat) script="$root_dir/scripts/nat-matrix.sh";;
-    reference) script="$root_dir/scripts/reference-lab.sh";;
+    ha) script="${LAB_PARALLEL_HA_SCRIPT:-$root_dir/scripts/ha-docker-integration.sh}";;
+    nat) script="${LAB_PARALLEL_NAT_SCRIPT:-$root_dir/scripts/nat-matrix.sh}";;
+    reference) script="${LAB_PARALLEL_REFERENCE_SCRIPT:-$root_dir/scripts/reference-lab.sh}";;
   esac
   run_one "$name" "$script" & pids+=("$!")
 done
 
-status=passed
-for pid in "${pids[@]}"; do wait "$pid" || status=failed; done
+process_status=passed
+for pid in "${pids[@]}"; do wait "$pid" || process_status=failed; done
 
-# A missing/inaccessible Docker daemon is an expected local-dev skip, not a
-# failed product check (the individual scripts emit their own skip artifacts).
-if [[ "$status" == failed ]] && grep -R -qiE 'docker daemon unavailable|permission denied.*docker daemon|connect: operation not permitted' "$artifact_dir"/*.log 2>/dev/null; then
-  non_docker_failure=0
-  for log in "$artifact_dir"/*.log; do
-    if ! grep -qiE 'docker daemon unavailable|permission denied.*docker daemon|connect: operation not permitted' "$log"; then non_docker_failure=1; fi
-  done
-  [[ "$non_docker_failure" == 0 ]] && status=passed
-fi
-
-python3 - "$artifact_dir" "$status" "$run_id" <<'PY'
+status=$(python3 - "$artifact_dir" "$process_status" "$run_id" <<'PY'
 import json, pathlib, sys, time
 d, status, run_id = sys.argv[1:]
 labs = {}
-for p in pathlib.Path(d).glob('*.json'):
-    try: labs[p.stem] = json.loads(p.read_text())
-    except Exception: labs[p.stem] = {'status':'failed','artifact':str(p)}
-# Derive aggregate status from artifacts as well as process exit codes. This
-# prevents a child that exited early after writing a failed artifact from
-# being reported as passed by the orchestrator.
-if any(str(v.get('status','')).lower() in ('failed','fail','error') for v in labs.values()):
+for name in ('ha', 'nat', 'reference'):
+    p = pathlib.Path(d, name + '.json')
+    try:
+        value = json.loads(p.read_text())
+        if not isinstance(value, dict) or value.get('status') not in ('passed', 'failed', 'skipped'):
+            raise ValueError('invalid lab status')
+        labs[name] = value
+    except Exception as exc:
+        labs[name] = {'schema_version':'xrok.lab-result/v1', 'lab':name,
+                      'status':'failed', 'reason':f'invalid artifact: {exc}', 'artifact':str(p)}
+states = [v['status'] for v in labs.values()]
+if status != 'passed' or 'failed' in states:
     status = 'failed'
-out = {'status': status, 'run_id': run_id, 'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'labs': labs}
+elif all(s == 'skipped' for s in states):
+    status = 'skipped'
+else:
+    status = 'passed'
+out = {'schema_version':'xrok.lab-summary/v1', 'status': status, 'run_id': run_id,
+       'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'labs': labs}
 pathlib.Path(d, 'summary.json').write_text(json.dumps(out, indent=2) + '\n')
+print(status)
 PY
+)
 echo "parallel lab: $status (summary: $artifact_dir/summary.json)"
-[[ "$status" == passed ]] || exit 1
+[[ "$status" == passed || "$status" == skipped ]] || exit 1

@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench regression e2e e2e-soak fuzz security fault-injection api-compat ci-local soak supply-chain lab-parallel check
+.PHONY: build test race vet bench regression e2e e2e-soak fuzz security fault-injection api-compat ci-local soak supply-chain lab-parallel lab-smoke check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -52,6 +52,9 @@ supply-chain:
 # Runs HA, NAT and observability reference labs concurrently in isolated Compose projects.
 lab-parallel:
 	./scripts/lab-parallel.sh
+
+lab-smoke:
+	./scripts/tests/lab-orchestration-smoke.sh
 
 e2e:
 	$(GO_ENV) go test -tags=e2e ./e2e -count=1

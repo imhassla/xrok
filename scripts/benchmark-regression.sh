@@ -6,9 +6,9 @@ SCALE=${SCALE:-bench/results-scale.json}
 APPLES=${APPLES:-bench/results.csv}
 ANALYTICS_OUT=${ANALYTICS_OUT:-${ARTIFACT_DIR:-.artifacts/benchmark}/summary.json}
 mkdir -p "$(dirname "$ANALYTICS_OUT")"
-python3 - "$BASELINE" "$SCALE" "$APPLES" "$ANALYTICS_OUT" <<'PY'
+python3 - "$BASELINE" "$SCALE" "$APPLES" "$ANALYTICS_OUT" "${BENCHMARK_REQUIRE_SCALE:-1}" "${BENCHMARK_REQUIRE_APPLES:-1}" <<'PY'
 import csv, json, os, sys
-base_path, scale_path, apples_path, analytics_path = sys.argv[1:]
+base_path, scale_path, apples_path, analytics_path, require_scale, require_apples = sys.argv[1:]
 base = json.load(open(base_path))
 failed = []
 if os.path.exists(scale_path):
@@ -21,7 +21,9 @@ if os.path.exists(scale_path):
             if float(row.get(key, 0)) > float(lim.get(key, float("inf"))):
                 failed.append(f"scale {row['tunnels']} {key}={row[key]} > {lim[key]}")
 else:
-    print(f"warning: {scale_path} not found; run scripts/synthetic-scale.sh")
+    message=f"{scale_path} not found; run scripts/synthetic-scale.sh"
+    print("warning: "+message)
+    if require_scale == '1': failed.append(message)
 if os.path.exists(apples_path):
     vals = {}
     with open(apples_path, newline="") as f:
@@ -45,7 +47,10 @@ if os.path.exists(apples_path):
                          "error_rate": (len(records)-len(ok))/len(records) if records else 0,
                          "throughput_bytes_per_sec": sum(x[2] for x in ok) / (sum(x[0] for x in ok)/1000) if ok and sum(x[0] for x in ok) else 0}
         print(f"{impl}: p50={summary[impl]['p50_ms']:.2f}ms p95={summary[impl]['p95_ms']:.2f}ms p99={summary[impl]['p99_ms']:.2f}ms errors={summary[impl]['error_rate']:.1%} throughput={summary[impl]['throughput_bytes_per_sec']:.0f}B/s")
-    json.dump({"schema_version":"xrok.benchmark-summary/v1", "baseline":base_path, "implementations":summary}, open(analytics_path, "w"), indent=2)
+    min_samples=int(base.get('apples',{}).get('min_samples', 3))
+    for impl in ('xrok','frp'):
+        if summary.get(impl,{}).get('count',0) < min_samples:
+            failed.append(f"{impl} has fewer than {min_samples} valid samples")
     if summary.get("xrok") and summary.get("frp"):
         x = summary["xrok"]; f = summary["frp"]
         pct = (x["p95_ms"]/f["p95_ms"]-1)*100 if f["p95_ms"] else 0
@@ -54,9 +59,14 @@ if os.path.exists(apples_path):
         if pct > float(lim.get("max_p95_latency_regression_pct", lim.get("max_latency_regression_pct", 25))): failed.append(f"apples p95 latency regression {pct:.1f}%")
         if x["error_rate"] > float(lim.get("max_error_rate", 0.05)): failed.append(f"xrok error rate {x['error_rate']:.1%}")
 else:
-    print(f"warning: {apples_path} not found; run scripts/benchmark-apples.sh")
-if not os.path.exists(analytics_path):
-    json.dump({"schema_version":"xrok.benchmark-summary/v1", "baseline":base_path, "implementations":{}}, open(analytics_path,"w"), indent=2)
+    summary={}
+    message=f"{apples_path} not found; run scripts/benchmark-apples.sh"
+    print("warning: "+message)
+    if require_apples == '1': failed.append(message)
+result={"schema_version":"xrok.benchmark-summary/v1", "baseline":base_path,
+        "status":"failed" if failed else "passed", "failures":failed,
+        "implementations":summary}
+json.dump(result, open(analytics_path,"w"), indent=2)
 if failed:
     print("REGRESSION FAILED")
     print("\n".join("- "+x for x in failed))

@@ -26,7 +26,10 @@ The runner records per-request latency, status and payload size in
 `bench/results.csv`. This compares workload endpoints rather than frp's
 control port. CPU/RSS can be sampled with `docker stats --no-stream` while it
 runs; pin compose image tags before publishing a result. Failed requests are
-recorded as HTTP code `000`, keeping reconnect/flakiness visible.
+recorded as HTTP code `000`, keeping reconnect/flakiness visible, and make the
+runner fail by default. `BENCHMARK_ALLOW_ERRORS=1` is reserved for explicit
+failure-behavior measurements. The regression gate also fails when either the
+scale or apples-to-apples evidence is missing.
 
 All image tags and service ports are explicit so CI or a later performance run can reproduce the same topology. The compose file does not publish credentials beyond the local benchmark network.
 
@@ -47,3 +50,8 @@ recovery, and writes `.artifacts/ha-integration.json`:
 ```sh
 HA_INTEGRATION_LOAD_ITERATIONS=250 HA_SMOKE_RETRIES=60 make ha-integration
 ```
+
+Lab artifacts use `xrok.lab-result/v1`; the parallel orchestrator writes an
+`xrok.lab-summary/v1` result and rejects missing, malformed, or failed child
+artifacts. `make lab-smoke` validates those contracts without Docker or
+network access.

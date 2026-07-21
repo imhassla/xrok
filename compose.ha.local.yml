@@ -38,7 +38,7 @@ services:
       XROK_HA_REDIS_ADDR: redis:6379
       XROK_HA_POSTGRES_DSN: postgres://xrok:xrok-local@postgres:5432/xrok?sslmode=disable
     ports: ["${XROK_HA_PORT_A:-8443}:8443/tcp", "${XROK_HA_UDP_A:-8443}:8443/udp"]
-    volumes: ["./local-certs:/certs:ro", "xrok-a-data:/data"]
+    volumes: ["${XROK_CERT_DIR:-./local-certs}:/certs:ro", "xrok-a-data:/data"]
     depends_on:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }
@@ -57,7 +57,7 @@ services:
       XROK_HA_REDIS_ADDR: redis:6379
       XROK_HA_POSTGRES_DSN: postgres://xrok:xrok-local@postgres:5432/xrok?sslmode=disable
     ports: ["${XROK_HA_PORT_B:-9443}:8444/tcp", "${XROK_HA_UDP_B:-9443}:8444/udp"]
-    volumes: ["./local-certs:/certs:ro", "xrok-b-data:/data"]
+    volumes: ["${XROK_CERT_DIR:-./local-certs}:/certs:ro", "xrok-b-data:/data"]
     depends_on:
       redis: { condition: service_healthy }
       postgres: { condition: service_healthy }

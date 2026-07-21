@@ -5,9 +5,11 @@
 # self-contained and reports a machine-readable artifact for CI dashboards.
 set -euo pipefail
 
-compose_file="${XROK_HA_COMPOSE_FILE:-compose.ha.local.yml}"
-artifact="${HA_INTEGRATION_ARTIFACT:-.artifacts/ha-integration.json}"
-cert_dir="${XROK_CERT_DIR:-local-certs}"
+root_dir="$(cd "$(dirname "$0")/.." && pwd)"
+compose_file="${XROK_HA_COMPOSE_FILE:-$root_dir/compose.ha.local.yml}"
+if [[ "$compose_file" != /* ]]; then compose_file="$root_dir/$compose_file"; fi
+artifact="${HA_INTEGRATION_ARTIFACT:-$root_dir/.artifacts/ha-integration.json}"
+cert_dir="${XROK_CERT_DIR:-$root_dir/local-certs}"
 if [[ ! -s "$cert_dir/server.pem" || ! -s "$cert_dir/server-key.pem" ]]; then
   if command -v openssl >/dev/null 2>&1; then
     mkdir -p "$cert_dir"
@@ -41,7 +43,15 @@ for p in range(18000, 28000):
 PY
 }
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
-  printf '{"status":"skipped","reason":"docker daemon unavailable"}\n' >"$artifact"
+  OUT="$artifact" python3 - <<'PY'
+import json, os, time
+json.dump({'schema_version':'xrok.lab-result/v1','lab':'ha','status':'skipped',
+ 'created_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),
+ 'reason':'docker daemon unavailable','attempts':0,'collision_count':0,
+ 'selected_ports':{'tcp_a':'','udp_a':'','tcp_b':'','udp_b':''},
+ 'compose_up_duration_ms':0,'service_health':{},'checks':[]},
+ open(os.environ['OUT'],'w'), indent=2)
+PY
   echo "HA Docker integration: SKIP (Docker daemon unavailable)"
   exit 0
 fi
@@ -81,10 +91,11 @@ cleanup() {
   fi
   "${compose[@]}" down >/dev/null 2>&1 || true
   ended_at=$(date +%s)
-  ARTIFACT="$artifact" STATUS="$status" COMPOSE_FILE="$compose_file" DURATION="$((ended_at-started_at))" LOAD="$load_iterations" ATTEMPTS="$attempts" COLLISIONS="$collision_count" TCP_A="$selected_tcp_a" UDP_A="$selected_udp_a" TCP_B="$selected_tcp_b" UDP_B="$selected_udp_b" UP_MS="$up_duration_ms" HEALTH="$health" HEALTH_TIMINGS="$health_timings" FAILURE_CLASS="$failure_class" LAST_ERROR_LOG="$last_error_log" LOG_DIR="$log_dir" DIAGNOSTICS="$diagnostics_file" python3 - <<'PY'
-import json, os
+  ARTIFACT="$artifact" STATUS="$status" COMPOSE_FILE="$compose_file" DURATION="$((ended_at-started_at))" LOAD="$load_iterations" ATTEMPTS="$attempts" COLLISIONS="$collision_count" TCP_A="$selected_tcp_a" UDP_A="$selected_udp_a" TCP_B="$selected_tcp_b" UDP_B="$selected_udp_b" UP_MS="$up_duration_ms" HEALTH="$health" HEALTH_TIMINGS="$health_timings" FAILURE_CLASS="$failure_class" LAST_ERROR_LOG="$last_error_log" LOG_DIR="$log_dir" DIAGNOSTICS="$diagnostics_file" ASSERT_HTTP="${HA_ASSERT_HTTP:-0}" ASSERT_METRICS="${HA_ASSERT_METRICS:-0}" python3 - <<'PY'
+import json, os, time
 out = {
   "status": os.environ["STATUS"], "compose": os.environ["COMPOSE_FILE"],
+  "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
   "duration_seconds": int(os.environ["DURATION"]), "load_iterations": int(os.environ["LOAD"]),
   "attempts": int(os.environ["ATTEMPTS"]), "collision_count": int(os.environ["COLLISIONS"]),
   "selected_ports": {"tcp_a": os.environ["TCP_A"], "udp_a": os.environ["UDP_A"], "tcp_b": os.environ["TCP_B"], "udp_b": os.environ["UDP_B"]},
@@ -95,8 +106,15 @@ out = {
   "attempt_log_dir": os.environ.get("LOG_DIR", ""),
   "diagnostics": os.environ.get("DIAGNOSTICS", ""),
   "service_health": json.loads(os.environ.get("HEALTH", "{}")),
-  "checks": ["redis_aof","redis_load","redis_failure","postgres_volume","postgres_load","postgres_failure","replica_restart","graceful_drain","xrok_health","xrok_ready","xrok_metrics"],
+  "schema_version": "xrok.lab-result/v1", "lab": "ha",
 }
+checks = ["redis_aof","redis_load","redis_failure","postgres_volume",
+          "postgres_sql_load","postgres_failure","replica_restart","graceful_drain"]
+if os.environ["STATUS"] == "passed" and os.environ.get("ASSERT_HTTP") == "1":
+  checks += ["xrok_health","xrok_ready"]
+if os.environ["STATUS"] == "passed" and os.environ.get("ASSERT_METRICS") == "1":
+  checks += ["xrok_metrics"]
+out["checks"] = checks if os.environ["STATUS"] == "passed" else []
 with open(os.environ["ARTIFACT"], "w") as f: json.dump(out, f, sort_keys=True); f.write("\n")
 PY
 }
@@ -177,12 +195,13 @@ for attempt in $(seq 1 "$up_attempts"); do
     up_ok=1
     break
   fi
-  up_finished=$(now_ms); up_duration_ms=$((up_finished-up_started)); collision_count=$((collision_count+1))
+  up_finished=$(now_ms); up_duration_ms=$((up_finished-up_started))
   last_error_log="$attempt_dir/up.err"
   if grep -Eqi 'operation not permitted|permission denied|cannot connect to the docker daemon|is the docker daemon running' "$attempt_dir/up.err"; then
     failure_class="environment"
   elif grep -Eqi 'address already in use|bind.*failed|port is already allocated' "$attempt_dir/up.err"; then
     failure_class="bind"
+    collision_count=$((collision_count+1))
   elif grep -Eqi 'build|failed to solve|dockerfile|image' "$attempt_dir/up.err"; then
     failure_class="build"
   elif [[ -s "$attempt_dir/config.err" ]]; then
