@@ -1,0 +1,517 @@
+package p2p // import "xrok/cmd/p2p"
+
+
+CONSTANTS
+
+const (
+	NegotiationControlling NegotiationRole  = "controlling"
+	NegotiationControlled  NegotiationRole  = "controlled"
+	NegotiationPending     NegotiationState = "pending"
+	NegotiationChecking    NegotiationState = "checking"
+	NegotiationCompleted   NegotiationState = "completed"
+)
+const (
+	MaxSignalMessageSize = 64 << 10
+	MaxICECandidates     = 32
+)
+
+FUNCTIONS
+
+func EncodeSignal(msg *SignalMessage) ([]byte, error)
+    EncodeSignal encodes a signal message to JSON
+
+func NewICESessionID() string
+func ShouldInitiateICE(localPeer, remotePeer string) bool
+    ShouldInitiateICE deterministically resolves offer glare. Exactly one side
+    becomes controlling for a pair of stable authenticated peer IDs.
+
+func ValidateCandidate(candidate Candidate) error
+
+TYPES
+
+type Candidate struct {
+	ID       string        `json:"id"`
+	Type     CandidateType `json:"type"`
+	Addr     string        `json:"addr"`
+	Priority uint32        `json:"priority"`
+}
+
+type CandidatePair struct {
+	Local    Candidate          `json:"local"`
+	Remote   Candidate          `json:"remote"`
+	Priority uint64             `json:"priority"`
+	State    CandidatePairState `json:"state"`
+}
+    CandidatePair is a local/remote candidate pair in an ICE checklist.
+
+type CandidatePairState string
+    CandidatePairState describes the state of an ICE connectivity check.
+
+const (
+	CandidatePairWaiting    CandidatePairState = "waiting"
+	CandidatePairInProgress CandidatePairState = "in-progress"
+	CandidatePairSucceeded  CandidatePairState = "succeeded"
+	CandidatePairFailed     CandidatePairState = "failed"
+	CandidatePairNominated  CandidatePairState = "nominated"
+)
+type CandidateType string
+
+const (
+	CandidateHost  CandidateType = "host"
+	CandidateSrflx CandidateType = "srflx"
+	CandidateRelay CandidateType = "relay"
+)
+type ConnectivityCheckFunc func(context.Context, Candidate, Candidate) (net.Conn, error)
+
+func (f ConnectivityCheckFunc) Check(ctx context.Context, local, remote Candidate) (net.Conn, error)
+
+type ConnectivityChecker interface {
+	Check(context.Context, Candidate, Candidate) (net.Conn, error)
+}
+    ConnectivityChecker performs a request/response connectivity check and
+    returns the connected transport when the pair is reachable. Implementations
+    are responsible for authenticating the response; a successful UDP write is
+    not sufficient to nominate a pair.
+
+type ConsentProbe interface {
+	Probe(context.Context, net.Conn) error
+}
+    ConsentProbe verifies that the nominated peer still consents to receive
+    traffic. It must perform an authenticated request/response exchange.
+
+type ConsentProbeFunc func(context.Context, net.Conn) error
+
+func (f ConsentProbeFunc) Probe(ctx context.Context, conn net.Conn) error
+
+type ICEAgent struct {
+	// Has unexported fields.
+}
+
+func NewICEAgent(cfg ICEConfig) *ICEAgent
+
+func (a *ICEAgent) Checklist(local, remote []Candidate) []CandidatePair
+    Checklist builds a deterministic, highest-priority-first set of usable
+    candidate pairs. Relay pairs are deliberately excluded: TURN is allocated
+    lazily only after all direct connectivity checks fail.
+
+func (a *ICEAgent) Connect(ctx context.Context, peerID string, local, remote []Candidate) (*ICESession, error)
+    Connect executes the ICE checklist, nominates the first authenticated pair,
+    and lazily requests a TURN allocation if all direct checks fail.
+
+func (a *ICEAgent) GatherCandidates(ctx context.Context) ([]Candidate, error)
+    GatherCandidates always returns host candidates and optionally a server
+    reflexive candidate. Failure to reach STUN is non-fatal.
+
+func (a *ICEAgent) GatherRelay(ctx context.Context, peerID string) (net.Conn, Candidate, error)
+    GatherRelay obtains a TURN allocation through the injected provider.
+    TURN failures are returned to the caller so deployments can choose whether
+    to fall back to host/srflx candidates.
+
+func (a *ICEAgent) Select(local, remote []Candidate) (Candidate, Candidate, error)
+
+type ICEConfig struct {
+	STUNServer    string
+	Relay         RelayProvider
+	GatherTimeout time.Duration
+	Checker       ConnectivityChecker
+	CheckTimeout  time.Duration
+	// ChecklistTimeout bounds the complete direct phase independently of the
+	// number of candidate pairs. TURN fallback still uses the original parent.
+	ChecklistTimeout time.Duration
+	ConsentProbe     ConsentProbe
+	ConsentInterval  time.Duration
+	ConsentFailures  int
+	TickSource       TickSource
+	// ConsentKey and ConsentSession enable authenticated in-band consent below
+	// the P2P tunnel framing. Both peers derive identical values from their
+	// authenticated signaling sessions.
+	ConsentKey     []byte
+	ConsentSession string
+
+	// DialUDP allows deterministic tests and custom transports. When nil,
+	// net.DialUDP is used.
+	DialUDP func(network string, laddr, raddr *net.UDPAddr) (udpConn, error)
+	// Has unexported fields.
+}
+
+type ICESession struct {
+	// Has unexported fields.
+}
+    ICESession owns the nominated connection and its consent lifecycle.
+
+func (s *ICESession) Close() error
+
+func (s *ICESession) Conn() net.Conn
+
+func (s *ICESession) Done() <-chan struct{}
+
+func (s *ICESession) Err() error
+
+func (s *ICESession) LocalAddr() net.Addr
+
+func (s *ICESession) Pair() CandidatePair
+
+func (s *ICESession) Read(p []byte) (int, error)
+
+func (s *ICESession) RemoteAddr() net.Addr
+
+func (s *ICESession) SetDeadline(t time.Time) error
+
+func (s *ICESession) ViaRelay() bool
+
+func (s *ICESession) Write(p []byte) (int, error)
+
+type Negotiation struct {
+	PeerID           string
+	SessionID        string
+	Role             NegotiationRole
+	State            NegotiationState
+	LocalCandidates  []Candidate
+	RemoteCandidates []Candidate
+	ExpiresAt        time.Time
+}
+
+type NegotiationRole string
+
+type NegotiationState string
+
+type NegotiationStore struct {
+	// Has unexported fields.
+}
+    NegotiationStore bounds concurrent ICE negotiations and rejects messages
+    that are stale or not bound to the peer/session that created the exchange.
+
+func NewNegotiationStore(capacity int, ttl time.Duration) *NegotiationStore
+
+func (s *NegotiationStore) AddRemote(peerID, sessionID string, candidates []Candidate) (*Negotiation, error)
+
+func (s *NegotiationStore) BeginCheck(peerID, sessionID string) (*Negotiation, bool)
+    BeginCheck atomically grants exactly one goroutine ownership of connectivity
+    checks for a peer/session. Replayed answers and offers observe false.
+
+func (s *NegotiationStore) Complete(peerID, sessionID string) bool
+
+func (s *NegotiationStore) Delete(peerID, sessionID string)
+
+func (s *NegotiationStore) Fail(peerID, sessionID string)
+
+func (s *NegotiationStore) Get(peerID, sessionID string) (*Negotiation, bool)
+
+func (s *NegotiationStore) Len() int
+
+func (s *NegotiationStore) Start(peerID string, role NegotiationRole, sessionID string, local, remote []Candidate) (*Negotiation, error)
+
+type P2PConnection struct {
+	PeerID      string
+	Conn        net.Conn
+	LocalAddr   string
+	RemoteAddr  string
+	Established time.Time
+}
+    P2PConnection represents a direct P2P connection
+
+type P2PManager struct {
+	// Has unexported fields.
+}
+    P2PManager handles P2P connections
+
+func NewP2PManager(peerID, stunServer string) *P2PManager
+    NewP2PManager creates a new P2P manager
+
+func NewP2PManagerWithToken(peerID, stunServer, token string) *P2PManager
+    NewP2PManagerWithToken creates a manager whose UDP probes are authenticated.
+    The token should be a short-lived per-session capability delivered by the
+    authenticated signaling channel.
+
+func (m *P2PManager) CancelPreparedICE(sessionID string)
+
+func (m *P2PManager) Close() error
+    Close releases active connections and every unconnected TURN allocation.
+    The manager identity remains immutable, but no transport ownership survives.
+
+func (m *P2PManager) CloseConnection(peerID string)
+    CloseConnection closes a P2P connection
+
+func (m *P2PManager) DiscoverPublicAddr() (*PeerInfo, error)
+    DiscoverPublicAddr uses STUN to discover public address
+
+func (m *P2PManager) EstablishICE(ctx context.Context, agent *ICEAgent, peer *PeerInfo) (*ICESession, error)
+    EstablishICE integrates the authenticated P2P punch exchange with the ICE
+    checklist and TURN fallback. Each connectivity check uses the candidate
+    selected by the agent; the punch response authenticates the remote peer.
+
+func (m *P2PManager) EstablishICECandidates(ctx context.Context, agent *ICEAgent, peer *PeerInfo, remote []Candidate) (*ICESession, error)
+    EstablishICECandidates uses candidates exchanged by the authenticated
+    offer/answer flow instead of inferring the remote checklist from PeerInfo.
+
+func (m *P2PManager) EstablishICENegotiated(ctx context.Context, agent *ICEAgent, peer *PeerInfo, local, remote []Candidate) (*ICESession, error)
+    EstablishICENegotiated connects the exact local and remote candidate sets
+    bound by an ICE offer/answer exchange.
+
+func (m *P2PManager) EstablishPreparedICE(ctx context.Context, agent *ICEAgent, peer *PeerInfo, negotiationID string, local, remote []Candidate) (*ICESession, error)
+    EstablishPreparedICE performs checks through the negotiation-owned socket
+    whose exact port was advertised in the offer/answer candidate set.
+
+func (m *P2PManager) GetConnection(peerID string) *P2PConnection
+    GetConnection returns an existing P2P connection
+
+func (m *P2PManager) GetNATType() stun.NATType
+    GetNATType returns the detected NAT type
+
+func (m *P2PManager) GetPublicAddr() string
+    GetPublicAddr returns the discovered public address
+
+func (m *P2PManager) PrepareICE(ctx context.Context, negotiationID, stunServer string) ([]Candidate, error)
+    PrepareICE binds the negotiation socket before advertising candidates.
+    The exact same socket is later used for connectivity checks and transferred
+    to the nominated ICESession, avoiding transient STUN/host port mismatches.
+
+func (m *P2PManager) PrepareICEWithRelay(ctx context.Context, negotiationID, stunServer string, allocate RelayCandidateAllocator) ([]Candidate, error)
+    PrepareICEWithRelay allocates the local TURN candidate before signaling and
+    retains the unbound allocation with the same bounded negotiation lifecycle.
+
+func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PConnection, error)
+    PunchHole attempts UDP hole punching to peer
+
+func (m *P2PManager) SignalingPeerInfo() *PeerInfo
+    SignalingPeerInfo returns the per-manager capability that may only be sent
+    over the authenticated signaling channel.
+
+type P2PStream struct {
+	// Has unexported fields.
+}
+    P2PStream represents a multiplexed stream over P2P
+
+func (s *P2PStream) Close() error
+
+func (s *P2PStream) Read(p []byte) (int, error)
+
+func (s *P2PStream) Write(p []byte) (int, error)
+
+type P2PTunnel struct {
+	// Has unexported fields.
+}
+    P2PTunnel provides HTTP tunneling over P2P connection
+
+func NewP2PTunnel(conn net.Conn, peerID, localProxy string) *P2PTunnel
+    NewP2PTunnel creates a new P2P tunnel over a connection
+
+func NewP2PTunnelWithRole(conn net.Conn, peerID, localProxy string, controlling bool) *P2PTunnel
+    NewP2PTunnelWithRole creates a tunnel whose locally opened stream IDs cannot
+    collide with the remote peer. The controlling ICE peer owns even IDs and the
+    controlled peer owns odd IDs.
+
+func (t *P2PTunnel) AcceptStream() (*P2PStream, error)
+    AcceptStream waits for and returns the next incoming stream
+
+func (t *P2PTunnel) Close() error
+    Close closes the tunnel
+
+func (t *P2PTunnel) DoHTTPRequest(req *http.Request) (*http.Response, error)
+    DoHTTPRequest sends an HTTP request over P2P and returns the response
+
+func (t *P2PTunnel) OpenStream() (*P2PStream, error)
+    OpenStream opens a new multiplexed stream
+
+type PeerInfo struct {
+	PeerID     string `json:"peer_id"`
+	PublicAddr string `json:"public_addr"` // Public IP:port discovered via STUN
+	LocalAddr  string `json:"local_addr"`  // Local IP:port
+	NATType    string `json:"nat_type"`    // NAT type detected
+	// AuthToken is a short-lived capability shared out-of-band via signaling.
+	// It is never logged and is only used to authenticate punch probes.
+	AuthToken string `json:"auth_token,omitempty"`
+	// SessionID rotates with each P2P manager lifecycle and binds authenticated
+	// connectivity probes to this exact signaling session.
+	SessionID string `json:"session_id,omitempty"`
+}
+    PeerInfo contains information about a peer
+
+type PendingRelayAllocation interface {
+	Connect(context.Context, *net.UDPAddr) (net.Conn, error)
+	Close() error
+}
+    PendingRelayAllocation is the negotiation-owned half of a split TURN
+    allocation. Connect binds it to the relay candidate authenticated by the
+    remote offer/answer and transfers ownership to the returned message conn.
+
+type PunchReplayCache struct {
+	// Has unexported fields.
+}
+    PunchReplayCache provides bounded, session-aware replay protection for UDP
+    connectivity probes. Entries expire after maxSkew and the cache evicts the
+    oldest entry when its fixed capacity is reached.
+
+func NewPunchReplayCache(capacity int) *PunchReplayCache
+
+type RelayCandidateAllocator func(context.Context) (PendingRelayAllocation, Candidate, error)
+
+func TURNRelayCandidateAllocator(provider *TURNRelayProvider) RelayCandidateAllocator
+
+type RelayProvider interface {
+	Allocate(ctx context.Context, peerID string) (net.Conn, Candidate, error)
+}
+    RelayProvider is implemented by TURN adapters. Implementations must return
+    an already authenticated, connected net.Conn.
+
+type RuntimeConsentProbe struct{}
+    RuntimeConsentProbe performs consent through the connection's framing layer.
+    It never reads the transport itself, so the P2PTunnel dispatcher remains the
+    only socket read owner.
+
+func (RuntimeConsentProbe) Probe(ctx context.Context, conn net.Conn) error
+
+type SignalMessage struct {
+	Type       SignalType  `json:"type"`
+	FromPeer   string      `json:"from_peer"`
+	ToPeer     string      `json:"to_peer,omitempty"`
+	PeerInfo   *PeerInfo   `json:"peer_info,omitempty"`
+	SessionID  string      `json:"session_id,omitempty"`
+	Candidates []Candidate `json:"candidates,omitempty"`
+	Error      string      `json:"error,omitempty"`
+}
+    SignalMessage represents a P2P signaling message
+
+func DecodeSignal(data []byte) (*SignalMessage, error)
+    DecodeSignal decodes a JSON signal message
+
+func NewDiscoverSignal(fromPeer, toPeer string) *SignalMessage
+    NewDiscoverSignal creates a peer discovery request
+
+func NewFallbackSignal(fromPeer, toPeer, sessionID, reason string) *SignalMessage
+    NewFallbackSignal indicates P2P failed, use relay
+
+func NewICEAnswerSignal(fromPeer, toPeer, sessionID string, candidates []Candidate) *SignalMessage
+
+func NewICECandidateSignal(fromPeer, toPeer, sessionID string, candidate Candidate) *SignalMessage
+
+func NewICEOfferSignal(fromPeer, toPeer, sessionID string, candidates []Candidate) *SignalMessage
+
+func NewPeerInfoSignal(fromPeer string, info *PeerInfo) *SignalMessage
+    NewPeerInfoSignal creates a peer info response
+
+func NewPunchSignal(fromPeer, toPeer, sessionID string) *SignalMessage
+    NewPunchSignal creates a hole punch coordination message
+
+func NewReadySignal(fromPeer, toPeer, sessionID string) *SignalMessage
+    NewReadySignal indicates P2P connection is established
+
+type SignalType string
+    SignalType represents P2P signaling message types
+
+const (
+	SignalTypeDiscover     SignalType = "p2p_discover"  // Request peer info
+	SignalTypePeerInfo     SignalType = "p2p_peer_info" // Response with peer info
+	SignalTypePunch        SignalType = "p2p_punch"     // Start hole punching
+	SignalTypeReady        SignalType = "p2p_ready"     // P2P connection ready
+	SignalTypeFallback     SignalType = "p2p_fallback"  // Fallback to relay
+	SignalTypeICEOffer     SignalType = "ice_offer"
+	SignalTypeICEAnswer    SignalType = "ice_answer"
+	SignalTypeICECandidate SignalType = "ice_candidate"
+	SignalTypeTunnelReq    SignalType = "p2p_tunnel_req"   // P2P tunnel request
+	SignalTypeTunnelResp   SignalType = "p2p_tunnel_resp"  // P2P tunnel response
+	SignalTypeTunnelData   SignalType = "p2p_tunnel_data"  // P2P tunnel data chunk
+	SignalTypeTunnelClose  SignalType = "p2p_tunnel_close" // P2P tunnel close
+)
+type TURNConfig struct {
+	Server        string
+	Username      string
+	Password      string
+	PeerResolver  TURNPeerResolver
+	Transport     TURNTransport
+	TLSConfig     *tls.Config
+	TLSServerName string
+	// TLSInsecureSkipVerify is deliberately explicit and should only be used
+	// by isolated local labs. TLS verifies certificates by default.
+	TLSInsecureSkipVerify bool
+	Dial                  TURNPacketDialer
+	Timeout               time.Duration
+	RefreshInterval       time.Duration
+	MaxDatagramSize       int
+	// Retransmits is the number of bounded UDP retransmissions after the
+	// initial send. TURN transactions are otherwise vulnerable to a single
+	// dropped packet. The default is three.
+	Retransmits int
+	// EnableChannelBind upgrades payloads to ChannelData after a successful
+	// bind. A rejected bind transparently retains Send/Data indications.
+	EnableChannelBind bool
+	// ChannelNumber is primarily a deterministic-test hook. Zero selects a
+	// cryptographically random number in RFC 5766's 0x4000-0x7fff range.
+	ChannelNumber uint16
+}
+
+type TURNPacketDialer func(context.Context, string, string) (net.Conn, error)
+    TURNPacketDialer allows deterministic protocol tests without a live TURN
+    server. It dials the raw UDP or TCP control transport; TLS wrapping and
+    verification remain owned by TURNRelayProvider.
+
+type TURNPeerResolver func(context.Context, string) (*net.UDPAddr, error)
+    TURNPeerResolver maps an authenticated signalling peer ID to the peer's UDP
+    address. TURN permissions are address-bound, so silently treating peerID as
+    an address would cross the signalling/security boundary.
+
+type TURNPendingAllocation struct {
+	// Has unexported fields.
+}
+    TURNPendingAllocation is an authenticated allocation that has not yet been
+    bound to a peer. It is intentionally single-use and contains no read-loop
+    goroutine until Connect succeeds.
+
+func (a *TURNPendingAllocation) Close() error
+    Close deallocates an unconnected allocation with a short authenticated
+    Refresh(LIFETIME=0). The socket is always closed even if the server is gone.
+
+func (a *TURNPendingAllocation) Connect(ctx context.Context, peer *net.UDPAddr) (net.Conn, error)
+    Connect installs the peer permission, optionally binds a channel, and
+    transfers socket ownership to the returned connection.
+
+type TURNRelayProvider struct {
+	// Has unexported fields.
+}
+    TURNRelayProvider is a concrete provider for UDP relay allocations over
+    UDP/TCP/TLS control transports. ChannelBind is optional and falls back to
+    Send/Data indications; it does not claim TURN TCP allocations.
+
+func NewTURNRelayProvider(cfg TURNConfig) (*TURNRelayProvider, error)
+
+func (p *TURNRelayProvider) Allocate(ctx context.Context, peerID string) (net.Conn, Candidate, error)
+    Allocate preserves the peer-ID RelayProvider contract through the split
+    allocation API. New signalling flows can advertise the relay Candidate from
+    AllocateCandidate before binding it to a peer with Connect.
+
+func (p *TURNRelayProvider) AllocateCandidate(ctx context.Context) (*TURNPendingAllocation, Candidate, error)
+    AllocateCandidate creates an authenticated UDP relay allocation without a
+    peer permission. The returned bounded pending allocation owns the control
+    socket until Connect transfers ownership to a turnConn or Close releases it.
+
+type TURNTransport string
+
+const (
+	TURNTransportUDP TURNTransport = "udp"
+	TURNTransportTCP TURNTransport = "tcp"
+	TURNTransportTLS TURNTransport = "tls"
+)
+type TickSource func(context.Context, time.Duration) <-chan time.Time
+    TickSource makes consent freshness deterministic in tests. A production
+    agent uses a time.Ticker when this hook is nil.
+
+type UDPConn struct {
+	// Has unexported fields.
+}
+    UDPConn wraps UDP connection to implement net.Conn
+
+func (c *UDPConn) Close() error
+
+func (c *UDPConn) LocalAddr() net.Addr
+
+func (c *UDPConn) Read(b []byte) (n int, err error)
+
+func (c *UDPConn) RemoteAddr() net.Addr
+
+func (c *UDPConn) SetDeadline(t time.Time) error
+
+func (c *UDPConn) SetReadDeadline(t time.Time) error
+
+func (c *UDPConn) SetWriteDeadline(t time.Time) error
+
+func (c *UDPConn) Write(b []byte) (n int, err error)

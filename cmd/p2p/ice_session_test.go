@@ -163,6 +163,24 @@ func TestICEConnectReportsDirectAndTURNFailures(t *testing.T) {
 	}
 }
 
+func TestICEDirectChecklistHasGlobalBudget(t *testing.T) {
+	checker := ConnectivityCheckFunc(func(ctx context.Context, _, _ Candidate) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	agent := NewICEAgent(ICEConfig{Checker: checker, CheckTimeout: time.Second, ChecklistTimeout: 25 * time.Millisecond})
+	started := time.Now()
+	_, err := agent.Connect(context.Background(), "peer",
+		[]Candidate{{ID: "l1", Type: CandidateHost, Addr: "127.0.0.1:1"}, {ID: "l2", Type: CandidateHost, Addr: "127.0.0.1:2"}},
+		[]Candidate{{ID: "r1", Type: CandidateHost, Addr: "127.0.0.1:3"}, {ID: "r2", Type: CandidateHost, Addr: "127.0.0.1:4"}})
+	if err == nil {
+		t.Fatal("exhausted direct checklist unexpectedly succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("direct checklist ignored global budget: %s", elapsed)
+	}
+}
+
 func TestICEConsentFreshnessClosesAfterConsecutiveFailures(t *testing.T) {
 	checker := &recordingChecker{succeed: "remote"}
 	defer checker.close()

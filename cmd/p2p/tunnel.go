@@ -23,6 +23,7 @@ type P2PTunnel struct {
 	streamsMu  sync.RWMutex
 	writeMu    sync.Mutex // serialize frames on stream transports
 	nextID     uint32
+	streamStep uint32
 	closed     int32
 }
 
@@ -54,12 +55,27 @@ const (
 
 // NewP2PTunnel creates a new P2P tunnel over a connection
 func NewP2PTunnel(conn net.Conn, peerID, localProxy string) *P2PTunnel {
+	return newP2PTunnel(conn, peerID, localProxy, 1, 1)
+}
+
+// NewP2PTunnelWithRole creates a tunnel whose locally opened stream IDs cannot
+// collide with the remote peer. The controlling ICE peer owns even IDs and the
+// controlled peer owns odd IDs.
+func NewP2PTunnelWithRole(conn net.Conn, peerID, localProxy string, controlling bool) *P2PTunnel {
+	if controlling {
+		return newP2PTunnel(conn, peerID, localProxy, 0, 2)
+	}
+	return newP2PTunnel(conn, peerID, localProxy, ^uint32(0), 2)
+}
+
+func newP2PTunnel(conn net.Conn, peerID, localProxy string, nextID, streamStep uint32) *P2PTunnel {
 	t := &P2PTunnel{
 		conn:       conn,
 		peerID:     peerID,
 		localProxy: localProxy,
 		streams:    make(map[uint32]*P2PStream),
-		nextID:     1,
+		nextID:     nextID,
+		streamStep: streamStep,
 	}
 	go t.readLoop()
 	return t
@@ -71,7 +87,7 @@ func (t *P2PTunnel) OpenStream() (*P2PStream, error) {
 		return nil, fmt.Errorf("tunnel closed")
 	}
 
-	id := atomic.AddUint32(&t.nextID, 1)
+	id := atomic.AddUint32(&t.nextID, t.streamStep)
 	stream := &P2PStream{
 		id:      id,
 		tunnel:  t,

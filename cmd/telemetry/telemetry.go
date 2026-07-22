@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,11 +34,22 @@ type OTLPHTTPExporter struct {
 }
 
 func NewOTLPHTTPExporter(endpoint string) *OTLPHTTPExporter {
-	endpoint = strings.TrimRight(endpoint, "/")
-	if !strings.HasSuffix(endpoint, "/v1/traces") {
-		endpoint += "/v1/traces"
+	return &OTLPHTTPExporter{Endpoint: normalizeOTLPTraceEndpoint(endpoint), Client: &http.Client{Timeout: 5 * time.Second}}
+}
+
+func normalizeOTLPTraceEndpoint(endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
 	}
-	return &OTLPHTTPExporter{Endpoint: endpoint, Client: &http.Client{Timeout: 5 * time.Second}}
+	// A host/root value is the conventional OTLP base endpoint. A non-root
+	// path is already a per-signal endpoint and must be preserved verbatim,
+	// including any query used by an authenticated collector gateway.
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/v1/traces"
+	}
+	return u.String()
 }
 
 func (e *OTLPHTTPExporter) Export(ctx context.Context, s Span) {
@@ -148,6 +160,8 @@ func newAsyncOTLPExporter(cfg AsyncOTLPConfig, export batchExportFunc) *AsyncOTL
 	defaults := DefaultAsyncOTLPConfig()
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaults.QueueSize
+	} else if cfg.QueueSize > 65536 {
+		cfg.QueueSize = 65536
 	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = defaults.BatchSize
@@ -155,17 +169,28 @@ func newAsyncOTLPExporter(cfg AsyncOTLPConfig, export batchExportFunc) *AsyncOTL
 	if cfg.BatchSize > cfg.QueueSize {
 		cfg.BatchSize = cfg.QueueSize
 	}
+	if cfg.BatchSize > 4096 {
+		cfg.BatchSize = 4096
+	}
 	if cfg.FlushInterval <= 0 {
 		cfg.FlushInterval = defaults.FlushInterval
+	} else if cfg.FlushInterval > time.Hour {
+		cfg.FlushInterval = time.Hour
 	}
 	if cfg.ExportTimeout <= 0 {
 		cfg.ExportTimeout = defaults.ExportTimeout
+	} else if cfg.ExportTimeout > time.Minute {
+		cfg.ExportTimeout = time.Minute
 	}
 	if cfg.MaxRetries < 0 {
 		cfg.MaxRetries = 0
+	} else if cfg.MaxRetries > 8 {
+		cfg.MaxRetries = 8
 	}
 	if cfg.RetryBackoff <= 0 {
 		cfg.RetryBackoff = defaults.RetryBackoff
+	} else if cfg.RetryBackoff > time.Minute {
+		cfg.RetryBackoff = time.Minute
 	}
 	if export == nil {
 		export = func(context.Context, []Span) error { return errors.New("telemetry: nil batch exporter") }
@@ -273,9 +298,15 @@ func (e *AsyncOTLPExporter) send(batch []Span) {
 		}
 		e.retries.Add(1)
 		delay := e.cfg.RetryBackoff << attempt
+		if delay <= 0 || delay > time.Minute {
+			delay = time.Minute
+		}
 		select {
 		case <-time.After(delay):
 		case <-e.stop:
+			// Close is a flush request: skip retry sleeps but retain the bounded
+			// retry budget so transient collector failures do not drop accepted
+			// spans during graceful shutdown.
 		}
 	}
 }
@@ -347,52 +378,6 @@ func (e *MemoryExporter) Snapshot() []Span {
 
 type ctxKey struct{}
 
-var defaultExporter Exporter = &MemoryExporter{}
-var exporterMu sync.RWMutex
-var exporterGeneration uint64
-
-func SetExporter(e Exporter) {
-	exporterMu.Lock()
-	defer exporterMu.Unlock()
-	exporterGeneration++
-	if e == nil {
-		defaultExporter = &MemoryExporter{}
-	} else {
-		defaultExporter = e
-	}
-}
-
-// InstallExporter atomically installs e and returns an idempotent restore
-// function. Restore is ownership-aware: it does not overwrite an exporter
-// installed by another runtime after this lease was created.
-func InstallExporter(e Exporter) func() {
-	if e == nil {
-		return func() {}
-	}
-	exporterMu.Lock()
-	previous := defaultExporter
-	defaultExporter = e
-	exporterGeneration++
-	generation := exporterGeneration
-	exporterMu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			exporterMu.Lock()
-			if exporterGeneration == generation {
-				defaultExporter = previous
-				exporterGeneration++
-			}
-			exporterMu.Unlock()
-		})
-	}
-}
-
-func currentExporter() Exporter {
-	exporterMu.RLock()
-	defer exporterMu.RUnlock()
-	return defaultExporter
-}
 func NewTraceID() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -436,7 +421,10 @@ func ContextWithTrace(ctx context.Context, trace string) context.Context {
 }
 func TraceFromContext(ctx context.Context) string { v, _ := ctx.Value(ctxKey{}).(string); return v }
 
-func HTTPMiddleware(next http.Handler) http.Handler {
+// HTTPMiddlewareWithExporter records one server span into the explicitly
+// supplied exporter. A nil exporter disables recording while preserving trace
+// propagation, which keeps runtimes isolated without process-global state.
+func HTTPMiddlewareWithExporter(next http.Handler, exporter Exporter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		trace, _, ok := ExtractTraceparent(r.Header.Get("traceparent"))
 		if !ok {
@@ -452,8 +440,17 @@ func HTTPMiddleware(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		currentExporter().Export(r.Context(), Span{TraceID: trace, SpanID: span, Name: r.Method + " " + r.URL.Path, Start: start, End: time.Now(), Status: status, Attributes: map[string]string{"http.method": r.Method, "http.route": r.URL.Path}})
+		if exporter != nil {
+			exporter.Export(r.Context(), Span{TraceID: trace, SpanID: span, Name: r.Method + " " + r.URL.Path, Start: start, End: time.Now(), Status: status, Attributes: map[string]string{"http.method": r.Method, "http.route": r.URL.Path}})
+		}
 	})
+}
+
+// HTTPMiddleware preserves the pre-DI middleware API. It propagates trace
+// context but intentionally performs no process-global export. New serving
+// paths should use HTTPMiddlewareWithExporter.
+func HTTPMiddleware(next http.Handler) http.Handler {
+	return HTTPMiddlewareWithExporter(next, nil)
 }
 
 type statusWriter struct {

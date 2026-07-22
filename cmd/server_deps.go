@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"xrok/cmd/telemetry"
 )
 
 // legacyServerDepsFallbacks tracks requests still served through the global
@@ -24,6 +26,7 @@ type ServerDeps struct {
 	Logger    *log.Logger
 	Domain    string
 	StartTime time.Time
+	Exporter  telemetry.Exporter
 }
 
 // NewServerDeps constructs an isolated dependency set for an embedded server.

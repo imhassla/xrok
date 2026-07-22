@@ -202,42 +202,49 @@ type TunnelInfo struct {
 }
 
 type clientState struct {
-	ProxyURL        string
-	ClientPort      string
-	ServerAddr      string
-	ServerPort      int    // Registration/QUIC server port
-	LocalPort       string // Legacy single tunnel
-	Tunnels         []TunnelConfig
-	TunnelMap       map[string]string // name -> target mapping
-	UDPTunnels      []UDPTunnelConfig // UDP tunnel configurations
-	ReverseTunnels  []ReverseConfig   // Reverse forwarding configurations
-	ReverseMap      map[string]string // remote -> local mapping
-	UseTLS          bool
-	UseProxy        bool
-	Socks5Addr      string // SOCKS5 proxy address
-	ConnectionID    string
-	MuxSession      *yamux.Session
-	QUICConn        *transport.QUICConn // QUIC connection
-	UseQUIC         bool                // Use QUIC transport
-	Headers         map[string]string   // Custom headers to inject
-	Compress        bool                // Enable compression
-	HTTPProxy       string              // HTTP CONNECT proxy URL
-	ClientCert      string              // Path to client certificate for mTLS
-	ClientKey       string              // Path to client private key for mTLS
-	TLSConfig       *tls.Config         // TLS config with mTLS if configured
-	SessionToken    string              // Credential returned by registration
-	APIToken        string              // Control-plane credential
-	StdioMode       bool                // Stdio tunneling mode
-	StdioTarget     string              // Target for stdio mode
-	P2PManager      *p2p.P2PManager
-	P2PEnabled      bool
-	P2PInfo         *p2p.PeerInfo
-	P2PSignalConn   *websocket.Conn           // WebSocket for P2P signaling
-	P2PSignalMutex  sync.Mutex                // Mutex for P2P signaling
-	P2PConnections  map[string]net.Conn       // Active P2P connections (peerID -> conn)
-	P2PConnMutex    sync.RWMutex              // Mutex for P2P connections
-	P2PTunnels      map[string]*p2p.P2PTunnel // P2P tunnels for HTTP traffic (peerID -> tunnel)
-	P2PTunnelsMutex sync.RWMutex              // Mutex for P2P tunnels
+	ClientID          string
+	ProxyURL          string
+	ClientPort        string
+	ServerAddr        string
+	ServerPort        int    // Registration/QUIC server port
+	LocalPort         string // Legacy single tunnel
+	Tunnels           []TunnelConfig
+	TunnelMap         map[string]string // name -> target mapping
+	UDPTunnels        []UDPTunnelConfig // UDP tunnel configurations
+	ReverseTunnels    []ReverseConfig   // Reverse forwarding configurations
+	ReverseMap        map[string]string // remote -> local mapping
+	UseTLS            bool
+	UseProxy          bool
+	Socks5Addr        string // SOCKS5 proxy address
+	ConnectionID      string
+	MuxSession        *yamux.Session
+	QUICConn          *transport.QUICConn // QUIC connection
+	UseQUIC           bool                // Use QUIC transport
+	Headers           map[string]string   // Custom headers to inject
+	Compress          bool                // Enable compression
+	HTTPProxy         string              // HTTP CONNECT proxy URL
+	ClientCert        string              // Path to client certificate for mTLS
+	ClientKey         string              // Path to client private key for mTLS
+	TLSConfig         *tls.Config         // TLS config with mTLS if configured
+	SessionToken      string              // Credential returned by registration
+	APIToken          string              // Control-plane credential
+	StdioMode         bool                // Stdio tunneling mode
+	StdioTarget       string              // Target for stdio mode
+	P2PManager        *p2p.P2PManager
+	P2PEnabled        bool
+	P2PInfo           *p2p.PeerInfo
+	P2PSignalConn     *websocket.Conn           // WebSocket for P2P signaling
+	P2PSignalMutex    sync.Mutex                // Mutex for P2P signaling
+	P2PConnections    map[string]net.Conn       // Active P2P connections (peerID -> conn)
+	P2PConnMutex      sync.RWMutex              // Mutex for P2P connections
+	P2PTunnels        map[string]*p2p.P2PTunnel // P2P tunnels for HTTP traffic (peerID -> tunnel)
+	P2PTunnelsMutex   sync.RWMutex              // Mutex for P2P tunnels
+	P2PNegotiations   *p2p.NegotiationStore
+	P2PPeers          map[string]*p2p.PeerInfo
+	P2PStateMutex     sync.RWMutex
+	P2PStunServer     string
+	P2PTURN           config.TURNConfig
+	P2PActiveSessions map[string]string
 }
 
 // ClientRuntime owns client lifecycle state and synchronization.  The CLI keeps
@@ -254,7 +261,7 @@ func NewClientRuntime(l *logger.Logger) *ClientRuntime {
 	if l == nil {
 		l = logger.New()
 	}
-	return &ClientRuntime{state: &clientState{TunnelMap: make(map[string]string), ReverseMap: make(map[string]string), P2PConnections: make(map[string]net.Conn), P2PTunnels: make(map[string]*p2p.P2PTunnel)}, log: l}
+	return &ClientRuntime{state: &clientState{TunnelMap: make(map[string]string), ReverseMap: make(map[string]string), P2PConnections: make(map[string]net.Conn), P2PTunnels: make(map[string]*p2p.P2PTunnel), P2PNegotiations: p2p.NewNegotiationStore(128, 30*time.Second), P2PPeers: make(map[string]*p2p.PeerInfo), P2PActiveSessions: make(map[string]string)}, log: l}
 }
 
 // CurrentClientRuntime exposes the active CLI runtime for embedding and
@@ -312,6 +319,7 @@ func (r *ClientRuntime) Close() {
 	if s != nil && s.MuxSession != nil {
 		_ = s.MuxSession.Close()
 	}
+	closeP2PState(s)
 }
 
 type registerResponse struct {
@@ -408,6 +416,18 @@ func RunClient(args []string) {
 	enableP2P := fs.Bool("p2p", false, "Enable P2P direct connections")
 	p2pStunServer := fs.String("stun-server", "stun.l.google.com:19302", "STUN server for P2P NAT discovery")
 	p2pFallback := fs.Bool("p2p-fallback", true, "Fallback to relay if P2P fails")
+	turnServer := fs.String("turn-server", "", "TURN server host:port (enables authenticated ICE relay fallback)")
+	turnUsername := fs.String("turn-username", "", "TURN long-term credential username")
+	turnPassword := fs.String("turn-password", os.Getenv("XROK_TURN_PASSWORD"), "TURN password (prefer XROK_TURN_PASSWORD or protected config)")
+	turnTransport := fs.String("turn-transport", "", "TURN control transport: udp, tcp, or tls")
+	turnCACert := fs.String("turn-ca-cert", "", "CA certificate for TURN TLS verification")
+	turnServerName := fs.String("turn-server-name", "", "TURN TLS certificate server name")
+	turnInsecure := fs.Bool("turn-insecure", false, "Skip TURN TLS verification (isolated development only)")
+	turnChannelBind := fs.Bool("turn-channel-bind", false, "Use TURN ChannelBind/ChannelData with indication fallback")
+	turnTimeout := fs.Duration("turn-timeout", 0, "TURN transaction timeout")
+	turnRefreshInterval := fs.Duration("turn-refresh-interval", 0, "TURN allocation/permission refresh interval")
+	turnMaxDatagram := fs.Int("turn-max-datagram", 0, "Maximum TURN payload datagram bytes")
+	turnRetransmits := fs.Int("turn-retransmits", 0, "TURN UDP retransmits (0 uses bounded default)")
 
 	fs.Parse(args)
 
@@ -523,6 +543,44 @@ func RunClient(args []string) {
 		if cfg != nil && !cfg.P2P.Fallback {
 			*p2pFallback = cfg.P2P.Fallback
 		}
+		if cfg != nil && cfg.P2P.TURN.Enabled {
+			if *turnServer == "" {
+				*turnServer = cfg.P2P.TURN.Server
+			}
+			if *turnUsername == "" {
+				*turnUsername = cfg.P2P.TURN.Username
+			}
+			if *turnPassword == "" {
+				*turnPassword = cfg.P2P.TURN.Password
+			}
+			if *turnTransport == "" {
+				*turnTransport = cfg.P2P.TURN.Transport
+			}
+			if *turnCACert == "" {
+				*turnCACert = cfg.P2P.TURN.CACert
+			}
+			if *turnServerName == "" {
+				*turnServerName = cfg.P2P.TURN.ServerName
+			}
+			if cfg.P2P.TURN.Insecure {
+				*turnInsecure = true
+			}
+			if cfg.P2P.TURN.ChannelBind {
+				*turnChannelBind = true
+			}
+			if *turnTimeout == 0 {
+				*turnTimeout = cfg.P2P.TURN.Timeout
+			}
+			if *turnRefreshInterval == 0 {
+				*turnRefreshInterval = cfg.P2P.TURN.RefreshInterval
+			}
+			if *turnMaxDatagram == 0 {
+				*turnMaxDatagram = cfg.P2P.TURN.MaxDatagramSize
+			}
+			if *turnRetransmits == 0 {
+				*turnRetransmits = cfg.P2P.TURN.Retransmits
+			}
+		}
 
 		// Reconfigure logger after loading config
 		if *quietMode {
@@ -536,6 +594,23 @@ func RunClient(args []string) {
 	if *serverAddr == "" {
 		clientLog.Error("The --server flag or 'server' in config file is required.")
 		os.Exit(1)
+	}
+
+	turnRuntimeConfig := config.TURNConfig{
+		Enabled: *turnServer != "", Server: *turnServer, Username: *turnUsername, Password: *turnPassword,
+		Transport: *turnTransport, CACert: *turnCACert, ServerName: *turnServerName,
+		Insecure: *turnInsecure, ChannelBind: *turnChannelBind, Timeout: *turnTimeout,
+		RefreshInterval: *turnRefreshInterval, MaxDatagramSize: *turnMaxDatagram, Retransmits: *turnRetransmits,
+	}
+	if turnRuntimeConfig.Enabled {
+		if turnRuntimeConfig.Transport == "" {
+			turnRuntimeConfig.Transport = "udp"
+		}
+		validation := &config.ClientConfig{Version: config.CurrentVersion, P2P: config.P2PConfig{Enabled: *enableP2P, TURN: turnRuntimeConfig}}
+		if err := validation.Validate(); err != nil {
+			clientLog.Error("Invalid TURN configuration: %v", err)
+			os.Exit(1)
+		}
 	}
 
 	// Build tunnel list from flags
@@ -618,27 +693,33 @@ func RunClient(args []string) {
 
 	clientStateMutex.Lock()
 	clientState_ = &clientState{
-		ServerAddr:     *serverAddr,
-		ServerPort:     clientRp,
-		UseTLS:         *useTLS,
-		UseProxy:       *useProxy,
-		Tunnels:        tunnelConfigs,
-		TunnelMap:      tunnelMap,
-		UDPTunnels:     udpTunnels,
-		ReverseTunnels: reverseTunnels,
-		ReverseMap:     reverseMap,
-		Socks5Addr:     *socks5Addr,
-		UseQUIC:        *useQUIC,
-		Headers:        customHeaders,
-		Compress:       *enableCompress,
-		HTTPProxy:      *httpProxy,
-		ClientCert:     *clientCert,
-		ClientKey:      *clientKey,
-		APIToken:       *apiToken,
-		StdioMode:      *stdioMode,
-		StdioTarget:    *stdioTarget,
-		P2PConnections: make(map[string]net.Conn),
-		P2PTunnels:     make(map[string]*p2p.P2PTunnel),
+		ClientID:          clientID,
+		ServerAddr:        *serverAddr,
+		ServerPort:        clientRp,
+		UseTLS:            *useTLS,
+		UseProxy:          *useProxy,
+		Tunnels:           tunnelConfigs,
+		TunnelMap:         tunnelMap,
+		UDPTunnels:        udpTunnels,
+		ReverseTunnels:    reverseTunnels,
+		ReverseMap:        reverseMap,
+		Socks5Addr:        *socks5Addr,
+		UseQUIC:           *useQUIC,
+		Headers:           customHeaders,
+		Compress:          *enableCompress,
+		HTTPProxy:         *httpProxy,
+		ClientCert:        *clientCert,
+		ClientKey:         *clientKey,
+		APIToken:          *apiToken,
+		StdioMode:         *stdioMode,
+		StdioTarget:       *stdioTarget,
+		P2PConnections:    make(map[string]net.Conn),
+		P2PTunnels:        make(map[string]*p2p.P2PTunnel),
+		P2PNegotiations:   p2p.NewNegotiationStore(128, 30*time.Second),
+		P2PPeers:          make(map[string]*p2p.PeerInfo),
+		P2PStunServer:     *p2pStunServer,
+		P2PTURN:           turnRuntimeConfig,
+		P2PActiveSessions: make(map[string]string),
 	}
 	clientRuntime_.replaceState(clientState_)
 	state := clientRuntime_.State()
@@ -687,18 +768,21 @@ func RunClient(args []string) {
 		// session and signaling authorization are both bound to this ID.
 		if clientID == "" {
 			clientID = fmt.Sprintf("client-%08x", rand.Uint32())
+			state.ClientID = clientID
 		}
 		p2pMgr := p2p.NewP2PManager(clientID, *p2pStunServer)
 		peerInfo, err := p2pMgr.DiscoverPublicAddr()
 		if err != nil {
-			clientLog.Warn("P2P discovery failed: %v, continuing without P2P", err)
-		} else {
-			clientStateMutex.Lock()
-			state.P2PManager = p2pMgr
-			state.P2PEnabled = true
-			state.P2PInfo = peerInfo
-			clientStateMutex.Unlock()
+			clientLog.Warn("P2P public discovery failed: %v; continuing with host/TURN ICE candidates", err)
+			peerInfo = p2pMgr.SignalingPeerInfo()
+		}
+		clientStateMutex.Lock()
+		activateP2PManager(state, p2pMgr, peerInfo)
+		clientStateMutex.Unlock()
+		if peerInfo.PublicAddr != "" {
 			clientLog.Info("P2P enabled: %s (NAT: %s)", peerInfo.PublicAddr, peerInfo.NATType)
+		} else {
+			clientLog.Info("P2P enabled with host/TURN ICE candidates")
 		}
 	}
 
@@ -810,6 +894,12 @@ func RunClient(args []string) {
 	clientStateMutex.Unlock()
 
 	clientLog.Info("Client has shut down.")
+}
+
+func activateP2PManager(state *clientState, manager *p2p.P2PManager, info *p2p.PeerInfo) {
+	state.P2PManager = manager
+	state.P2PEnabled = manager != nil && info != nil
+	state.P2PInfo = info
 }
 
 func setupClientLogging() {
@@ -1170,6 +1260,7 @@ func registerClient(state *clientState, token string) bool {
 		}
 
 		clientID = res.UDID
+		state.ClientID = res.UDID
 		state.SessionToken = res.SessionToken
 		state.ClientPort = res.ClientPortTLS
 
@@ -1267,6 +1358,7 @@ func runWithReconnect(ctx context.Context, state *clientState, token string, wg 
 		select {
 		case <-ctx.Done():
 			sessionCancel()
+			closeP2PState(state)
 			return
 		case <-disconnected:
 			isConnected.Store(false)
@@ -1281,28 +1373,7 @@ func runWithReconnect(ctx context.Context, state *clientState, token string, wg 
 				state.QUICConn.Close()
 				state.QUICConn = nil
 			}
-			// Cleanup P2P signaling
-			state.P2PSignalMutex.Lock()
-			if state.P2PSignalConn != nil {
-				state.P2PSignalConn.Close()
-				state.P2PSignalConn = nil
-			}
-			state.P2PSignalMutex.Unlock()
-			// Cleanup P2P tunnels
-			state.P2PTunnelsMutex.Lock()
-			for _, tunnel := range state.P2PTunnels {
-				tunnel.Close()
-			}
-			state.P2PTunnels = make(map[string]*p2p.P2PTunnel)
-			state.P2PTunnelsMutex.Unlock()
-
-			// Cleanup P2P connections
-			state.P2PConnMutex.Lock()
-			for _, conn := range state.P2PConnections {
-				conn.Close()
-			}
-			state.P2PConnections = make(map[string]net.Conn)
-			state.P2PConnMutex.Unlock()
+			closeP2PState(state)
 			clientStateMutex.Unlock()
 
 			if reconnectConfig.Enabled {
@@ -2330,56 +2401,89 @@ func handleP2PSignals(ctx context.Context, conn *websocket.Conn, state *clientSt
 			return
 		}
 
-		var signal p2p.SignalMessage
-		if err := json.Unmarshal(message, &signal); err != nil {
+		signal, err := p2p.DecodeSignal(message)
+		if err != nil {
 			clientLog.Debug("P2P signal decode error: %v", err)
 			continue
 		}
 
-		handleP2PSignal(ctx, state, &signal)
+		handleP2PSignal(ctx, state, signal)
 	}
 }
 
 // handleP2PSignal processes a single P2P signal
 func handleP2PSignal(ctx context.Context, state *clientState, signal *p2p.SignalMessage) {
+	localID := clientRuntimeID(state)
+	negotiations := clientNegotiationStore(state)
 	switch signal.Type {
 	case p2p.SignalTypePeerInfo:
-		// Received peer info - initiate hole punching
 		if signal.PeerInfo == nil {
 			return
 		}
-		clientLog.Info("P2P: Received peer info from %s at %s", signal.FromPeer, signal.PeerInfo.PublicAddr)
+		peer := *signal.PeerInfo
+		peerID := peer.PeerID
+		if peerID == "" {
+			peerID = signal.FromPeer
+			peer.PeerID = peerID
+		}
+		state.P2PStateMutex.Lock()
+		state.P2PPeers[peerID] = &peer
+		state.P2PStateMutex.Unlock()
+		clientLog.Info("P2P: Received peer info from %s at %s", peerID, peer.PublicAddr)
+		if p2p.ShouldInitiateICE(localID, peerID) {
+			go startICEOffer(ctx, state, &peer)
+		}
 
-		// Start hole punching in background
-		go func() {
-			conn, err := state.P2PManager.PunchHole(ctx, signal.PeerInfo)
-			if err != nil {
-				clientLog.Debug("P2P: Hole punch to %s failed: %v", signal.FromPeer, err)
-				// Send fallback signal
-				sendP2PSignal(state, p2p.NewFallbackSignal(clientID, signal.FromPeer, "", err.Error()))
-				return
-			}
+	case p2p.SignalTypeICEOffer:
+		if signal.ToPeer != localID || p2p.ShouldInitiateICE(localID, signal.FromPeer) {
+			clientLog.Debug("P2P: rejected ICE offer glare/session mismatch from %s", signal.FromPeer)
+			return
+		}
+		peer := p2pPeer(state, signal.FromPeer)
+		if peer == nil {
+			return
+		}
+		if existing, ok := negotiations.Get(signal.FromPeer, signal.SessionID); ok {
+			// Idempotently answer an offer replay from the original candidate
+			// snapshot. Never bind a second socket or restart connectivity checks.
+			sendP2PSignal(state, p2p.NewICEAnswerSignal(localID, signal.FromPeer, signal.SessionID, existing.LocalCandidates))
+			return
+		}
+		local, err := prepareClientICE(ctx, state, signal.SessionID)
+		if err != nil {
+			sendP2PSignal(state, p2p.NewFallbackSignal(localID, signal.FromPeer, signal.SessionID, err.Error()))
+			return
+		}
+		_, err = negotiations.Start(signal.FromPeer, p2p.NegotiationControlled, signal.SessionID, local, signal.Candidates)
+		if err != nil {
+			state.P2PManager.CancelPreparedICE(signal.SessionID)
+			return
+		}
+		sendP2PSignal(state, p2p.NewICEAnswerSignal(localID, signal.FromPeer, signal.SessionID, local))
+		if checking, won := negotiations.BeginCheck(signal.FromPeer, signal.SessionID); won {
+			go establishNegotiatedICE(ctx, state, peer, checking)
+		}
 
-			// Store P2P connection
-			state.P2PConnMutex.Lock()
-			state.P2PConnections[signal.FromPeer] = conn.Conn
-			state.P2PConnMutex.Unlock()
+	case p2p.SignalTypeICEAnswer:
+		if signal.ToPeer != localID || !p2p.ShouldInitiateICE(localID, signal.FromPeer) {
+			return
+		}
+		peer := p2pPeer(state, signal.FromPeer)
+		if peer == nil {
+			return
+		}
+		negotiation, err := negotiations.AddRemote(signal.FromPeer, signal.SessionID, signal.Candidates)
+		if err != nil || negotiation.Role != p2p.NegotiationControlling {
+			return
+		}
+		if checking, won := negotiations.BeginCheck(signal.FromPeer, signal.SessionID); won {
+			go establishNegotiatedICE(ctx, state, peer, checking)
+		}
 
-			// Create P2P tunnel for HTTP traffic
-			localTarget := ""
-			if len(state.Tunnels) > 0 {
-				localTarget = state.Tunnels[0].Target
-			}
-			tunnel := p2p.NewP2PTunnel(conn.Conn, signal.FromPeer, localTarget)
-			state.P2PTunnelsMutex.Lock()
-			state.P2PTunnels[signal.FromPeer] = tunnel
-			state.P2PTunnelsMutex.Unlock()
-
-			clientLog.Info("P2P: Connection and tunnel established with %s", signal.FromPeer)
-
-			// Notify peer that P2P is ready
-			sendP2PSignal(state, p2p.NewReadySignal(clientID, signal.FromPeer, ""))
-		}()
+	case p2p.SignalTypeICECandidate:
+		if signal.ToPeer == localID {
+			_, _ = negotiations.AddRemote(signal.FromPeer, signal.SessionID, signal.Candidates)
+		}
 
 	case p2p.SignalTypePunch:
 		// Peer is trying to punch - we should already be punching too
@@ -2393,21 +2497,196 @@ func handleP2PSignal(ctx context.Context, state *clientState, signal *p2p.Signal
 		// P2P failed, will use relay
 		clientLog.Debug("P2P: Fallback to relay for %s: %s", signal.FromPeer, signal.Error)
 
-		// Remove any P2P tunnel
-		state.P2PTunnelsMutex.Lock()
-		if tunnel, exists := state.P2PTunnels[signal.FromPeer]; exists {
-			tunnel.Close()
-			delete(state.P2PTunnels, signal.FromPeer)
-		}
-		state.P2PTunnelsMutex.Unlock()
+		removeP2PSessionIfMatch(state, signal.FromPeer, signal.SessionID)
+		negotiations.Fail(signal.FromPeer, signal.SessionID)
+		state.P2PManager.CancelPreparedICE(signal.SessionID)
+	}
+}
 
-		// Remove any P2P connection
-		state.P2PConnMutex.Lock()
-		if conn, exists := state.P2PConnections[signal.FromPeer]; exists {
-			conn.Close()
-			delete(state.P2PConnections, signal.FromPeer)
+func startICEOffer(ctx context.Context, state *clientState, peer *p2p.PeerInfo) {
+	negotiations := clientNegotiationStore(state)
+	sessionID := p2p.NewICESessionID()
+	if sessionID == "" {
+		return
+	}
+	local, err := prepareClientICE(ctx, state, sessionID)
+	if err != nil {
+		return
+	}
+	if _, err := negotiations.Start(peer.PeerID, p2p.NegotiationControlling, sessionID, local, nil); err != nil {
+		state.P2PManager.CancelPreparedICE(sessionID)
+		return
+	}
+	sendP2PSignal(state, p2p.NewICEOfferSignal(clientRuntimeID(state), peer.PeerID, sessionID, local))
+}
+
+func p2pPeer(state *clientState, peerID string) *p2p.PeerInfo {
+	state.P2PStateMutex.RLock()
+	defer state.P2PStateMutex.RUnlock()
+	peer := state.P2PPeers[peerID]
+	if peer == nil {
+		return nil
+	}
+	copy := *peer
+	return &copy
+}
+
+func prepareClientICE(ctx context.Context, state *clientState, sessionID string) ([]p2p.Candidate, error) {
+	allocator, err := newClientTURNSplitAllocator(state.P2PTURN)
+	if err != nil {
+		return nil, err
+	}
+	return prepareClientICEWithAllocator(ctx, state, sessionID, allocator)
+}
+
+func prepareClientICEWithAllocator(ctx context.Context, state *clientState, sessionID string, allocator p2p.RelayCandidateAllocator) ([]p2p.Candidate, error) {
+	candidates, err := state.P2PManager.PrepareICEWithRelay(ctx, sessionID, state.P2PStunServer, allocator)
+	if err == nil || allocator == nil || ctx.Err() != nil {
+		return candidates, err
+	}
+	// TURN is an availability fallback, not a prerequisite for direct ICE. A
+	// failed pre-allocation must not discard an otherwise usable host/srflx path.
+	if clientLog != nil {
+		clientLog.Warn("P2P: TURN candidate unavailable, continuing direct-only: %v", err)
+	}
+	return state.P2PManager.PrepareICE(ctx, sessionID, state.P2PStunServer)
+}
+
+func establishNegotiatedICE(ctx context.Context, state *clientState, peer *p2p.PeerInfo, negotiation *p2p.Negotiation) {
+	negotiations := clientNegotiationStore(state)
+	iceConfig := p2p.ICEConfig{STUNServer: state.P2PStunServer}
+	agent := p2p.NewICEAgent(iceConfig)
+	session, err := state.P2PManager.EstablishPreparedICE(ctx, agent, peer, negotiation.SessionID, negotiation.LocalCandidates, negotiation.RemoteCandidates)
+	if err != nil {
+		clientLog.Debug("P2P: ICE to %s failed: %v", peer.PeerID, err)
+		sendP2PSignal(state, p2p.NewFallbackSignal(clientRuntimeID(state), peer.PeerID, negotiation.SessionID, err.Error()))
+		negotiations.Fail(peer.PeerID, negotiation.SessionID)
+		state.P2PManager.CancelPreparedICE(negotiation.SessionID)
+		return
+	}
+	localTarget := ""
+	if len(state.Tunnels) > 0 {
+		localTarget = state.Tunnels[0].Target
+	}
+	tunnel := p2p.NewP2PTunnelWithRole(session.Conn(), peer.PeerID, localTarget, p2p.ShouldInitiateICE(clientRuntimeID(state), peer.PeerID))
+	if !negotiations.Complete(peer.PeerID, negotiation.SessionID) {
+		_ = tunnel.Close()
+		return
+	}
+	installP2PSession(state, peer.PeerID, negotiation.SessionID, session.Conn(), tunnel)
+	go monitorP2PSession(state, negotiations, peer.PeerID, negotiation.SessionID, session.Done())
+	sendP2PSignal(state, p2p.NewReadySignal(clientRuntimeID(state), peer.PeerID, negotiation.SessionID))
+}
+
+func clientRuntimeID(state *clientState) string {
+	if state != nil && state.ClientID != "" {
+		return state.ClientID
+	}
+	return clientID
+}
+
+func installP2PSession(state *clientState, peerID, sessionID string, conn net.Conn, tunnel *p2p.P2PTunnel) {
+	state.P2PStateMutex.Lock()
+	if state.P2PActiveSessions == nil {
+		state.P2PActiveSessions = make(map[string]string)
+	}
+	state.P2PActiveSessions[peerID] = sessionID
+	state.P2PConnMutex.Lock()
+	oldConn := state.P2PConnections[peerID]
+	state.P2PConnections[peerID] = conn
+	state.P2PConnMutex.Unlock()
+	state.P2PTunnelsMutex.Lock()
+	oldTunnel := state.P2PTunnels[peerID]
+	state.P2PTunnels[peerID] = tunnel
+	state.P2PTunnelsMutex.Unlock()
+	state.P2PStateMutex.Unlock()
+	if oldTunnel != nil && oldTunnel != tunnel {
+		_ = oldTunnel.Close()
+	}
+	if oldConn != nil && oldConn != conn {
+		_ = oldConn.Close()
+	}
+}
+
+func monitorP2PSession(state *clientState, negotiations *p2p.NegotiationStore, peerID, sessionID string, done <-chan struct{}) {
+	if state == nil || negotiations == nil || done == nil {
+		return
+	}
+	<-done
+	if removeP2PSessionIfMatch(state, peerID, sessionID) {
+		negotiations.Delete(peerID, sessionID)
+	}
+}
+
+func clientNegotiationStore(state *clientState) *p2p.NegotiationStore {
+	state.P2PStateMutex.RLock()
+	defer state.P2PStateMutex.RUnlock()
+	return state.P2PNegotiations
+}
+
+func removeP2PSessionIfMatch(state *clientState, peerID, sessionID string) bool {
+	state.P2PStateMutex.Lock()
+	active := state.P2PActiveSessions[peerID]
+	if active == "" || active != sessionID {
+		state.P2PStateMutex.Unlock()
+		return false
+	}
+	delete(state.P2PActiveSessions, peerID)
+	state.P2PConnMutex.Lock()
+	conn := state.P2PConnections[peerID]
+	delete(state.P2PConnections, peerID)
+	state.P2PConnMutex.Unlock()
+	state.P2PTunnelsMutex.Lock()
+	tunnel := state.P2PTunnels[peerID]
+	delete(state.P2PTunnels, peerID)
+	state.P2PTunnelsMutex.Unlock()
+	state.P2PStateMutex.Unlock()
+	if tunnel != nil {
+		_ = tunnel.Close()
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	return true
+}
+
+func closeP2PState(state *clientState) {
+	if state == nil {
+		return
+	}
+	state.P2PSignalMutex.Lock()
+	signalConn := state.P2PSignalConn
+	state.P2PSignalConn = nil
+	state.P2PSignalMutex.Unlock()
+	if signalConn != nil {
+		_ = signalConn.Close()
+	}
+
+	state.P2PStateMutex.Lock()
+	state.P2PActiveSessions = make(map[string]string)
+	state.P2PPeers = make(map[string]*p2p.PeerInfo)
+	state.P2PNegotiations = p2p.NewNegotiationStore(128, 30*time.Second)
+	state.P2PTunnelsMutex.Lock()
+	tunnels := state.P2PTunnels
+	state.P2PTunnels = make(map[string]*p2p.P2PTunnel)
+	state.P2PTunnelsMutex.Unlock()
+	state.P2PConnMutex.Lock()
+	connections := state.P2PConnections
+	state.P2PConnections = make(map[string]net.Conn)
+	state.P2PConnMutex.Unlock()
+	state.P2PStateMutex.Unlock()
+	for _, tunnel := range tunnels {
+		if tunnel != nil {
+			_ = tunnel.Close()
 		}
-		state.P2PConnMutex.Unlock()
+	}
+	for _, conn := range connections {
+		if conn != nil {
+			_ = conn.Close()
+		}
+	}
+	if state.P2PManager != nil {
+		_ = state.P2PManager.Close()
 	}
 }
 
@@ -2459,7 +2738,7 @@ func requestP2PConnection(state *clientState, peerID string) {
 	}
 
 	// Send discover signal to find peer
-	sendP2PSignal(state, p2p.NewDiscoverSignal(clientID, peerID))
+	sendP2PSignal(state, p2p.NewDiscoverSignal(clientRuntimeID(state), peerID))
 }
 
 // FetchViaP2P attempts to fetch from a tunnel using P2P if available

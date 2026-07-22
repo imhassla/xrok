@@ -56,7 +56,9 @@ func TestHTTPRelayEndToEnd(t *testing.T) {
 	defer stopProcess(t, server)
 
 	tlsClient := newTLSClient(t, caFile)
-	waitFor(t, 10*time.Second, func() bool {
+	// Full-suite builds contend for CPU on local runners; readiness is an
+	// eventual process condition, not a 10-second performance assertion.
+	waitFor(t, 20*time.Second, func() bool {
 		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", port))
 		if err != nil {
 			return false
@@ -126,7 +128,7 @@ client_identities:
 	server := startProcess(t, tmp, nil, binary, "server", "--config", configPath)
 	defer stopProcess(t, server)
 	tlsClient := newTLSClient(t, caFile)
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, 20*time.Second, func() bool {
 		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", port))
 		if err != nil {
 			return false
@@ -196,6 +198,14 @@ func TestP2PReplayRejectedAcrossProcess(t *testing.T) {
 	run(t, root, nil, helper)
 }
 
+func TestPreparedICENegotiationAcrossProcess(t *testing.T) {
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	helper := filepath.Join(tmp, "ice-negotiation-e2e")
+	run(t, root, nil, "go", "build", "-o", helper, "./e2e/testdata/ice_negotiation_helper.go")
+	run(t, root, nil, helper)
+}
+
 func assertControlStatus(t *testing.T, client *http.Client, port int, path, token string, payload interface{}, want int) {
 	t.Helper()
 	body, err := json.Marshal(payload)
@@ -240,7 +250,7 @@ func TestQUICHTTPRelayEndToEnd(t *testing.T) {
 		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
 	defer stopProcess(t, server)
 	tlsClient := newTLSClient(t, caFile)
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, 20*time.Second, func() bool {
 		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", port))
 		if err != nil {
 			return false
@@ -297,7 +307,7 @@ func TestHTTPAuthAndHeadersEndToEnd(t *testing.T) {
 		"--log-file", filepath.Join(tmp, "server.log"))
 	defer stopProcess(t, server)
 	tlsClient := newTLSClient(t, caFile)
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, 20*time.Second, func() bool {
 		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", port))
 		if err != nil {
 			return false
@@ -378,7 +388,7 @@ func TestReverseTCPRelayEndToEnd(t *testing.T) {
 		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
 	defer stopProcess(t, server)
 	tlsClient := newTLSClient(t, caFile)
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, 20*time.Second, func() bool {
 		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", serverPort))
 		if err != nil {
 			return false
@@ -458,7 +468,7 @@ func TestUDPTunnelEndToEnd(t *testing.T) {
 		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
 	defer stopProcess(t, server)
 	tlsClient := newTLSClient(t, caFile)
-	waitFor(t, 10*time.Second, func() bool {
+	waitFor(t, 20*time.Second, func() bool {
 		resp, getErr := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", serverPort))
 		if getErr != nil {
 			return false

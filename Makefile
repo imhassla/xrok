@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench regression e2e e2e-soak fuzz security fault-injection api-compat ci-local soak supply-chain lab-parallel lab-smoke otlp-integration check
+.PHONY: build test race vet bench regression e2e e2e-soak fuzz security fault-injection api-compat ci-local soak supply-chain lab-parallel lab-smoke otlp-integration turn-integration check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -59,6 +59,10 @@ lab-smoke:
 # Runs the real async exporter against the pinned local OTEL Collector.
 otlp-integration:
 	./scripts/otel-collector-integration.sh
+
+# Exercises TURN-over-UDP/TCP/TLS and ChannelBind against pinned coturn.
+turn-integration:
+	./scripts/turn-integration.sh
 
 e2e:
 	$(GO_ENV) go test -tags=e2e ./e2e -count=1

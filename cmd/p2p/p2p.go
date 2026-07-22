@@ -32,16 +32,18 @@ type PeerInfo struct {
 
 // P2PManager handles P2P connections
 type P2PManager struct {
-	peerID      string
-	stunServer  string
-	publicAddr  string
-	localAddr   string
-	natType     stun.NATType
-	authToken   string
-	sessionID   string
-	replay      *PunchReplayCache
-	connections map[string]*P2PConnection
-	mu          sync.RWMutex
+	peerID       string
+	stunServer   string
+	publicAddr   string
+	localAddr    string
+	natType      stun.NATType
+	authToken    string
+	sessionID    string
+	replay       *PunchReplayCache
+	connections  map[string]*P2PConnection
+	preparedICE  map[string]*preparedICE
+	preparingICE map[string]struct{}
+	mu           sync.RWMutex
 }
 
 // P2PConnection represents a direct P2P connection
@@ -59,12 +61,14 @@ func NewP2PManager(peerID, stunServer string) *P2PManager {
 		stunServer = "stun.l.google.com:19302"
 	}
 	return &P2PManager{
-		peerID:      peerID,
-		stunServer:  stunServer,
-		authToken:   newPunchToken(),
-		sessionID:   newPunchSessionID(),
-		replay:      NewPunchReplayCache(defaultReplayEntries),
-		connections: make(map[string]*P2PConnection),
+		peerID:       peerID,
+		stunServer:   stunServer,
+		authToken:    newPunchToken(),
+		sessionID:    newPunchSessionID(),
+		replay:       NewPunchReplayCache(defaultReplayEntries),
+		connections:  make(map[string]*P2PConnection),
+		preparedICE:  make(map[string]*preparedICE),
+		preparingICE: make(map[string]struct{}),
 	}
 }
 

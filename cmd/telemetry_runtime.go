@@ -52,6 +52,15 @@ func telemetryConfigFromEnvironment(c config.TelemetryConfig, getenv func(string
 	return c, validateTelemetryConfig(c)
 }
 
+// telemetryConfigForServer keeps injected runtimes independent from host
+// process environment. Only the direct CLI path consumes OTEL_* overrides.
+func telemetryConfigForServer(c config.TelemetryConfig, injected telemetry.Exporter, getenv func(string) string) (config.TelemetryConfig, error) {
+	if injected != nil {
+		return c, nil
+	}
+	return telemetryConfigFromEnvironment(c, getenv)
+}
+
 func validateTelemetryConfig(c config.TelemetryConfig) error {
 	if strings.TrimSpace(c.Endpoint) == "" {
 		return nil

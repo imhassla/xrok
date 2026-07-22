@@ -50,6 +50,18 @@ func TestTelemetryConfigFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestInjectedTelemetryIgnoresProcessEnvironment(t *testing.T) {
+	base := config.DefaultServerConfig().Telemetry
+	exporter := &telemetry.MemoryExporter{}
+	got, err := telemetryConfigForServer(base, exporter, func(string) string { return "invalid-host-environment" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != base {
+		t.Fatalf("injected runtime telemetry config changed by host env: got=%+v want=%+v", got, base)
+	}
+}
+
 func TestServerRuntimeDrainsInjectedTelemetryOnNaturalExit(t *testing.T) {
 	exporter := &closingTestExporter{closed: make(chan struct{})}
 	r, err := NewServerRuntimeWithDeps(config.ServerConfig{Domain: "test.local"}, ServerRuntimeDeps{
@@ -112,13 +124,38 @@ func TestServerRuntimeBuildsConfiguredAsyncExporter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := r.telemetry.exporter.(*telemetry.AsyncOTLPExporter); !ok {
-		t.Fatalf("exporter=%T", r.telemetry.exporter)
+	if r.telemetry.exporter != nil {
+		t.Fatalf("endpoint exporter was constructed before Start: %T", r.telemetry.exporter)
 	}
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if _, ok := r.telemetry.exporter.(*telemetry.AsyncOTLPExporter); !ok {
+		t.Fatalf("exporter=%T", r.telemetry.exporter)
+	}
 	r.Wait()
+}
+
+func TestServerRuntimeShutdownBeforeStartClosesOwnedTelemetry(t *testing.T) {
+	exporter := &closingTestExporter{closed: make(chan struct{})}
+	r, err := NewServerRuntimeWithDeps(config.ServerConfig{Domain: "test.local"}, ServerRuntimeDeps{TelemetryExporter: exporter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ShutdownContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exporter.closed:
+	default:
+		t.Fatal("unstarted runtime did not close its owned exporter")
+	}
+	if err := r.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("Start after Shutdown error=%v", err)
+	}
+	if err := r.WaitContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestServerRuntimeOTLPCollectorIntegration(t *testing.T) {
@@ -131,8 +168,8 @@ func TestServerRuntimeOTLPCollectorIntegration(t *testing.T) {
 	cfg.Telemetry.Endpoint = endpoint
 	cfg.Telemetry.FlushInterval = 10 * time.Millisecond
 	r, err := NewServerRuntimeWithDeps(cfg, ServerRuntimeDeps{
-		RunContext: func(context.Context, []string) error {
-			h := telemetry.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+		RunContextWithDeps: func(_ context.Context, _ []string, deps *ServerDeps) error {
+			h := telemetry.HTTPMiddlewareWithExporter(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }), deps.Exporter)
 			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/collector-integration", nil))
 			return nil
 		},
@@ -147,5 +184,48 @@ func TestServerRuntimeOTLPCollectorIntegration(t *testing.T) {
 	exporter := r.telemetry.exporter.(*telemetry.AsyncOTLPExporter)
 	if stats := exporter.Stats(); stats.Exported != 1 || stats.Dropped != 0 {
 		t.Fatalf("runtime exporter did not drain: %+v", stats)
+	}
+}
+
+func TestConcurrentServerRuntimesKeepTelemetryIsolated(t *testing.T) {
+	exporterA := &telemetry.MemoryExporter{}
+	exporterB := &telemetry.MemoryExporter{}
+	ready := make(chan struct{}, 2)
+	release := make(chan struct{})
+	newRuntime := func(name string, exporter telemetry.Exporter) *ServerRuntime {
+		r, err := NewServerRuntimeWithDeps(config.ServerConfig{Domain: name + ".test"}, ServerRuntimeDeps{
+			TelemetryExporter: exporter,
+			RunContextWithDeps: func(_ context.Context, _ []string, deps *ServerDeps) error {
+				ready <- struct{}{}
+				<-release
+				h := telemetry.HTTPMiddlewareWithExporter(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), deps.Exporter)
+				h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/"+name, nil))
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	runtimeA := newRuntime("alpha", exporterA)
+	runtimeB := newRuntime("bravo", exporterB)
+	if err := runtimeA.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeB.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-ready
+	<-ready
+	close(release)
+	runtimeA.Wait()
+	runtimeB.Wait()
+	spansA, spansB := exporterA.Snapshot(), exporterB.Snapshot()
+	if len(spansA) != 1 || spansA[0].Name != "GET /alpha" {
+		t.Fatalf("runtime A spans=%+v", spansA)
+	}
+	if len(spansB) != 1 || spansB[0].Name != "GET /bravo" {
+		t.Fatalf("runtime B spans=%+v", spansB)
 	}
 }

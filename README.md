@@ -58,20 +58,52 @@ p2p:
   enabled: true
   stun_server: stun.l.google.com:19302
   fallback: true  # Fallback to relay if P2P fails
+  turn:
+    enabled: true
+    server: turn.example.com:5349
+    username: client-a
+    password: "use-a-runtime-secret"
+    transport: tls # UDP relay over a UDP/TCP/TLS control connection
+    ca_cert: /etc/xrok/turn-ca.pem
+    server_name: turn.example.com
+    channel_bind: true
 ```
+
+The equivalent CLI uses `--turn-server`, `--turn-username`,
+`--turn-transport`, `--turn-ca-cert`, `--turn-server-name` and
+`--turn-channel-bind`. Prefer `XROK_TURN_PASSWORD` over exposing the password
+in process arguments.
 
 P2P mode:
 - Uses server for signaling only
 - Data flows directly between clients
 - Reduces latency and server bandwidth
-- Falls back to the normal xrok server relay when direct traversal fails
+- Exchanges bilateral TURN relay candidates when direct traversal fails
+- Falls back to the normal xrok server data path if TURN is unavailable
 
-The Go P2P API also includes an RFC 5766 TURN-over-UDP provider with
-long-term authentication, permissions, allocation refresh and Send/Data
-indications. It is exercised against the pinned local coturn lab. The current
-CLI does not yet exchange TURN candidates between both peers, so TURN is an
-embeddable ICE transport option rather than a claim of end-to-end CLI TURN
-fallback. ChannelBind and TURN-over-TCP/TLS are not implemented.
+The client runtime allocates an RFC 5766 candidate before its authenticated ICE
+offer/answer, but binds the peer permission only after direct checks fail. Both
+peers exchange independently allocated relay candidates and nominate only a
+relay-to-relay pair after an authenticated connectivity exchange. It supports
+long-term authentication, permissions, refresh,
+bounded retransmission, Send/Data indications, optional ChannelBind/ChannelData
+and UDP/TCP/TLS control connections. TLS verifies certificates by default.
+After nomination, session-bound consent request/response records continuously
+verify liveness; application datagrams are protected with AES-256-GCM and a
+bounded replay window derived from both authenticated peer sessions and the ICE
+negotiation ID.
+
+This is a dependency-free ICE-style runtime, not a complete RFC 8445 stack.
+TURN TCP/TLS here means the client-to-coturn control connection; the allocated
+peer relay remains UDP. RFC 6062 TCP allocations and TURN-over-TLS peer data are
+not claimed.
+
+The local `turn-integration.sh` lab validates bilateral allocation, ChannelData,
+deallocation and UDP/TCP/TLS control transports. Its coturn relay address is
+locally reachable; reproducing internet symmetric-NAT routing additionally
+requires coturn `external-ip` to advertise an address reachable from both test
+namespaces or VMs. That deployment boundary is intentionally separate from the
+fully local protocol/lifecycle acceptance tests.
 
 #### P2P Server APIs
 
@@ -322,6 +354,18 @@ curl http://example.com  # Goes through tunnel server
 | `--p2p` | Enable P2P connections | false |
 | `--stun-server` | STUN server address | stun.l.google.com:19302 |
 | `--p2p-fallback` | Fallback to relay if P2P fails | true |
+| `--turn-server` | TURN server `host:port`; enables ICE TURN fallback | - |
+| `--turn-username` | TURN long-term username | - |
+| `--turn-password` | TURN password; prefer `XROK_TURN_PASSWORD` | env/none |
+| `--turn-transport` | TURN control transport: `udp`, `tcp`, or `tls` | udp |
+| `--turn-ca-cert` | Additional CA file for TURN TLS | system roots |
+| `--turn-server-name` | TURN TLS certificate server name | server host |
+| `--turn-insecure` | Disable TURN TLS verification for isolated labs | false |
+| `--turn-channel-bind` | Prefer ChannelData with indication fallback | false |
+| `--turn-timeout` | TURN transaction timeout | 5s |
+| `--turn-refresh-interval` | Allocation/permission refresh interval | derived |
+| `--turn-max-datagram` | Maximum TURN payload bytes | 65046 |
+| `--turn-retransmits` | Bounded UDP transaction retransmits | 3 |
 | `--debug` | Enable debug logging | false |
 
 ### Configuration File
@@ -347,6 +391,15 @@ p2p:
   enabled: true
   stun_server: stun.l.google.com:19302
   fallback: true  # Fallback to relay if P2P fails
+  turn:
+    enabled: true
+    server: turn.example.com:5349
+    username: client-a
+    password: use-a-runtime-secret
+    transport: tls
+    ca_cert: /etc/xrok/turn-ca.pem
+    server_name: turn.example.com
+    channel_bind: true
 
 # Tunnels to create
 tunnels:
@@ -405,6 +458,12 @@ reverse:
 | `p2p.enabled` | Enable P2P connections | No (default: false) |
 | `p2p.stun_server` | STUN server address | No (default: stun.l.google.com:19302) |
 | `p2p.fallback` | Fallback to relay if P2P fails | No (default: true) |
+| `p2p.turn.enabled` | Enable authenticated TURN fallback | No (default: false) |
+| `p2p.turn.server` | TURN control endpoint `host:port` | When TURN enabled |
+| `p2p.turn.username/password` | TURN long-term credentials | When TURN enabled |
+| `p2p.turn.transport` | Control transport: udp/tcp/tls | No (default: udp) |
+| `p2p.turn.ca_cert/server_name` | TURN TLS trust and identity | No |
+| `p2p.turn.channel_bind` | Prefer ChannelData, retaining indication fallback | No |
 | `tunnels` | List of tunnels to create | Yes |
 | `tunnels[].name` | Subdomain name for tunnel | Yes |
 | `tunnels[].target` | Local target address | Yes |

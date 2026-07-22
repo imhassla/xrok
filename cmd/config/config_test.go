@@ -44,6 +44,137 @@ func TestClientConfigRoundTrip(t *testing.T) {
 	}
 }
 
+func TestClientTURNConfigRoundTripAndMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client-turn.yaml")
+	want := DefaultClientConfig()
+	want.Server = "xrok.test"
+	want.P2P.Enabled = true
+	want.P2P.TURN = TURNConfig{
+		Enabled: true, Server: "turn.test:5349", Username: "client-a", Password: "secret",
+		Transport: "tls", CACert: "/run/secrets/turn-ca.pem", ServerName: "turn.test",
+		ChannelBind: true, Timeout: 4 * time.Second, RefreshInterval: 2 * time.Minute,
+		MaxDatagramSize: 32 * 1024, Retransmits: 4,
+	}
+	if err := SaveClientConfig(want, path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadClientConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.P2P.TURN.Transport != "tls" || got.P2P.TURN.CACert != want.P2P.TURN.CACert || !got.P2P.TURN.ChannelBind || got.P2P.TURN.RefreshInterval != 2*time.Minute {
+		t.Fatalf("TURN round trip mismatch: %#v", got.P2P.TURN)
+	}
+	legacy := &ClientConfig{P2P: P2PConfig{Enabled: true, TURN: TURNConfig{Enabled: true}}}
+	MigrateClientConfig(legacy)
+	if legacy.P2P.TURN.Transport != "udp" {
+		t.Fatalf("legacy TURN transport=%q", legacy.P2P.TURN.Transport)
+	}
+}
+
+func TestClientTURNConfigValidation(t *testing.T) {
+	valid := DefaultClientConfig()
+	valid.P2P.Enabled = true
+	valid.P2P.TURN = TURNConfig{Enabled: true, Server: "turn.test:3478", Username: "u", Password: "p", Transport: "udp"}
+	if err := valid.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*ClientConfig){
+		"p2p_disabled": func(c *ClientConfig) { c.P2P.Enabled = false },
+		"server":       func(c *ClientConfig) { c.P2P.TURN.Server = "turn.test" },
+		"credentials":  func(c *ClientConfig) { c.P2P.TURN.Password = "" },
+		"transport":    func(c *ClientConfig) { c.P2P.TURN.Transport = "sctp" },
+		"server_name":  func(c *ClientConfig) { c.P2P.TURN.ServerName = "bad name" },
+		"duration":     func(c *ClientConfig) { c.P2P.TURN.Timeout = -time.Second },
+		"datagram":     func(c *ClientConfig) { c.P2P.TURN.MaxDatagramSize = 65047 },
+		"retransmits":  func(c *ClientConfig) { c.P2P.TURN.Retransmits = 9 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := *valid
+			if valid.P2P.TURN.CACert != "" {
+				t.Fatal("unexpected shared test state")
+			}
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("invalid TURN config accepted")
+			}
+		})
+	}
+}
+
+func TestSavedConfigsContainingCredentialsAreOwnerOnly(t *testing.T) {
+	clientPath := filepath.Join(t.TempDir(), "client.yaml")
+	client := DefaultClientConfig()
+	client.Server = "xrok.test"
+	client.Token = "client-secret"
+	if err := SaveClientConfig(client, clientPath); err != nil {
+		t.Fatal(err)
+	}
+	serverPath := filepath.Join(t.TempDir(), "server.yaml")
+	server := DefaultServerConfig()
+	server.Domain = "xrok.test"
+	server.APIToken = "server-secret"
+	if err := SaveServerConfig(server, serverPath); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{clientPath, serverPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0600 {
+			t.Fatalf("%s mode=%#o, want 0600", path, got)
+		}
+	}
+}
+
+func TestSaveConfigAtomicallyReplacesSymlinkWithoutTouchingTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("do-not-overwrite"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "client.yaml")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	cfg := DefaultClientConfig()
+	cfg.Server = "xrok.test"
+	if err := SaveClientConfig(cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "do-not-overwrite" {
+		t.Fatalf("symlink target changed: %q err=%v", got, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0600 {
+		t.Fatalf("saved config mode=%v", info.Mode())
+	}
+}
+
+func TestServerTelemetryResourceBounds(t *testing.T) {
+	base := DefaultServerConfig()
+	base.Domain = "xrok.test"
+	base.Telemetry.Endpoint = "http://collector:4318"
+	for name, mutate := range map[string]func(*ServerConfig){
+		"queue":   func(c *ServerConfig) { c.Telemetry.QueueSize = 65537 },
+		"batch":   func(c *ServerConfig) { c.Telemetry.BatchSize = 4097 },
+		"retries": func(c *ServerConfig) { c.Telemetry.MaxRetries = 9 },
+		"backoff": func(c *ServerConfig) { c.Telemetry.RetryBackoff = time.Hour },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := *base
+			mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("unsafe telemetry config accepted")
+			}
+		})
+	}
+}
+
 func TestServerClientIdentitiesValidationAndRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "server.yaml")
 	want := DefaultServerConfig()

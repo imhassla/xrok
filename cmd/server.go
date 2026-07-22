@@ -273,6 +273,10 @@ func (t *srvConnectionTimer) observe() {
 
 // RunServer runs the xrok server with the given arguments
 func RunServer(args []string) {
+	runServer(args, nil)
+}
+
+func runServer(args []string, injectedExporter telemetry.Exporter) {
 	var loadedConfig *config.ServerConfig
 	for i, arg := range args {
 		if (arg == "-config" || arg == "--config") && i+1 < len(args) {
@@ -330,23 +334,24 @@ func RunServer(args []string) {
 	if loadedConfig != nil {
 		telemetryConfig = loadedConfig.Telemetry
 	}
-	telemetryConfig, err := telemetryConfigFromEnvironment(telemetryConfig, os.Getenv)
+	telemetryConfig, err := telemetryConfigForServer(telemetryConfig, injectedExporter, os.Getenv)
 	if err != nil {
 		fmt.Printf("Invalid OTLP configuration: %v\n", err)
 		return
 	}
-	runtimeTelemetry, err := newRuntimeTelemetry(telemetryConfig, nil)
-	if err != nil {
-		fmt.Printf("Invalid OTLP configuration: %v\n", err)
-		return
+	telemetryRuntime := runtimeTelemetry{exporter: injectedExporter, timeout: telemetryConfig.ShutdownTimeout}
+	if injectedExporter == nil {
+		telemetryRuntime, err = newRuntimeTelemetry(telemetryConfig, nil)
+		if err != nil {
+			fmt.Printf("Invalid OTLP configuration: %v\n", err)
+			return
+		}
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), telemetryConfig.ShutdownTimeout)
+			_ = telemetryRuntime.drain(ctx)
+			cancel()
+		}()
 	}
-	restoreTelemetry := telemetry.InstallExporter(runtimeTelemetry.exporter)
-	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), telemetryConfig.ShutdownTimeout)
-		_ = runtimeTelemetry.drain(ctx)
-		cancel()
-		restoreTelemetry()
-	}()
 	setupServerLogging()
 
 	if serverDomain == "" {
@@ -377,7 +382,7 @@ func RunServer(args []string) {
 	serverWg.Add(1)
 	go func() {
 		defer serverWg.Done()
-		waitForProxyConnectionTLS(ctx, serverPort)
+		waitForProxyConnectionTLS(ctx, serverPort, telemetryRuntime.exporter)
 	}()
 
 	// Start QUIC listener on port 443 (UDP)
@@ -882,17 +887,20 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	portNoTLS, clientPortTLS := generateServerPorts()
-	ctx, cancel := context.WithCancel(context.Background())
-
 	clientID, allowed := requirePrincipalClient(w, r, regReq.ClientID)
 	if !allowed {
-		cancel()
 		return
 	}
 	if clientID == "" {
 		clientID = uuid.New().String()
 	}
+	if err := bindRegistrationP2PIdentity(clientID, regReq.P2PInfo); err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+
+	portNoTLS, clientPortTLS := generateServerPorts()
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// Clean up existing client if reconnecting (stateless behavior)
 	if existing, exists := legacyClientRegistry.Get(clientID); exists {
@@ -1061,6 +1069,20 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func bindRegistrationP2PIdentity(clientID string, info *p2p.PeerInfo) error {
+	if info == nil {
+		return nil
+	}
+	if info.PeerID == "" {
+		info.PeerID = clientID
+		return nil
+	}
+	if info.PeerID != clientID {
+		return fmt.Errorf("P2P peer identity does not match authenticated client")
+	}
+	return nil
+}
+
 func extractServerClientIDFromHost(host string) string {
 	parts := strings.Split(host, ".")
 	if len(parts) < 2 {
@@ -1085,7 +1107,7 @@ func resolveServerTunnel(deps *ServerDeps, subdomain string) (*serverClientInfo,
 	return client, nil, subdomain
 }
 
-func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
+func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter telemetry.Exporter) {
 	cert, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
 	if err != nil {
 		log.Printf("Failed to load certificate for port %d: %v", proxyPort, err)
@@ -1094,7 +1116,8 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 
 	// Create unified HTTP handler for both registration and proxy
 	deps := serverDepsFromGlobals()
-	handler := telemetry.HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	deps.Exporter = exporter
+	handler := telemetry.HTTPMiddlewareWithExporter(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Propagate runtime-owned dependencies through the request context. This
 		// keeps migrated handlers isolated while legacy endpoints are transitioned.
 		if _, ok := ServerDepsFromContext(r.Context()); !ok {
@@ -1223,7 +1246,7 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int) {
 
 		// Handle the proxy connection with the buffered data
 		go handleHijackedProxyConnection(conn, buf, r, client, tunnelName, basicAuth, customHeaders)
-	}))
+	}), deps.Exporter)
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -2728,14 +2751,14 @@ func handleP2PWebSocket(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		var signal p2p.SignalMessage
-		if err := json.Unmarshal(message, &signal); err != nil {
+		signal, err := p2p.DecodeSignal(message)
+		if err != nil {
 			log.Printf("P2P signal decode error: %v", err)
 			continue
 		}
 
 		// Process and relay signal
-		handleP2PSignalRelay(clientID, &signal)
+		handleP2PSignalRelay(clientID, signal)
 	}
 
 	// Cleanup
@@ -2778,7 +2801,7 @@ func handleP2PSignalRelay(fromClientID string, signal *p2p.SignalMessage) {
 			sendP2PSignalToClient(signal.ToPeer, p2p.NewPeerInfoSignal(fromClientID, fromClient.p2pInfo))
 		}
 
-	case p2p.SignalTypePunch:
+	case p2p.SignalTypePunch, p2p.SignalTypeICEOffer, p2p.SignalTypeICEAnswer, p2p.SignalTypeICECandidate:
 		// Relay punch signal to target
 		sendP2PSignalToClient(signal.ToPeer, signal)
 

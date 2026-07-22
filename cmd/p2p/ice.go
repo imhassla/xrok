@@ -37,15 +37,25 @@ type RelayProvider interface {
 }
 
 type ICEConfig struct {
-	STUNServer      string
-	Relay           RelayProvider
-	GatherTimeout   time.Duration
-	Checker         ConnectivityChecker
-	CheckTimeout    time.Duration
-	ConsentProbe    ConsentProbe
-	ConsentInterval time.Duration
-	ConsentFailures int
-	TickSource      TickSource
+	STUNServer    string
+	Relay         RelayProvider
+	GatherTimeout time.Duration
+	Checker       ConnectivityChecker
+	CheckTimeout  time.Duration
+	// ChecklistTimeout bounds the complete direct phase independently of the
+	// number of candidate pairs. TURN fallback still uses the original parent.
+	ChecklistTimeout time.Duration
+	ConsentProbe     ConsentProbe
+	ConsentInterval  time.Duration
+	ConsentFailures  int
+	TickSource       TickSource
+	// ConsentKey and ConsentSession enable authenticated in-band consent below
+	// the P2P tunnel framing. Both peers derive identical values from their
+	// authenticated signaling sessions.
+	ConsentKey          []byte
+	ConsentSession      string
+	consentSendLabel    string
+	consentReceiveLabel string
 	// DialUDP allows deterministic tests and custom transports. When nil,
 	// net.DialUDP is used.
 	DialUDP func(network string, laddr, raddr *net.UDPAddr) (udpConn, error)
@@ -67,12 +77,19 @@ func NewICEAgent(cfg ICEConfig) *ICEAgent {
 	if cfg.CheckTimeout <= 0 {
 		cfg.CheckTimeout = 3 * time.Second
 	}
+	if cfg.ChecklistTimeout <= 0 {
+		cfg.ChecklistTimeout = 12 * time.Second
+	}
 	if cfg.ConsentInterval <= 0 {
 		cfg.ConsentInterval = 15 * time.Second
 	}
 	if cfg.ConsentFailures <= 0 {
 		cfg.ConsentFailures = 3
 	}
+	if cfg.ConsentProbe == nil && len(cfg.ConsentKey) != 0 && cfg.ConsentSession != "" {
+		cfg.ConsentProbe = RuntimeConsentProbe{}
+	}
+	cfg.ConsentKey = append([]byte(nil), cfg.ConsentKey...)
 	return &ICEAgent{cfg: cfg}
 }
 

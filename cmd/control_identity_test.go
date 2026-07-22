@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"xrok/cmd/config"
+	"xrok/cmd/p2p"
 )
 
 func TestControlIdentityScopesAndClientBinding(t *testing.T) {
@@ -36,6 +37,17 @@ func TestControlIdentityScopesAndClientBinding(t *testing.T) {
 	h(w, req)
 	if w.Code != http.StatusForbidden || called {
 		t.Fatalf("cross-client impersonation accepted: code=%d", w.Code)
+	}
+}
+
+func TestRegistrationBindsP2PIdentityToAuthenticatedClient(t *testing.T) {
+	info := &p2p.PeerInfo{}
+	if err := bindRegistrationP2PIdentity("alice", info); err != nil || info.PeerID != "alice" {
+		t.Fatalf("empty P2P identity was not normalized: info=%#v err=%v", info, err)
+	}
+	poisoned := &p2p.PeerInfo{PeerID: "bob"}
+	if err := bindRegistrationP2PIdentity("alice", poisoned); err == nil {
+		t.Fatal("cross-client P2P identity poisoning accepted")
 	}
 }
 

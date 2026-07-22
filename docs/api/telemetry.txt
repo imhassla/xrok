@@ -1,0 +1,93 @@
+package telemetry // import "xrok/cmd/telemetry"
+
+
+FUNCTIONS
+
+func ContextWithTrace(ctx context.Context, trace string) context.Context
+func ExtractTraceparent(h string) (trace, parent string, ok bool)
+func HTTPMiddleware(next http.Handler) http.Handler
+    HTTPMiddleware preserves the pre-DI middleware API. It propagates trace
+    context but intentionally performs no process-global export. New serving
+    paths should use HTTPMiddlewareWithExporter.
+
+func HTTPMiddlewareWithExporter(next http.Handler, exporter Exporter) http.Handler
+    HTTPMiddlewareWithExporter records one server span into the explicitly
+    supplied exporter. A nil exporter disables recording while preserving trace
+    propagation, which keeps runtimes isolated without process-global state.
+
+func InjectTraceparent(trace, span string) string
+func NewSpanID() string
+func NewTraceID() string
+func TraceFromContext(ctx context.Context) string
+
+TYPES
+
+type AsyncOTLPConfig struct {
+	QueueSize     int
+	BatchSize     int
+	FlushInterval time.Duration
+	ExportTimeout time.Duration
+	MaxRetries    int
+	RetryBackoff  time.Duration
+}
+    AsyncOTLPConfig bounds every resource used by AsyncOTLPExporter. A slow
+    or unavailable collector can therefore never apply backpressure to tunnel
+    request handling or grow memory without limit.
+
+func DefaultAsyncOTLPConfig() AsyncOTLPConfig
+
+type AsyncOTLPExporter struct {
+	// Has unexported fields.
+}
+    AsyncOTLPExporter batches OTLP spans in a bounded in-memory queue. Export is
+    deliberately non-blocking; QueueFull drops are counted rather than delaying
+    the data plane. Close flushes pending spans until its context expires.
+
+func NewAsyncOTLPHTTPExporter(endpoint string, cfg AsyncOTLPConfig) *AsyncOTLPExporter
+
+func (e *AsyncOTLPExporter) Close(ctx context.Context) error
+
+func (e *AsyncOTLPExporter) Export(_ context.Context, span Span)
+
+func (e *AsyncOTLPExporter) Stats() AsyncOTLPStats
+
+type AsyncOTLPStats struct {
+	Accepted      uint64
+	Exported      uint64
+	Dropped       uint64
+	Failed        uint64
+	Retries       uint64
+	Batches       uint64
+	QueueDepth    int
+	QueueCapacity int
+}
+
+type Exporter interface{ Export(context.Context, Span) }
+
+type MemoryExporter struct {
+	Spans []Span
+	// Has unexported fields.
+}
+
+func (e *MemoryExporter) Export(_ context.Context, s Span)
+
+func (e *MemoryExporter) Snapshot() []Span
+
+type OTLPHTTPExporter struct {
+	Endpoint string
+	Client   *http.Client
+}
+    OTLPHTTPExporter exports spans using the OTLP/HTTP JSON protocol. It is
+    intentionally dependency-free so the runtime can emit traces to a local
+    OpenTelemetry Collector without pulling the full SDK into binaries.
+
+func NewOTLPHTTPExporter(endpoint string) *OTLPHTTPExporter
+
+func (e *OTLPHTTPExporter) Export(ctx context.Context, s Span)
+
+type Span struct {
+	TraceID, SpanID, Name string
+	Start, End            time.Time
+	Attributes            map[string]string
+	Status                int
+}

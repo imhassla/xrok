@@ -7,14 +7,10 @@ base_project="${COMPOSE_PROJECT_NAME:-xrok-otel-integration-$$}"
 
 pick_ports() {
   python3 - <<'PY'
-import socket
-sockets = []
-for _ in range(3):
-    s = socket.socket()
-    s.bind(('127.0.0.1', 0))
-    sockets.append(s)
-print(*(s.getsockname()[1] for s in sockets))
-for s in sockets: s.close()
+import random
+# Docker is the allocator of record; compose-up collision retry below is the
+# only authority. Avoid bind-then-release port probes.
+print(*random.sample(range(20000, 50000), 3))
 PY
 }
 
@@ -57,7 +53,8 @@ if [[ "$started" != 1 ]]; then
   exit 1
 fi
 
-endpoint="${XROK_OTLP_INTEGRATION_ENDPOINT:-http://127.0.0.1:$OTEL_HTTP_PORT}"
+custom_endpoint="${XROK_OTLP_INTEGRATION_ENDPOINT:-}"
+endpoint="${custom_endpoint:-http://127.0.0.1:$OTEL_HTTP_PORT}"
 health_url="http://127.0.0.1:$OTEL_HEALTH_PORT/"
 
 for _ in {1..30}; do
@@ -67,6 +64,10 @@ done
 curl -fsS --max-time 2 "$health_url" >/dev/null
 
 (cd "$root_dir" && GOCACHE="${GOCACHE:-/tmp/xrok-go-build}" GOMODCACHE="${GOMODCACHE:-/tmp/xrok-go-mod}" XROK_OTLP_INTEGRATION_ENDPOINT="$endpoint" go test ./cmd -run '^TestServerRuntimeOTLPCollectorIntegration$' -count=1)
+if [[ -n "$custom_endpoint" ]]; then
+  echo "OTLP collector integration: PASS (custom endpoint accepted and runtime drained)"
+  exit 0
+fi
 for _ in {1..20}; do
   if "${c[@]}" logs otel-collector 2>&1 | grep -q '/collector-integration'; then
     echo "OTLP collector integration: PASS"

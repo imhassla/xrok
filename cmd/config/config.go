@@ -2,9 +2,12 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -75,9 +78,30 @@ type ReconnectConfig struct {
 
 // P2PConfig holds P2P settings
 type P2PConfig struct {
-	Enabled    bool   `yaml:"enabled"`
-	StunServer string `yaml:"stun_server,omitempty"`
-	Fallback   bool   `yaml:"fallback"` // Fallback to relay if P2P fails
+	Enabled    bool       `yaml:"enabled"`
+	StunServer string     `yaml:"stun_server,omitempty"`
+	Fallback   bool       `yaml:"fallback"` // Fallback to relay if P2P fails
+	TURN       TURNConfig `yaml:"turn,omitempty"`
+}
+
+// TURNConfig configures the client-side RFC 5766 UDP relay adapter. Transport
+// selects the control connection (udp/tcp/tls); the relayed transport remains
+// UDP. Password should be supplied through a protected config file or runtime
+// secret injection rather than committed to source control.
+type TURNConfig struct {
+	Enabled         bool          `yaml:"enabled"`
+	Server          string        `yaml:"server,omitempty"`
+	Username        string        `yaml:"username,omitempty"`
+	Password        string        `yaml:"password,omitempty"`
+	Transport       string        `yaml:"transport,omitempty"`
+	CACert          string        `yaml:"ca_cert,omitempty"`
+	ServerName      string        `yaml:"server_name,omitempty"`
+	Insecure        bool          `yaml:"insecure,omitempty"`
+	ChannelBind     bool          `yaml:"channel_bind,omitempty"`
+	Timeout         time.Duration `yaml:"timeout,omitempty"`
+	RefreshInterval time.Duration `yaml:"refresh_interval,omitempty"`
+	MaxDatagramSize int           `yaml:"max_datagram_size,omitempty"`
+	Retransmits     int           `yaml:"retransmits,omitempty"`
 }
 
 // ServerConfig represents server configuration
@@ -181,6 +205,9 @@ func MigrateClientConfig(c *ClientConfig) {
 		}
 		c.Version = CurrentVersion
 	}
+	if c.P2P.TURN.Enabled && c.P2P.TURN.Transport == "" {
+		c.P2P.TURN.Transport = "udp"
+	}
 }
 
 // MigrateServerConfig upgrades legacy configs in memory and is idempotent.
@@ -207,6 +234,51 @@ type HealthCheckConfig struct {
 	Enabled  bool          `yaml:"enabled"`
 	Interval time.Duration `yaml:"interval"`
 	Timeout  time.Duration `yaml:"timeout"`
+}
+
+// Validate checks the versioned client settings that can be verified before
+// starting network goroutines. An empty Server remains valid here because CLI
+// flags may supply it after loading the file.
+func (c *ClientConfig) Validate() error {
+	if c.Version > CurrentVersion {
+		return fmt.Errorf("unsupported client config version %d (current %d)", c.Version, CurrentVersion)
+	}
+	turn := c.P2P.TURN
+	if !turn.Enabled {
+		return nil
+	}
+	if !c.P2P.Enabled {
+		return fmt.Errorf("p2p.turn.enabled requires p2p.enabled")
+	}
+	host, portText, err := net.SplitHostPort(turn.Server)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return fmt.Errorf("p2p.turn.server must be a valid host:port")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("p2p.turn.server port must be between 1 and 65535")
+	}
+	if turn.Username == "" || turn.Password == "" {
+		return fmt.Errorf("p2p.turn requires username and password")
+	}
+	switch turn.Transport {
+	case "", "udp", "tcp", "tls":
+	default:
+		return fmt.Errorf("p2p.turn.transport must be udp, tcp, or tls")
+	}
+	if strings.ContainsAny(turn.ServerName, " \t\r\n") {
+		return fmt.Errorf("p2p.turn.server_name is invalid")
+	}
+	if turn.Timeout < 0 || turn.RefreshInterval < 0 {
+		return fmt.Errorf("p2p.turn durations must not be negative")
+	}
+	if turn.MaxDatagramSize < 0 || turn.MaxDatagramSize > 65046 {
+		return fmt.Errorf("p2p.turn.max_datagram_size must be between 0 and 65046")
+	}
+	if turn.Retransmits < 0 || turn.Retransmits > 8 {
+		return fmt.Errorf("p2p.turn.retransmits must be between 0 and 8")
+	}
+	return nil
 }
 
 // Validate checks settings that would otherwise fail only after the runtime
@@ -265,17 +337,20 @@ func (c *ServerConfig) Validate() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
 			return fmt.Errorf("telemetry endpoint must be an http(s) URL with a host and no userinfo")
 		}
-		if t.QueueSize <= 0 {
-			return fmt.Errorf("telemetry queue_size must be positive")
+		if t.QueueSize <= 0 || t.QueueSize > 65536 {
+			return fmt.Errorf("telemetry queue_size must be between 1 and 65536")
 		}
-		if t.BatchSize <= 0 || t.BatchSize > t.QueueSize {
-			return fmt.Errorf("telemetry batch_size must be between 1 and queue_size")
+		if t.BatchSize <= 0 || t.BatchSize > t.QueueSize || t.BatchSize > 4096 {
+			return fmt.Errorf("telemetry batch_size must be between 1 and min(queue_size, 4096)")
 		}
 		if t.FlushInterval <= 0 || t.ExportTimeout <= 0 || t.RetryBackoff <= 0 || t.ShutdownTimeout <= 0 {
 			return fmt.Errorf("telemetry durations must be positive")
 		}
-		if t.MaxRetries < 0 {
-			return fmt.Errorf("telemetry max_retries must not be negative")
+		if t.FlushInterval > time.Hour || t.ExportTimeout > time.Minute || t.RetryBackoff > time.Minute || t.ShutdownTimeout > 10*time.Minute {
+			return fmt.Errorf("telemetry durations exceed safe runtime bounds")
+		}
+		if t.MaxRetries < 0 || t.MaxRetries > 8 {
+			return fmt.Errorf("telemetry max_retries must be between 0 and 8")
 		}
 	}
 	// Empty certificate paths are valid: the server derives the Let's Encrypt
@@ -335,8 +410,8 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 	MigrateClientConfig(cfg)
-	if cfg.Version > CurrentVersion {
-		return nil, fmt.Errorf("unsupported client config version %d (current %d)", cfg.Version, CurrentVersion)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
@@ -355,8 +430,8 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 	MigrateServerConfig(cfg)
-	if cfg.Version > CurrentVersion {
-		return nil, fmt.Errorf("unsupported server config version %d (current %d)", cfg.Version, CurrentVersion)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
@@ -365,8 +440,8 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 // SaveClientConfig saves client configuration to file
 func SaveClientConfig(cfg *ClientConfig, path string) error {
 	MigrateClientConfig(cfg)
-	if cfg.Version > CurrentVersion {
-		return fmt.Errorf("unsupported client config version %d (current %d)", cfg.Version, CurrentVersion)
+	if err := cfg.Validate(); err != nil {
+		return err
 	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -378,7 +453,10 @@ func SaveClientConfig(cfg *ClientConfig, path string) error {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	// Client configs may contain API and TURN credentials. Replace atomically
+	// from an owner-only same-directory file; an existing symlink is replaced,
+	// never followed to its target.
+	if err := writePrivateConfig(path, data); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
@@ -388,8 +466,8 @@ func SaveClientConfig(cfg *ClientConfig, path string) error {
 // SaveServerConfig saves server configuration to file
 func SaveServerConfig(cfg *ServerConfig, path string) error {
 	MigrateServerConfig(cfg)
-	if cfg.Version > CurrentVersion {
-		return fmt.Errorf("unsupported server config version %d (current %d)", cfg.Version, CurrentVersion)
+	if err := cfg.Validate(); err != nil {
+		return err
 	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -401,10 +479,59 @@ func SaveServerConfig(cfg *ServerConfig, path string) error {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	// Server configs can contain API/client tokens and backend credentials.
+	if err := writePrivateConfig(path, data); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
+	return nil
+}
+
+func writePrivateConfig(path string, data []byte) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	closed := false
+	renamed := false
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+		}
+		if !renamed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err = tmp.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	err = tmp.Close()
+	closed = true
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	renamed = true
+	if dirHandle, openErr := os.Open(dir); openErr == nil {
+		syncErr := dirHandle.Sync()
+		closeErr := dirHandle.Close()
+		if syncErr != nil {
+			return syncErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
 	return nil
 }
 
@@ -461,6 +588,26 @@ udp:
 reverse:
   - remote: ":9000"
     local: "localhost:9000"
+
+# Authenticated P2P with optional TURN UDP relay fallback. Prefer injecting
+# the TURN password at runtime instead of committing it to a config file.
+p2p:
+  enabled: false
+  stun_server: stun.example.com:3478
+  fallback: true
+  turn:
+    enabled: false
+    server: turn.example.com:5349
+    username: client-a
+    password: ""
+    transport: tls # udp, tcp, or tls control connection; relay stays UDP
+    ca_cert: /etc/xrok/turn-ca.pem
+    server_name: turn.example.com
+    channel_bind: true
+    timeout: 5s
+    refresh_interval: 4m
+    max_datagram_size: 65046
+    retransmits: 3
 
 # Reconnect settings
 reconnect:

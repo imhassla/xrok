@@ -16,22 +16,26 @@ import (
 // The underlying handlers remain compatible with the existing global registry;
 // lifecycle state is reset for each runtime instance.
 type ServerRuntime struct {
-	cfg              config.ServerConfig
-	mu               sync.Mutex
-	start            bool
-	stop             sync.Once
-	done             chan struct{}
-	run              func([]string)
-	runContext       func(context.Context, []string) error
-	cancel           context.CancelFunc
-	shutdown         chan struct{}
-	legacy           bool
-	runErr           error
-	store            RuntimeStateStore
-	drain            DrainController
-	ha               HAConfig
-	telemetry        runtimeTelemetry
-	restoreTelemetry func()
+	cfg                config.ServerConfig
+	mu                 sync.Mutex
+	start              bool
+	closed             bool
+	stop               sync.Once
+	doneOnce           sync.Once
+	done               chan struct{}
+	run                func([]string)
+	runContext         func(context.Context, []string) error
+	runContextWithDeps func(context.Context, []string, *ServerDeps) error
+	cancel             context.CancelFunc
+	shutdown           chan struct{}
+	legacy             bool
+	runErr             error
+	store              RuntimeStateStore
+	drain              DrainController
+	ha                 HAConfig
+	telemetry          runtimeTelemetry
+	telemetryConfig    config.TelemetryConfig
+	serverDeps         *ServerDeps
 }
 
 func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error) {
@@ -59,30 +63,60 @@ func newServerRuntime(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerR
 			return nil, err
 		}
 	}
-	runtimeTelemetry, err := newRuntimeTelemetry(cfg.Telemetry, deps.TelemetryExporter)
-	if err != nil {
-		return nil, err
+	injectedExporter := deps.TelemetryExporter
+	if injectedExporter == nil && deps.ServerDeps != nil {
+		injectedExporter = deps.ServerDeps.Exporter
 	}
+	var runtimeTelemetry runtimeTelemetry
+	if injectedExporter != nil {
+		runtimeTelemetry, err = newRuntimeTelemetry(cfg.Telemetry, injectedExporter)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Endpoint exporters own a batching goroutine. Construct them only after
+		// Start has acquired the runtime lifecycle, so an unstarted runtime or a
+		// retryable legacy-owner conflict cannot leak that goroutine.
+		if err := validateTelemetryConfig(cfg.Telemetry); err != nil {
+			return nil, err
+		}
+		runtimeTelemetry.timeout = cfg.Telemetry.ShutdownTimeout
+	}
+	serverDeps := deps.ServerDeps
+	if serverDeps == nil {
+		serverDeps = NewServerDeps(cfg.Domain, time.Now(), nil)
+	} else {
+		// Preserve caller-owned registries while keeping per-runtime scalar
+		// dependencies (notably Exporter) independently assignable.
+		copy := *serverDeps
+		serverDeps = &copy
+	}
+	serverDeps.Exporter = runtimeTelemetry.exporter
 	r := &ServerRuntime{
 		cfg: cfg, done: make(chan struct{}), shutdown: make(chan struct{}),
-		ha: ha, store: store, run: RunServer, legacy: true, telemetry: runtimeTelemetry,
+		ha: ha, store: store, legacy: true, telemetry: runtimeTelemetry,
+		telemetryConfig: cfg.Telemetry, serverDeps: serverDeps,
 	}
+	r.run = func(args []string) { runServer(args, r.telemetry.exporter) }
 	return r, nil
 }
 
 // ServerRuntimeDeps allows embedders and tests to inject the serving loop.
-// When Run is nil, the legacy CLI runner is used for backwards compatibility.
+// When no runner is supplied, the legacy CLI runner is used for compatibility.
 type ServerRuntimeDeps struct {
 	Run func([]string)
-	// RunContext is the preferred embeddable runner. It receives a runtime-owned
-	// context which is cancelled by Shutdown. When set, it takes precedence over
-	// Run and never touches the legacy process-global shutdown channel.
-	RunContext   func(context.Context, []string) error
-	Store        RuntimeStateStore
-	StoreFactory StoreFactoryDeps
+	// RunContext is the compatibility embeddable runner. It receives a
+	// runtime-owned context which is cancelled by Shutdown.
+	RunContext func(context.Context, []string) error
+	// RunContextWithDeps is the instance-safe serving hook. Handlers should use
+	// the supplied ServerDeps, including its runtime-owned telemetry exporter.
+	RunContextWithDeps func(context.Context, []string, *ServerDeps) error
+	Store              RuntimeStateStore
+	StoreFactory       StoreFactoryDeps
 	// TelemetryExporter overrides endpoint-based construction for embedders and
 	// tests. Closers implementing Close(context.Context) join graceful drain.
 	TelemetryExporter telemetry.Exporter
+	ServerDeps        *ServerDeps
 }
 
 func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error) {
@@ -90,13 +124,13 @@ func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (
 	if err != nil {
 		return nil, err
 	}
-	r.run = deps.Run
-	r.runContext = deps.RunContext
-	if deps.Run != nil || deps.RunContext != nil {
-		r.legacy = false
+	if deps.Run != nil {
+		r.run = deps.Run
 	}
-	if r.run == nil && r.runContext == nil {
-		r.run = RunServer
+	r.runContext = deps.RunContext
+	r.runContextWithDeps = deps.RunContextWithDeps
+	if deps.Run != nil || deps.RunContext != nil || deps.RunContextWithDeps != nil {
+		r.legacy = false
 	}
 	if deps.Store != nil {
 		r.store = deps.Store
@@ -111,6 +145,10 @@ func (r *ServerRuntime) Start(ctx context.Context) error {
 		return fmt.Errorf("server runtime context is nil")
 	}
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return fmt.Errorf("server runtime is closed")
+	}
 	if r.start {
 		r.mu.Unlock()
 		return fmt.Errorf("server runtime already started")
@@ -118,6 +156,18 @@ func (r *ServerRuntime) Start(ctx context.Context) error {
 	if r.legacy && !acquireLegacyServerRuntime(r) {
 		r.mu.Unlock()
 		return fmt.Errorf("another legacy server runtime is already active")
+	}
+	if r.telemetry.exporter == nil && r.telemetryConfig.Endpoint != "" {
+		runtimeTelemetry, err := newRuntimeTelemetry(r.telemetryConfig, nil)
+		if err != nil {
+			if r.legacy {
+				releaseLegacyServerRuntime(r)
+			}
+			r.mu.Unlock()
+			return err
+		}
+		r.telemetry = runtimeTelemetry
+		r.serverDeps.Exporter = runtimeTelemetry.exporter
 	}
 	r.start = true
 	runCtx, cancel := context.WithCancel(ctx)
@@ -127,9 +177,6 @@ func (r *ServerRuntime) Start(ctx context.Context) error {
 	// fully isolated from it.
 	if r.legacy {
 		serverShutdownChan = r.shutdown
-	}
-	if r.telemetry.exporter != nil {
-		r.restoreTelemetry = telemetry.InstallExporter(r.telemetry.exporter)
 	}
 	r.mu.Unlock()
 
@@ -147,15 +194,20 @@ func (r *ServerRuntime) Start(ctx context.Context) error {
 			// with final request/shutdown spans emitted after cancellation.
 			_ = r.telemetry.drain(drainCtx)
 			cancel()
-			if r.restoreTelemetry != nil {
-				r.restoreTelemetry()
-			}
 			if r.legacy {
 				releaseLegacyServerRuntime(r)
 			}
-			close(r.done)
+			r.mu.Lock()
+			r.closed = true
+			r.mu.Unlock()
+			r.doneOnce.Do(func() { close(r.done) })
 		}()
-		if r.runContext != nil {
+		if r.runContextWithDeps != nil {
+			err := r.runContextWithDeps(runCtx, args, r.serverDeps)
+			r.mu.Lock()
+			r.runErr = err
+			r.mu.Unlock()
+		} else if r.runContext != nil {
 			err := r.runContext(runCtx, args)
 			r.mu.Lock()
 			r.runErr = err
@@ -179,15 +231,26 @@ func (r *ServerRuntime) Shutdown() {
 }
 
 // ShutdownContext stops this runtime only, then runs registered drain hooks.
-// Calling it before Start is a no-op and cannot affect another runtime.
+// Calling it before Start closes runtime-owned resources without affecting
+// another runtime; a shut down runtime cannot subsequently be started.
 func (r *ServerRuntime) ShutdownContext(ctx context.Context) error {
 	if ctx == nil {
 		return fmt.Errorf("server shutdown context is nil")
 	}
 	r.mu.Lock()
 	if !r.start {
+		if r.closed {
+			r.mu.Unlock()
+			return nil
+		}
+		r.closed = true
 		r.mu.Unlock()
-		return nil
+		err := r.drain.Drain(ctx)
+		if telemetryErr := r.telemetry.drain(ctx); err == nil {
+			err = telemetryErr
+		}
+		r.doneOnce.Do(func() { close(r.done) })
+		return err
 	}
 	cancel := r.cancel
 	legacy := r.legacy
@@ -206,6 +269,7 @@ func (r *ServerRuntime) ShutdownContext(ctx context.Context) error {
 
 func (r *ServerRuntime) StateStore() RuntimeStateStore { return r.store }
 func (r *ServerRuntime) HAConfig() HAConfig            { return r.ha }
+func (r *ServerRuntime) ServerDeps() *ServerDeps       { return r.serverDeps }
 func (r *ServerRuntime) AddDrainHook(h DrainHook)      { r.drain.Add(h) }
 
 func (r *ServerRuntime) Wait() { <-r.done }

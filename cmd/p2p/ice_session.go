@@ -196,13 +196,27 @@ func (a *ICEAgent) Connect(ctx context.Context, peerID string, local, remote []C
 
 	var failures []error
 	if a.cfg.Checker != nil {
+		directCtx, cancelDirect := context.WithTimeout(ctx, a.cfg.ChecklistTimeout)
+		defer cancelDirect()
 		checklist := a.Checklist(local, remote)
 		if len(checklist) == 0 {
 			failures = append(failures, fmt.Errorf("ICE checklist has no usable direct candidate pairs"))
 		}
-		for _, pair := range checklist {
+		for index, pair := range checklist {
+			if err := directCtx.Err(); err != nil {
+				failures = append(failures, fmt.Errorf("ICE direct checklist budget exhausted: %w", err))
+				break
+			}
 			pair.State = CandidatePairInProgress
-			checkCtx, cancel := context.WithTimeout(ctx, a.cfg.CheckTimeout)
+			checkTimeout := a.cfg.CheckTimeout
+			if deadline, ok := directCtx.Deadline(); ok {
+				remainingPairs := len(checklist) - index
+				fairShare := time.Until(deadline) / time.Duration(remainingPairs)
+				if fairShare > 0 && fairShare < checkTimeout {
+					checkTimeout = fairShare
+				}
+			}
+			checkCtx, cancel := context.WithTimeout(directCtx, checkTimeout)
 			conn, err := a.cfg.Checker.Check(checkCtx, pair.Local, pair.Remote)
 			cancel()
 			if err == nil && conn == nil {
@@ -243,6 +257,7 @@ func (a *ICEAgent) Connect(ctx context.Context, peerID string, local, remote []C
 
 func (a *ICEAgent) newSession(parent context.Context, pair CandidatePair, conn net.Conn, viaRelay bool) *ICESession {
 	ctx, cancel := context.WithCancel(parent)
+	conn = newDirectionalConsentConn(conn, a.cfg.ConsentKey, a.cfg.ConsentSession, a.cfg.consentSendLabel, a.cfg.consentReceiveLabel)
 	s := &ICESession{pair: pair, conn: conn, viaRelay: viaRelay, cancel: cancel, done: make(chan struct{})}
 	go a.monitorConsent(ctx, s)
 	return s
@@ -268,6 +283,7 @@ func (a *ICEAgent) monitorConsent(ctx context.Context, session *ICESession) {
 			return
 		case _, ok := <-tickChannel:
 			if !ok {
+				session.terminate(fmt.Errorf("ICE consent tick source closed"))
 				return
 			}
 			probeCtx, cancel := context.WithTimeout(ctx, a.cfg.CheckTimeout)

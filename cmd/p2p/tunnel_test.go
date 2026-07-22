@@ -130,3 +130,27 @@ func TestP2PWriteFragmentsPayload(t *testing.T) {
 	}
 	tun.Close()
 }
+
+func TestP2PTunnelRoleStreamIDsAreDisjoint(t *testing.T) {
+	controllingConn, controllingPeer := net.Pipe()
+	defer controllingPeer.Close()
+	controlledConn, controlledPeer := net.Pipe()
+	defer controlledPeer.Close()
+
+	controlling := NewP2PTunnelWithRole(controllingConn, "controlled", "", true)
+	defer controlling.Close()
+	controlled := NewP2PTunnelWithRole(controlledConn, "controlling", "", false)
+	defer controlled.Close()
+
+	even, err := controlling.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	odd, err := controlled.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if even.id%2 != 0 || odd.id%2 != 1 || even.id == odd.id {
+		t.Fatalf("role stream IDs collide: controlling=%d controlled=%d", even.id, odd.id)
+	}
+}

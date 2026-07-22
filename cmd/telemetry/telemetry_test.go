@@ -76,11 +76,22 @@ func TestOTLPHTTPExporter(t *testing.T) {
 		t.Fatal("export timeout")
 	}
 }
+
+func TestOTLPHTTPExporterPreservesSignalPathAndQuery(t *testing.T) {
+	for input, want := range map[string]string{
+		"https://collector.test:4318":                  "https://collector.test:4318/v1/traces",
+		"https://collector.test:4318/":                 "https://collector.test:4318/v1/traces",
+		"https://collector.test/custom?token=redacted": "https://collector.test/custom?token=redacted",
+		"https://collector.test/v1/traces?tenant=a":    "https://collector.test/v1/traces?tenant=a",
+	} {
+		if got := NewOTLPHTTPExporter(input).Endpoint; got != want {
+			t.Fatalf("endpoint %q normalized to %q, want %q", input, got, want)
+		}
+	}
+}
 func TestHTTPMiddlewareExportsAndPropagates(t *testing.T) {
 	e := &MemoryExporter{}
-	SetExporter(e)
-	defer SetExporter(nil)
-	h := HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := HTTPMiddlewareWithExporter(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if TraceFromContext(r.Context()) == "" {
 			t.Error("missing trace context")
 		}
@@ -88,7 +99,7 @@ func TestHTTPMiddlewareExportsAndPropagates(t *testing.T) {
 			t.Error("missing propagation")
 		}
 		w.WriteHeader(201)
-	}))
+	}), e)
 	req := httptest.NewRequest("GET", "http://x/test", nil)
 	req.Header.Set("traceparent", InjectTraceparent(NewTraceID(), NewSpanID()))
 	rr := httptest.NewRecorder()
@@ -101,13 +112,10 @@ func TestHTTPMiddlewareExportsAndPropagates(t *testing.T) {
 
 func TestHTTPMiddlewareRecordsImplicitOKAndFirstStatus(t *testing.T) {
 	e := &MemoryExporter{}
-	SetExporter(e)
-	defer SetExporter(nil)
-
-	h := HTTPMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	h := HTTPMiddlewareWithExporter(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		w.WriteHeader(http.StatusInternalServerError)
-	}))
+	}), e)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "http://x/test", nil))
 	spans := e.Snapshot()
@@ -116,8 +124,7 @@ func TestHTTPMiddlewareRecordsImplicitOKAndFirstStatus(t *testing.T) {
 	}
 
 	e = &MemoryExporter{}
-	SetExporter(e)
-	h = HTTPMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	h = HTTPMiddlewareWithExporter(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), e)
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://x/implicit", nil))
 	spans = e.Snapshot()
 	if len(spans) != 1 || spans[0].Status != http.StatusOK {
@@ -233,23 +240,27 @@ func TestAsyncOTLPRejectsExportAfterClose(t *testing.T) {
 	}
 }
 
-func TestInstallExporterRestoreIsOwnershipAware(t *testing.T) {
-	baseline := &MemoryExporter{}
-	first := &MemoryExporter{}
-	second := &MemoryExporter{}
-	SetExporter(baseline)
-	defer SetExporter(nil)
-	restoreFirst := InstallExporter(first)
-	if currentExporter() != first {
-		t.Fatal("first exporter not installed")
+func TestAsyncOTLPClampsUnsafeEmbedderResourceValues(t *testing.T) {
+	e := newAsyncOTLPExporter(AsyncOTLPConfig{
+		QueueSize: 1 << 30, BatchSize: 1 << 30, FlushInterval: 24 * time.Hour,
+		ExportTimeout: 24 * time.Hour, MaxRetries: 100, RetryBackoff: 24 * time.Hour,
+	}, func(context.Context, []Span) error { return nil })
+	if e.cfg.QueueSize != 65536 || e.cfg.BatchSize != 4096 || e.cfg.FlushInterval != time.Hour ||
+		e.cfg.ExportTimeout != time.Minute || e.cfg.MaxRetries != 8 || e.cfg.RetryBackoff != time.Minute {
+		t.Fatalf("unsafe async config was not clamped: %#v", e.cfg)
 	}
-	restoreSecond := InstallExporter(second)
-	restoreFirst()
-	if currentExporter() != second {
-		t.Fatal("stale lease overwrote current exporter")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := e.Close(ctx); err != nil {
+		t.Fatal(err)
 	}
-	restoreSecond()
-	if currentExporter() != first {
-		t.Fatal("second lease did not restore previous exporter")
-	}
+}
+
+func TestHTTPMiddlewareWithNilExporterStillPropagates(t *testing.T) {
+	h := HTTPMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		if TraceFromContext(r.Context()) == "" {
+			t.Fatal("missing trace context")
+		}
+	}))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://x/no-export", nil))
 }

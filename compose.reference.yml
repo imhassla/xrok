@@ -12,25 +12,25 @@ services:
     healthcheck: { test: ["CMD-SHELL", "pg_isready -U xrok -d xrok"], interval: 5s, timeout: 2s, retries: 10 }
   coturn:
     image: coturn/coturn:4.6.3
-    command: ["-n", "--no-cli", "--log-file=stdout", "--listening-port=3478", "--min-port=49160", "--max-port=49200", "--realm=xrok.local", "--lt-cred-mech", "--user=matrix:matrix-pass"]
-    ports: ["3478:3478/udp", "49160-49200:49160-49200/udp"]
+    command: ["-n", "--no-cli", "--log-file=stdout", "--listening-port=3478", "--tls-listening-port=5349", "--cert=/certs/server.pem", "--pkey=/certs/server-key.pem", "--min-port=49160", "--max-port=49200", "--realm=xrok.local", "--lt-cred-mech", "--user=matrix:matrix-pass"]
+    volumes: ["${COTURN_CERT_DIR:-./local-certs}:/certs:ro"]
+    ports: ["${COTURN_UDP_PORT:-3478}:3478/udp", "${COTURN_TCP_PORT:-3478}:3478/tcp", "${COTURN_TLS_PORT:-5349}:5349/tcp", "${COTURN_RELAY_MIN:-49160}-${COTURN_RELAY_MAX:-49200}:49160-49200/udp"]
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.123.0
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes: ["./bench/otel-reference.yaml:/etc/otelcol/config.yaml:ro"]
     ports: ["${OTEL_GRPC_PORT:-4317}:4317", "${OTEL_HTTP_PORT:-4318}:4318", "${OTEL_HEALTH_PORT:-13133}:13133"]
-    healthcheck: { test: ["CMD", "wget", "-qO-", "http://127.0.0.1:13133/"], interval: 5s, timeout: 2s, retries: 10 }
   prometheus:
     image: prom/prometheus:v3.1.0
     command: ["--config.file=/etc/prometheus/prometheus.yml"]
     volumes: ["./bench/prometheus.yml:/etc/prometheus/prometheus.yml:ro", "reference-prometheus:/prometheus"]
-    ports: ["9090:9090"]
+    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
   grafana:
     image: grafana/grafana:11.4.0
     environment: ["GF_AUTH_ANONYMOUS_ENABLED=true", "GF_AUTH_ANONYMOUS_ORG_ROLE=Admin"]
     volumes: ["reference-grafana:/var/lib/grafana", "./bench/grafana/provisioning:/etc/grafana/provisioning:ro"]
-    ports: ["3000:3000"]
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.9.0
-    ports: ["8474:8474", "18080:18080", "18443:18443"]
+    ports: ["${TOXIPROXY_API_PORT:-8474}:8474", "${TOXIPROXY_HTTP_PORT:-18080}:18080", "${TOXIPROXY_TLS_PORT:-18443}:18443"]
 volumes: { reference-redis: {}, reference-postgres: {}, reference-prometheus: {}, reference-grafana: {} }

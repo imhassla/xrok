@@ -1,24 +1,210 @@
 package config // import "xrok/cmd/config"
 
+
+CONSTANTS
+
 const CurrentVersion = 2
+    CurrentVersion is the on-disk configuration schema version.
+
+
+FUNCTIONS
+
 func FindConfigFile(name string) string
+    FindConfigFile looks for config file in standard locations
+
 func GenerateExampleClientConfig() string
+    GenerateExampleClientConfig creates an example client config
+
 func GenerateExampleServerConfig() string
+    GenerateExampleServerConfig creates an example server config
+
 func MigrateClientConfig(c *ClientConfig)
+    MigrateClientConfig upgrades legacy configs in memory and is idempotent.
+
 func MigrateServerConfig(c *ServerConfig)
+    MigrateServerConfig upgrades legacy configs in memory and is idempotent.
+
 func SaveClientConfig(cfg *ClientConfig, path string) error
+    SaveClientConfig saves client configuration to file
+
 func SaveServerConfig(cfg *ServerConfig, path string) error
-type ClientConfig struct{ ... }
-    func DefaultClientConfig() *ClientConfig
-    func LoadClientConfig(path string) (*ClientConfig, error)
-type ClientIdentityConfig struct{ ... }
-type HealthCheckConfig struct{ ... }
-type P2PConfig struct{ ... }
-type ReconnectConfig struct{ ... }
-type ReverseConfig struct{ ... }
-type ServerConfig struct{ ... }
-    func DefaultServerConfig() *ServerConfig
-    func LoadServerConfig(path string) (*ServerConfig, error)
-type TelemetryConfig struct{ ... }
-type TunnelConfig struct{ ... }
-type UDPConfig struct{ ... }
+    SaveServerConfig saves server configuration to file
+
+
+TYPES
+
+type ClientConfig struct {
+	// Version is the schema version. Zero denotes the legacy unversioned format.
+	Version   int               `yaml:"version,omitempty"`
+	Server    string            `yaml:"server"`
+	ID        string            `yaml:"id,omitempty"`
+	Token     string            `yaml:"token,omitempty"`
+	TLS       bool              `yaml:"tls"`
+	Debug     bool              `yaml:"debug"`
+	Quiet     bool              `yaml:"quiet"`
+	Verbose   bool              `yaml:"verbose"`
+	Tunnels   []TunnelConfig    `yaml:"tunnels,omitempty"`
+	Socks5    string            `yaml:"socks5,omitempty"`
+	UDP       []UDPConfig       `yaml:"udp,omitempty"`
+	Reverse   []ReverseConfig   `yaml:"reverse,omitempty"`
+	Reconnect ReconnectConfig   `yaml:"reconnect"`
+	Headers   map[string]string `yaml:"headers,omitempty"`
+	Compress  bool              `yaml:"compress"`
+	LogFile   string            `yaml:"log_file,omitempty"`
+	// Transport protocol: "websocket" (default), "quic"
+	Transport string `yaml:"transport,omitempty"`
+	// ConnectionType is a deprecated alias retained for older examples.
+	ConnectionType string `yaml:"connection_type,omitempty"`
+	// P2P configuration
+	P2P P2PConfig `yaml:"p2p,omitempty"`
+	// HTTP CONNECT proxy for corporate environments
+	HTTPProxy string `yaml:"http_proxy,omitempty"`
+	// mTLS client certificates
+	ClientCert string `yaml:"client_cert,omitempty"`
+	ClientKey  string `yaml:"client_key,omitempty"`
+	CACert     string `yaml:"ca_cert,omitempty"`
+	Insecure   bool   `yaml:"insecure,omitempty"`
+}
+    ClientConfig represents client configuration
+
+func DefaultClientConfig() *ClientConfig
+    DefaultClientConfig returns default client configuration
+
+func LoadClientConfig(path string) (*ClientConfig, error)
+    LoadClientConfig loads client configuration from file
+
+func (c *ClientConfig) Validate() error
+    Validate checks the versioned client settings that can be verified before
+    starting network goroutines. An empty Server remains valid here because CLI
+    flags may supply it after loading the file.
+
+type ClientIdentityConfig struct {
+	ID     string   `yaml:"id"`
+	Token  string   `yaml:"token"`
+	Scopes []string `yaml:"scopes,omitempty"`
+}
+    ClientIdentityConfig binds a credential to one stable client ID and an
+    explicit set of control-plane scopes (for example client or p2p).
+
+type HealthCheckConfig struct {
+	Enabled  bool          `yaml:"enabled"`
+	Interval time.Duration `yaml:"interval"`
+	Timeout  time.Duration `yaml:"timeout"`
+}
+    HealthCheckConfig holds health check settings
+
+type P2PConfig struct {
+	Enabled    bool       `yaml:"enabled"`
+	StunServer string     `yaml:"stun_server,omitempty"`
+	Fallback   bool       `yaml:"fallback"` // Fallback to relay if P2P fails
+	TURN       TURNConfig `yaml:"turn,omitempty"`
+}
+    P2PConfig holds P2P settings
+
+type ReconnectConfig struct {
+	Enabled     bool          `yaml:"enabled"`
+	MaxRetries  int           `yaml:"max_retries"`
+	InitialWait time.Duration `yaml:"initial_wait"`
+	MaxWait     time.Duration `yaml:"max_wait"`
+}
+    ReconnectConfig holds reconnection settings
+
+type ReverseConfig struct {
+	Remote string `yaml:"remote"` // Remote port to listen on
+	Local  string `yaml:"local"`  // Local target to forward to
+}
+    ReverseConfig represents reverse port forwarding
+
+type ServerConfig struct {
+	Version     int    `yaml:"version,omitempty"`
+	Domain      string `yaml:"domain"`
+	TLSCertPath string `yaml:"tls_cert_path,omitempty"`
+	TLSKeyPath  string `yaml:"tls_key_path,omitempty"`
+	Port        int    `yaml:"port"`
+	ProxyPort   int    `yaml:"proxy_port"`
+	MetricsPort int    `yaml:"metrics_port"`
+	Debug       bool   `yaml:"debug"`
+	Quiet       bool   `yaml:"quiet"`
+	Verbose     bool   `yaml:"verbose"`
+	APIToken    string `yaml:"api_token,omitempty"`
+	// ClientIdentities enables per-client control-plane credentials. APIToken is
+	// retained as an administrator/legacy fallback during migration.
+	ClientIdentities []ClientIdentityConfig `yaml:"client_identities,omitempty"`
+	RateLimit        int                    `yaml:"rate_limit"`
+	LogFile          string                 `yaml:"log_file,omitempty"`
+	StateFile        string                 `yaml:"state_file,omitempty"`
+	IPWhitelist      []string               `yaml:"ip_whitelist,omitempty"`
+	RequestLog       bool                   `yaml:"request_log"`
+	Compress         bool                   `yaml:"compress"`
+	HealthCheck      HealthCheckConfig      `yaml:"health_check"`
+	// mTLS: CA certificate for verifying client certificates
+	ClientCAPath string `yaml:"client_ca_path,omitempty"`
+	Insecure     bool   `yaml:"insecure,omitempty"`
+	// StateBackend selects the runtime control-plane store: memory, redis, or postgres.
+	StateBackend  string `yaml:"state_backend,omitempty"`
+	RedisAddr     string `yaml:"redis_addr,omitempty"`
+	RedisPassword string `yaml:"redis_password,omitempty"`
+	PostgresDSN   string `yaml:"postgres_dsn,omitempty"`
+	// Telemetry configures bounded asynchronous OTLP/HTTP trace export. An
+	// empty endpoint keeps export disabled.
+	Telemetry TelemetryConfig `yaml:"telemetry,omitempty"`
+}
+    ServerConfig represents server configuration
+
+func DefaultServerConfig() *ServerConfig
+    DefaultServerConfig returns default server configuration
+
+func LoadServerConfig(path string) (*ServerConfig, error)
+    LoadServerConfig loads server configuration from file
+
+func (c *ServerConfig) Validate() error
+    Validate checks settings that would otherwise fail only after the runtime
+    has started goroutines and opened partial listeners.
+
+type TURNConfig struct {
+	Enabled         bool          `yaml:"enabled"`
+	Server          string        `yaml:"server,omitempty"`
+	Username        string        `yaml:"username,omitempty"`
+	Password        string        `yaml:"password,omitempty"`
+	Transport       string        `yaml:"transport,omitempty"`
+	CACert          string        `yaml:"ca_cert,omitempty"`
+	ServerName      string        `yaml:"server_name,omitempty"`
+	Insecure        bool          `yaml:"insecure,omitempty"`
+	ChannelBind     bool          `yaml:"channel_bind,omitempty"`
+	Timeout         time.Duration `yaml:"timeout,omitempty"`
+	RefreshInterval time.Duration `yaml:"refresh_interval,omitempty"`
+	MaxDatagramSize int           `yaml:"max_datagram_size,omitempty"`
+	Retransmits     int           `yaml:"retransmits,omitempty"`
+}
+    TURNConfig configures the client-side RFC 5766 UDP relay adapter. Transport
+    selects the control connection (udp/tcp/tls); the relayed transport remains
+    UDP. Password should be supplied through a protected config file or runtime
+    secret injection rather than committed to source control.
+
+type TelemetryConfig struct {
+	Endpoint        string        `yaml:"endpoint,omitempty"`
+	QueueSize       int           `yaml:"queue_size,omitempty"`
+	BatchSize       int           `yaml:"batch_size,omitempty"`
+	FlushInterval   time.Duration `yaml:"flush_interval,omitempty"`
+	ExportTimeout   time.Duration `yaml:"export_timeout,omitempty"`
+	MaxRetries      int           `yaml:"max_retries,omitempty"`
+	RetryBackoff    time.Duration `yaml:"retry_backoff,omitempty"`
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout,omitempty"`
+}
+    TelemetryConfig is the versioned server-side trace export contract.
+    Durations use Go/YAML duration syntax, for example "250ms" or "5s".
+
+type TunnelConfig struct {
+	Name               string `yaml:"name"`
+	Target             string `yaml:"target"`
+	BasicAuth          string `yaml:"basic_auth,omitempty"` // user:password
+	Capability         string `yaml:"capability,omitempty"`
+	CapabilityAudience string `yaml:"capability_audience,omitempty"`
+}
+    TunnelConfig represents a tunnel configuration
+
+type UDPConfig struct {
+	Local  string `yaml:"local"`
+	Remote string `yaml:"remote"`
+}
+    UDPConfig represents UDP tunnel configuration

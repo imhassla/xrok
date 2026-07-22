@@ -1,53 +1,371 @@
 package cmd // import "xrok/cmd"
 
+
+FUNCTIONS
+
 func FetchViaP2P(state *clientState, tunnelURL string, req *http.Request) (*http.Response, bool, error)
+    FetchViaP2P attempts to fetch from a tunnel using P2P if available Returns
+    the response, whether P2P was used, and any error
+
 func LegacyServerDepsFallbacks() uint64
+    LegacyServerDepsFallbacks reports how often a handler had to use package
+    globals because no injected ServerDeps were present.
+
 func RunClient(args []string)
+    RunClient runs the xrok client with the given arguments
+
 func RunServer(args []string)
+    RunServer runs the xrok server with the given arguments
+
 func RunStatus(args []string)
+    RunStatus runs the status command
+
 func WithServerDeps(ctx context.Context, deps *ServerDeps) context.Context
-type ClientRegistry struct{ ... }
-    func NewClientRegistry() *ClientRegistry
-type ClientRuntime struct{ ... }
-    func CurrentClientRuntime() *ClientRuntime
-    func NewClientRuntime(l *logger.Logger) *ClientRuntime
-type DrainController struct{ ... }
+
+TYPES
+
+type ClientRegistry struct {
+	// Has unexported fields.
+}
+
+func NewClientRegistry() *ClientRegistry
+
+func (r *ClientRegistry) Delete(id string)
+
+func (r *ClientRegistry) Get(id string) (*serverClientInfo, bool)
+
+func (r *ClientRegistry) Len() int
+
+func (r *ClientRegistry) Put(id string, c *serverClientInfo)
+
+func (r *ClientRegistry) Snapshot() map[string]*serverClientInfo
+
+type ClientRuntime struct {
+	// Has unexported fields.
+}
+    ClientRuntime owns client lifecycle state and synchronization. The CLI keeps
+    a compatibility pointer for legacy handlers, while new code and tests can
+    inject an independent runtime instance without sharing process globals.
+
+func CurrentClientRuntime() *ClientRuntime
+    CurrentClientRuntime exposes the active CLI runtime for embedding and
+    diagnostics. It returns nil until RunClient has initialized the client.
+
+func NewClientRuntime(l *logger.Logger) *ClientRuntime
+
+func (r *ClientRuntime) Close()
+
+func (r *ClientRuntime) Logger() *logger.Logger
+
+func (r *ClientRuntime) State() *clientState
+    State returns a snapshot pointer for read-only inspection. Mutations should
+    use Update to preserve lifecycle synchronization.
+
+func (r *ClientRuntime) Update(fn func(*clientState))
+
+func (r *ClientRuntime) WithContext(parent context.Context) context.Context
+
+type DrainController struct {
+	// Has unexported fields.
+}
+
+func (d *DrainController) Add(h DrainHook)
+
+func (d *DrainController) Drain(ctx context.Context) error
+
 type DrainHook func(context.Context) error
-type HAConfig struct{ ... }
-    func HAConfigFromServerConfig(c config.ServerConfig) (HAConfig, error)
-    func LoadHAConfig(getenv func(string) string) (HAConfig, error)
-type InMemoryStateStore struct{ ... }
-    func NewInMemoryStateStore(max int) *InMemoryStateStore
-type OIDCVerifier struct{ ... }
-    func NewOIDCVerifier(issuer, audience string, client *http.Client, ttl time.Duration) *OIDCVerifier
-type PostgresStateStore struct{ ... }
-    func NewPostgresStateStore(db *sql.DB) *PostgresStateStore
-type ReconnectConfig struct{ ... }
-type RedisStateStore struct{ ... }
-    func NewRedisStateStore(addr string) *RedisStateStore
-type ReverseConfig struct{ ... }
-type ReverseConfigJSON struct{ ... }
-type RouteRegistry struct{ ... }
-    func NewRouteRegistry() *RouteRegistry
-type RuntimeState struct{ ... }
-type RuntimeStateStore interface{ ... }
-    func NewRuntimeStateStore(ctx context.Context, cfg config.ServerConfig, deps StoreFactoryDeps) (RuntimeStateStore, error)
-type SOCKS5Server struct{ ... }
-    func NewSOCKS5Server(addr string, dialFunc func(target string) (net.Conn, error)) (*SOCKS5Server, error)
-type ServerDeps struct{ ... }
-    func NewServerDeps(domain string, start time.Time, logger *log.Logger) *ServerDeps
-    func ServerDepsFromContext(ctx context.Context) (*ServerDeps, bool)
-type ServerReverseConfig struct{ ... }
-type ServerRuntime struct{ ... }
-    func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error)
-    func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error)
-type ServerRuntimeDeps struct{ ... }
-type ServerStatus struct{ ... }
-type ServerTunnelConfig struct{ ... }
-type ServerTunnelInfo struct{ ... }
-type StoreFactoryDeps struct{ ... }
-type TunnelConfig struct{ ... }
-type TunnelInfo struct{ ... }
-type TunnelRoute struct{ ... }
-type TunnelStatus struct{ ... }
-type UDPTunnelConfig struct{ ... }
+
+type HAConfig struct {
+	Backend       string
+	RedisAddr     string
+	RedisPassword string
+	PostgresDSN   string
+}
+    HAConfig describes optional control-plane backends. Keeping this separate
+    from transport configuration makes the local lab explicit and testable.
+    Adapters can consume these endpoints without changing ServerRuntime APIs.
+
+func HAConfigFromServerConfig(c config.ServerConfig) (HAConfig, error)
+    HAConfigFromServerConfig maps versioned configuration into runtime backend
+    settings. Environment variables remain a compatibility fallback for the CLI.
+
+func LoadHAConfig(getenv func(string) string) (HAConfig, error)
+
+type InMemoryStateStore struct {
+	// Has unexported fields.
+}
+    InMemoryStateStore is a bounded HA-ready store for local development and
+    single-process deployments. A future Redis/Postgres adapter can implement
+    RuntimeStateStore without changing handlers.
+
+func NewInMemoryStateStore(max int) *InMemoryStateStore
+
+func (s *InMemoryStateStore) Load(_ context.Context, id string) (RuntimeState, bool, error)
+
+func (s *InMemoryStateStore) Save(_ context.Context, st RuntimeState) error
+
+type OIDCVerifier struct {
+	// Has unexported fields.
+}
+    OIDCVerifier validates RS256 tokens using the issuer's discovery document
+    and JWKS. Keys are cached and transparently refreshed when an unknown kid
+    appears.
+
+func NewOIDCVerifier(issuer, audience string, client *http.Client, ttl time.Duration) *OIDCVerifier
+
+func (v *OIDCVerifier) Verify(ctx context.Context, token string, now time.Time) error
+
+type PostgresStateStore struct {
+	DB    *sql.DB
+	Table string
+}
+
+func NewPostgresStateStore(db *sql.DB) *PostgresStateStore
+
+func (s *PostgresStateStore) EnsureSchema(ctx context.Context) error
+
+func (s *PostgresStateStore) Load(ctx context.Context, id string) (RuntimeState, bool, error)
+
+func (s *PostgresStateStore) Save(ctx context.Context, st RuntimeState) error
+
+type ReconnectConfig struct {
+	Enabled     bool
+	InitialWait time.Duration
+	MaxWait     time.Duration
+	MaxRetries  int // 0 = unlimited
+	Multiplier  float64
+}
+    ReconnectConfig holds configuration for auto-reconnect with exponential
+    backoff
+
+func (r *ReconnectConfig) Backoff(attempt int) time.Duration
+    Backoff calculates the next wait duration with jitter
+
+type RedisStateStore struct {
+	Addr, Password, Prefix string
+	Timeout                time.Duration
+}
+
+func NewRedisStateStore(addr string) *RedisStateStore
+
+func (s *RedisStateStore) Load(ctx context.Context, id string) (RuntimeState, bool, error)
+
+func (s *RedisStateStore) Save(ctx context.Context, st RuntimeState) error
+
+type ReverseConfig struct {
+	Remote string // Remote port to listen on server (e.g., ":9000")
+	Local  string // Local target to forward to (e.g., "localhost:9000")
+}
+    ReverseConfig represents reverse port forwarding configuration
+
+type ReverseConfigJSON struct {
+	Remote string `json:"remote"`
+	Local  string `json:"local"`
+}
+    ReverseConfigJSON is the JSON format for reverse forwarding
+
+type RouteRegistry struct {
+	// Has unexported fields.
+}
+
+func NewRouteRegistry() *RouteRegistry
+
+func (r *RouteRegistry) Delete(name string)
+
+func (r *RouteRegistry) DeleteOwned(name, clientID string) bool
+    DeleteOwned removes a route only when it still belongs to clientID.
+
+func (r *RouteRegistry) Get(name string) (*TunnelRoute, bool)
+
+func (r *RouteRegistry) Put(name string, v *TunnelRoute)
+
+func (r *RouteRegistry) Snapshot() []*TunnelRoute
+
+type RuntimeState struct {
+	ID        string
+	Status    string
+	UpdatedAt time.Time
+}
+    RuntimeState is the small, serializable control-plane state needed by an
+    embedded runtime. It intentionally avoids coupling the runtime to a DB.
+
+type RuntimeStateStore interface {
+	Save(context.Context, RuntimeState) error
+	Load(context.Context, string) (RuntimeState, bool, error)
+}
+
+func NewRuntimeStateStore(ctx context.Context, cfg config.ServerConfig, deps StoreFactoryDeps) (RuntimeStateStore, error)
+
+type SOCKS5Server struct {
+	// Has unexported fields.
+}
+    SOCKS5Server represents a SOCKS5 proxy server
+
+func NewSOCKS5Server(addr string, dialFunc func(target string) (net.Conn, error)) (*SOCKS5Server, error)
+    NewSOCKS5Server creates a new SOCKS5 server
+
+func (s *SOCKS5Server) Close() error
+    Close shuts down the SOCKS5 server
+
+func (s *SOCKS5Server) Serve() error
+    Serve starts accepting SOCKS5 connections
+
+type ServerDeps struct {
+	Clients   *ClientRegistry
+	Routes    *RouteRegistry
+	Logger    *log.Logger
+	Domain    string
+	StartTime time.Time
+	Exporter  telemetry.Exporter
+}
+    ServerDeps contains the mutable services a server handler needs.
+    New handlers should receive this value (directly or through ServerContext)
+    instead of reaching for package globals. The legacy CLI is bridged by
+    serverDepsFromGlobals while it is being migrated incrementally.
+
+func NewServerDeps(domain string, start time.Time, logger *log.Logger) *ServerDeps
+    NewServerDeps constructs an isolated dependency set for an embedded server.
+    Registries are created when omitted, making each runtime independent.
+
+func ServerDepsFromContext(ctx context.Context) (*ServerDeps, bool)
+
+type ServerReverseConfig struct {
+	Remote string `json:"remote"` // Port to listen on server
+	Local  string `json:"local"`  // Local target on client
+}
+    ServerReverseConfig represents reverse forwarding config from client
+
+type ServerRuntime struct {
+	// Has unexported fields.
+}
+    ServerRuntime owns one server process lifecycle. It provides an embeddable
+    API for tests and supervisors while preserving the legacy RunServer CLI.
+    The underlying handlers remain compatible with the existing global registry;
+    lifecycle state is reset for each runtime instance.
+
+func NewServerRuntime(cfg config.ServerConfig) (*ServerRuntime, error)
+
+func NewServerRuntimeWithDeps(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerRuntime, error)
+
+func (r *ServerRuntime) AddDrainHook(h DrainHook)
+
+func (r *ServerRuntime) HAConfig() HAConfig
+
+func (r *ServerRuntime) ServerDeps() *ServerDeps
+
+func (r *ServerRuntime) Shutdown()
+
+func (r *ServerRuntime) ShutdownContext(ctx context.Context) error
+    ShutdownContext stops this runtime only, then runs registered drain hooks.
+    Calling it before Start closes runtime-owned resources without affecting
+    another runtime; a shut down runtime cannot subsequently be started.
+
+func (r *ServerRuntime) Start(ctx context.Context) error
+    Start launches the server asynchronously. Cancellation of ctx requests
+    Shutdown; readiness is reported by the serving implementation, not Start.
+
+func (r *ServerRuntime) StateStore() RuntimeStateStore
+
+func (r *ServerRuntime) Wait()
+
+func (r *ServerRuntime) WaitContext(ctx context.Context) error
+    WaitContext waits for completion without forcing callers to block forever
+    when a serving implementation fails to honor cancellation.
+
+func (r *ServerRuntime) WaitErr() error
+    WaitErr waits for completion and reports an error returned by RunContext.
+
+type ServerRuntimeDeps struct {
+	Run func([]string)
+	// RunContext is the compatibility embeddable runner. It receives a
+	// runtime-owned context which is cancelled by Shutdown.
+	RunContext func(context.Context, []string) error
+	// RunContextWithDeps is the instance-safe serving hook. Handlers should use
+	// the supplied ServerDeps, including its runtime-owned telemetry exporter.
+	RunContextWithDeps func(context.Context, []string, *ServerDeps) error
+	Store              RuntimeStateStore
+	StoreFactory       StoreFactoryDeps
+	// TelemetryExporter overrides endpoint-based construction for embedders and
+	// tests. Closers implementing Close(context.Context) join graceful drain.
+	TelemetryExporter telemetry.Exporter
+	ServerDeps        *ServerDeps
+}
+    ServerRuntimeDeps allows embedders and tests to inject the serving loop.
+    When no runner is supplied, the legacy CLI runner is used for compatibility.
+
+type ServerStatus struct {
+	Status      string         `json:"status"`
+	Uptime      string         `json:"uptime"`
+	Version     string         `json:"version"`
+	Clients     int            `json:"clients"`
+	Connections int            `json:"connections"`
+	BytesSent   int64          `json:"bytes_sent"`
+	BytesRecv   int64          `json:"bytes_received"`
+	Tunnels     []TunnelStatus `json:"tunnels,omitempty"`
+}
+    ServerStatus represents the server status response
+
+type ServerTunnelConfig struct {
+	Name               string `json:"name"`
+	Target             string `json:"target"`
+	BasicAuth          string `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
+	Capability         string `json:"capability,omitempty"`
+	CapabilityAudience string `json:"capability_audience,omitempty"`
+}
+    ServerTunnelConfig represents a tunnel configuration on the server
+
+type ServerTunnelInfo struct {
+	Name   string `json:"name"`
+	Target string `json:"target"`
+	URL    string `json:"url"`
+}
+    ServerTunnelInfo contains server-side tunnel info
+
+type StoreFactoryDeps struct {
+	OpenSQL func(driver, dsn string) (*sql.DB, error)
+}
+    StoreFactoryDeps keeps database driver selection outside xrok. This allows
+    embedders to register the driver they use without imposing dependencies.
+
+type TunnelConfig struct {
+	Name               string `json:"name"`                 // Subdomain name (e.g., "app", "api")
+	Target             string `json:"target"`               // Local target (e.g., "localhost:8080")
+	BasicAuth          string `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
+	Capability         string `json:"capability,omitempty"` // optional capability required by the public route
+	CapabilityAudience string `json:"capability_audience,omitempty"`
+}
+    TunnelConfig represents a single tunnel configuration
+
+type TunnelInfo struct {
+	Name   string `json:"name"`
+	Target string `json:"target"`
+	URL    string `json:"url"`
+}
+    TunnelInfo contains info about a registered tunnel
+
+type TunnelRoute struct {
+	ClientID           string
+	TunnelName         string
+	Target             string
+	BasicAuth          string            // user:password for HTTP Basic Auth
+	Headers            map[string]string // Custom headers to inject
+	Capability         string            // Optional capability token required by route
+	CapabilityAudience string            // JWT audience when capability is an HS256 secret
+}
+    TunnelRoute maps a subdomain to client and tunnel info
+
+type TunnelStatus struct {
+	Name      string `json:"name"`
+	Target    string `json:"target"`
+	URL       string `json:"url"`
+	ClientID  string `json:"client_id"`
+	Connected string `json:"connected"`
+	Requests  int64  `json:"requests"`
+}
+    TunnelStatus represents a tunnel's status
+
+type UDPTunnelConfig struct {
+	LocalAddr  string // Local address to listen on (e.g., ":5353")
+	RemoteAddr string // Remote UDP target (e.g., "8.8.8.8:53")
+}
+    UDPTunnelConfig represents a UDP tunnel configuration
