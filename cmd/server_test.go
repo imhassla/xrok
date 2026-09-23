@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"crypto/x509"
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -70,5 +73,50 @@ func TestServerConfigPathAcceptsBothFlagForms(t *testing.T) {
 	}
 	if _, ok := serverConfigPath([]string{"--", "--config=/e.yaml"}); ok {
 		t.Fatal("config after the -- terminator must be ignored")
+	}
+}
+
+func TestIsUpgradeRequestPreservesWebSocketHandshake(t *testing.T) {
+	ws := httptest.NewRequest(http.MethodGet, "/ws", nil)
+	ws.Header.Set("Connection", "keep-alive, Upgrade")
+	ws.Header.Set("Upgrade", "websocket")
+	if !isUpgradeRequest(ws) {
+		t.Fatal("WebSocket handshake not recognised as an upgrade")
+	}
+	plain := httptest.NewRequest(http.MethodGet, "/", nil)
+	plain.Header.Set("Connection", "keep-alive")
+	if isUpgradeRequest(plain) {
+		t.Fatal("ordinary request treated as an upgrade")
+	}
+	bare := httptest.NewRequest(http.MethodGet, "/", nil)
+	bare.Header.Set("Upgrade", "websocket")
+	if isUpgradeRequest(bare) {
+		t.Fatal("Upgrade without Connection: upgrade must stay single-use")
+	}
+}
+
+func TestControlClientCertRequiredOnlyForControlPlane(t *testing.T) {
+	old := serverClientCA
+	t.Cleanup(func() { serverClientCA = old })
+
+	serverClientCA = ""
+	if !controlClientCertAccepted(httptest.NewRequest(http.MethodGet, "/register_client", nil)) {
+		t.Fatal("control plane rejected while mTLS is disabled")
+	}
+
+	serverClientCA = "/ca.pem"
+	noCert := httptest.NewRequest(http.MethodGet, "https://example.com/register_client", nil)
+	if controlClientCertAccepted(noCert) {
+		t.Fatal("control plane accepted without a verified client certificate")
+	}
+	for _, probe := range []string{"/health", "/ready"} {
+		if !controlClientCertAccepted(httptest.NewRequest(http.MethodGet, "https://example.com"+probe, nil)) {
+			t.Fatalf("%s probe required a client certificate", probe)
+		}
+	}
+	verified := httptest.NewRequest(http.MethodGet, "https://example.com/register_client", nil)
+	verified.TLS.VerifiedChains = [][]*x509.Certificate{{{}}}
+	if !controlClientCertAccepted(verified) {
+		t.Fatal("verified client certificate rejected")
 	}
 }

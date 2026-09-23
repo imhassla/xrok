@@ -1160,6 +1160,10 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 
 		// Check if this is a request to the main domain (registration/control)
 		if host == serverDomain {
+			if !controlClientCertAccepted(r) {
+				http.Error(w, "Client certificate required", http.StatusForbidden)
+				return
+			}
 			// Handle registration and control endpoints
 			switch r.URL.Path {
 			case "/register_client":
@@ -1284,20 +1288,23 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 	}
 
 	// Configure mTLS if client CA is specified
+	// The listener also serves public tunnel visitors, who have no client
+	// certificate. Verify certificates when presented and let the main-domain
+	// router require a verified chain for control-plane endpoints only.
 	if serverClientCA != "" {
 		caCert, err := os.ReadFile(serverClientCA)
 		if err != nil {
 			log.Printf("Failed to load client CA certificate: %v", err)
-		} else {
-			caCertPool := x509.NewCertPool()
-			if caCertPool.AppendCertsFromPEM(caCert) {
-				tlsConfig.ClientCAs = caCertPool
-				tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-				log.Printf("mTLS enabled: client certificates will be verified against %s", serverClientCA)
-			} else {
-				log.Printf("Failed to parse client CA certificate")
-			}
+			return
 		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			log.Printf("Failed to parse client CA certificate %s", serverClientCA)
+			return
+		}
+		tlsConfig.ClientCAs = caCertPool
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+		log.Printf("mTLS enabled: control-plane clients must present a certificate signed by %s", serverClientCA)
 	}
 
 	server := &http.Server{
@@ -1320,6 +1327,15 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 	if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 		log.Printf("HTTPS server error: %v", err)
 	}
+}
+
+// controlClientCertAccepted enforces --client-ca on main-domain requests.
+// Liveness and readiness probes stay reachable without a certificate.
+func controlClientCertAccepted(r *http.Request) bool {
+	if serverClientCA == "" || r.URL.Path == "/health" || r.URL.Path == "/ready" {
+		return true
+	}
+	return r.TLS != nil && len(r.TLS.VerifiedChains) > 0
 }
 
 func serverStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -1431,6 +1447,22 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 	conn.Close()
 }
 
+// isUpgradeRequest reports whether r asks to switch protocols, i.e. carries
+// an Upgrade header and lists "upgrade" among its Connection tokens.
+func isUpgradeRequest(r *http.Request) bool {
+	if r.Header.Get("Upgrade") == "" {
+		return false
+	}
+	for _, value := range r.Header.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // handleHijackedProxyConnection handles a hijacked HTTP connection for proxying
 func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http.Request, client *serverClientInfo, tunnelName string, basicAuth string, customHeaders map[string]string) {
 	defer conn.Close()
@@ -1461,7 +1493,13 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 			reqBuf.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
 		}
 	}
-	reqBuf.WriteString("Connection: close\r\n")
+	// Protocol upgrades (WebSocket) leave HTTP after the 101 response, so no
+	// further request can reuse the socket; keep their Connection token.
+	if isUpgradeRequest(r) {
+		reqBuf.WriteString("Connection: Upgrade\r\n")
+	} else {
+		reqBuf.WriteString("Connection: close\r\n")
+	}
 	reqBuf.WriteString("\r\n")
 
 	// Read any buffered body data

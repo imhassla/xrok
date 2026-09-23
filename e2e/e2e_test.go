@@ -28,6 +28,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func TestHTTPRelayEndToEnd(t *testing.T) {
@@ -88,6 +90,85 @@ func TestHTTPRelayEndToEnd(t *testing.T) {
 	})
 	if responseBody != "method=POST path=/hello body=payload" {
 		t.Fatalf("unexpected tunneled response: %q", responseBody)
+	}
+}
+
+func TestWebSocketRelayEndToEnd(t *testing.T) {
+	t.Parallel()
+	root := repositoryRoot(t)
+	tmp := t.TempDir()
+	caFile, certFile, keyFile := generateTestPKI(t, tmp)
+	binary := filepath.Join(tmp, "xrok")
+	run(t, root, nil, "go", "build", "-o", binary, ".")
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			kind, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if err := conn.WriteMessage(kind, append([]byte("echo:"), msg...)); err != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+	target := strings.TrimPrefix(upstream.URL, "http://")
+	port := freePort(t)
+	token := "e2e-ws-token"
+
+	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
+		"server", "--domain", "localhost", "--port", fmt.Sprint(port),
+		"--tls-cert", certFile, "--tls-key", keyFile,
+		"--state-file", filepath.Join(tmp, "state.dat"),
+		"--log-file", filepath.Join(tmp, "server.log"))
+	defer stopProcess(t, server)
+	tlsClient := newTLSClient(t, caFile)
+	waitFor(t, 20*time.Second, func() bool {
+		resp, err := tlsClient.Get(fmt.Sprintf("https://localhost:%d/health", port))
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	})
+
+	client := startProcess(t, tmp, nil, binary,
+		"client", "--server", "localhost", "--rp", fmt.Sprint(port),
+		"--ca-cert", caFile, "--token", token, "--id", "e2e-ws-client",
+		"--tunnel", "ws:"+target, "--retry-interval", "50ms", "--max-interval", "250ms")
+	defer stopProcess(t, client)
+
+	dialer := websocket.Dialer{TLSClientConfig: tlsClient.Transport.(*http.Transport).TLSClientConfig, HandshakeTimeout: 5 * time.Second}
+	header := http.Header{"Host": []string{"ws.localhost"}}
+	var conn *websocket.Conn
+	waitFor(t, 15*time.Second, func() bool {
+		c, resp, err := dialer.Dial(fmt.Sprintf("wss://localhost:%d/socket", port), header)
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		if err != nil {
+			return false
+		}
+		conn = c
+		return true
+	})
+	defer conn.Close()
+	for _, msg := range []string{"first", "second"} {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
+			t.Fatalf("write %q: %v", msg, err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, got, err := conn.ReadMessage()
+		if err != nil || string(got) != "echo:"+msg {
+			t.Fatalf("websocket echo = %q, %v; want %q", got, err, "echo:"+msg)
+		}
 	}
 }
 
