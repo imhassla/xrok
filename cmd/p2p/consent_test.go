@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"sync/atomic"
 	"time"
 )
 
@@ -446,4 +447,39 @@ func TestConsentControlRenewsDispatcherDeadline(t *testing.T) {
 	}
 	_ = a.Close()
 	_ = b.Close()
+}
+
+// A remote close is delivered by the tunnel's only reader. Answering it with
+// an acknowledged write from that reader would wait for an ack nobody can
+// read and tear down the whole reliable connection.
+func TestRemoteStreamCloseDoesNotStallReliableTunnel(t *testing.T) {
+	rawA, rawB := messagePipe()
+	connA := newDirectionalConsentConn(rawA, []byte("shared-key"), "session", "alice", "bob")
+	connB := newDirectionalConsentConn(rawB, []byte("shared-key"), "session", "bob", "alice")
+	a := NewP2PTunnelWithRole(connA, "bob", "", true)
+	defer a.Close()
+	b := NewP2PTunnelWithRole(connB, "alice", "", false)
+	defer b.Close()
+
+	for i := 0; i < 2; i++ {
+		stream, err := a.OpenStream()
+		if err != nil {
+			t.Fatalf("open stream %d: %v", i, err)
+		}
+		// b has no local proxy, so it closes each incoming stream at once.
+		if _, err := stream.Write([]byte("hello")); err != nil {
+			t.Fatalf("write stream %d: %v", i, err)
+		}
+		deadline := time.Now().Add(time.Second)
+		for atomic.LoadInt32(&stream.closed) == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if atomic.LoadInt32(&stream.closed) == 0 {
+			t.Fatalf("stream %d did not observe the remote close", i)
+		}
+	}
+	time.Sleep((consentDataRetries + 1) * consentDataRetryInterval)
+	if atomic.LoadInt32(&a.closed) != 0 {
+		t.Fatal("reliable tunnel closed after handling a remote stream close")
+	}
 }

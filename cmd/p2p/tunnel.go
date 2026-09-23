@@ -175,7 +175,9 @@ func (t *P2PTunnel) readLoop() {
 			stream.readMu.Unlock()
 
 		case msgTypeClose:
-			stream.Close()
+			// The peer already closed its side. Replying from the read owner
+			// would block reliable connections on an ack only it can read.
+			stream.closeLocal()
 		}
 	}
 }
@@ -324,9 +326,20 @@ func (s *P2PStream) Close() error {
 	if !atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
 		return nil
 	}
-
 	s.writeFrame(msgTypeClose, nil)
+	s.release()
+	return nil
+}
 
+// closeLocal closes the stream without notifying the peer, for closes the
+// peer initiated.
+func (s *P2PStream) closeLocal() {
+	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
+		s.release()
+	}
+}
+
+func (s *P2PStream) release() {
 	s.readMu.Lock()
 	s.readCond.Broadcast()
 	s.readMu.Unlock()
@@ -334,8 +347,6 @@ func (s *P2PStream) Close() error {
 	s.tunnel.streamsMu.Lock()
 	delete(s.tunnel.streams, s.id)
 	s.tunnel.streamsMu.Unlock()
-
-	return nil
 }
 
 // DoHTTPRequest sends an HTTP request over P2P and returns the response
