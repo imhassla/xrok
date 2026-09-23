@@ -106,7 +106,10 @@ type serverClientInfo struct {
 	clientListenerTLS   *http.Server
 	clientListenerNoTLS *http.Server
 	cancelFunc          context.CancelFunc
-	ctx                 context.Context // registration lifetime; nil for restored clients
+	ctx                 context.Context // registration lifetime
+	attachMu            sync.Mutex      // orders data-connection attach against the unattached reaper
+	attached            bool
+	reaped              bool
 	connMutex           sync.Mutex
 	wsConnChans         map[string]chan *websocket.Conn
 	tunnels             []ServerTunnelConfig  // Multiple tunnels per client
@@ -161,7 +164,17 @@ var (
 	serverPortMutex                sync.Mutex
 	serverInactivityTimeout        = 60 * time.Minute
 	serverMaxClientStreams         = 1024
-	serverStartTime                = time.Now()
+	// serverLegacyListeners binds the per-client port (7000+) and allows
+	// non-tls registrations (4000+). Current clients use /mux on the main
+	// port; disable on internet-facing hosts to keep the host's port space
+	// out of client reach.
+	serverLegacyListeners = true
+	// Unauthenticated QUIC connections allowed at once, and how long one
+	// may take to present its registration.
+	serverQUICPendingSlots = make(chan struct{}, 256)
+	serverQUICAuthTimeout  = 10 * time.Second
+	serverStateSaveMu      sync.Mutex
+	serverStartTime        = time.Now()
 
 	serverBasePortNoTLS     = 4000
 	serverBaseClientPortTLS = 7000
@@ -344,6 +357,9 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 		serverClientIdentityPolicy = newControlIdentityPolicy(loadedConfig.ClientIdentities)
 		serverAllowAnonymous = loadedConfig.AllowAnonymous
 		serverAllowPrivateEgress = loadedConfig.AllowPrivateEgress
+		if loadedConfig.LegacyListeners != nil {
+			serverLegacyListeners = *loadedConfig.LegacyListeners
+		}
 		if loadedConfig.ReversePortMin > 0 {
 			serverReversePortMin = loadedConfig.ReversePortMin
 		}
@@ -371,6 +387,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	fs.StringVar(&serverClientCA, "client-ca", serverClientCA, "Path to CA certificate for mTLS client verification")
 	fs.StringVar(&serverPprofAddr, "pprof", serverPprofAddr, "Serve net/http/pprof on this loopback address (e.g. 127.0.0.1:6060)")
 	fs.BoolVar(&serverTrustProxyHeaders, "trust-proxy-headers", serverTrustProxyHeaders, "Key rate limits on X-Forwarded-For/X-Real-IP (only behind a trusted proxy)")
+	fs.BoolVar(&serverLegacyListeners, "legacy-listeners", serverLegacyListeners, "Bind legacy per-client ports (7000+) and allow non-tls registrations (4000+)")
 	fs.BoolVar(&serverAllowAnonymous, "allow-anonymous", serverAllowAnonymous, "Start without authentication (anyone can register and proxy)")
 	fs.BoolVar(&serverAllowPrivateEgress, "allow-private-egress", serverAllowPrivateEgress, "Let SOCKS/UDP streams reach loopback, private and link-local addresses")
 	fs.IntVar(&serverReversePortMin, "reverse-port-min", serverReversePortMin, "Lowest port a client may bind with -R")
@@ -813,25 +830,35 @@ func initServerMetrics() {
 	)
 }
 
-func generateServerPorts() (int, int) {
+// serverLegacyPortSpan bounds each legacy per-client port range so the
+// allocator can never walk into ports of other services on the host.
+const serverLegacyPortSpan = 1000
+
+var errServerPortsExhausted = errors.New("per-client port range exhausted")
+
+func generateServerPorts() (int, int, error) {
 	serverPortMutex.Lock()
 	defer serverPortMutex.Unlock()
 
 	portNoTLS := findServerAvailablePort(serverBasePortNoTLS, 1)
 	clientPortTLS := findServerAvailablePort(serverBaseClientPortTLS, 1)
+	if portNoTLS < 0 || clientPortTLS < 0 {
+		return 0, 0, errServerPortsExhausted
+	}
 
 	serverUsedPorts[portNoTLS] = true
 	serverUsedPorts[clientPortTLS] = true
 
-	return portNoTLS, clientPortTLS
+	return portNoTLS, clientPortTLS, nil
 }
 
 func findServerAvailablePort(basePort, step int) int {
-	for port := basePort; ; port += step {
+	for port := basePort; port < basePort+serverLegacyPortSpan; port += step {
 		if !serverUsedPorts[port] {
 			return port
 		}
 	}
+	return -1
 }
 
 func releaseServerPorts(ports ...int) {
@@ -924,16 +951,28 @@ func reapUnattachedRegistration(ctx context.Context, clientID string, client *se
 		return
 	case <-time.After(serverAttachTimeout):
 	}
-	client.muxSessionMutex.Lock()
-	hasMux := client.muxSession != nil
-	client.muxSessionMutex.Unlock()
-	client.connMutex.Lock()
-	hasQUIC := client.quicConn != nil
-	client.connMutex.Unlock()
-	if !hasMux && !hasQUIC {
+	client.attachMu.Lock()
+	reap := !client.attached
+	client.reaped = reap
+	client.attachMu.Unlock()
+	if reap {
 		log.Printf("Client %s registered but never connected within %s, releasing", clientID, serverAttachTimeout)
 		closeServerClientConnections(clientID, client)
 	}
+}
+
+// claimServerAttach marks a registration as having a live data connection.
+// It fails once the unattached reaper (or any teardown) has expired the
+// registration, so a late mux/QUIC connection cannot revive a registration
+// whose routes are already gone.
+func claimServerAttach(client *serverClientInfo) bool {
+	client.attachMu.Lock()
+	defer client.attachMu.Unlock()
+	if client.reaped || (client.ctx != nil && client.ctx.Err() != nil) {
+		return false
+	}
+	client.attached = true
+	return true
 }
 
 // monitorServerClientActivity reaps registrations without traffic. It exits
@@ -1028,7 +1067,15 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	regReq.Reverse = reverse
 
-	portNoTLS, clientPortTLS := generateServerPorts()
+	if regReq.ConnectionType == "non-tls" && !serverLegacyListeners {
+		http.Error(w, "non-tls connections are disabled on this server", http.StatusForbidden)
+		return
+	}
+	portNoTLS, clientPortTLS, err := generateServerPorts()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	serverClientLifecycleMu.Lock()
@@ -1076,6 +1123,9 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 				serverClientLifecycleMu.Unlock()
 				http.Error(w, fmt.Sprintf("Subdomain '%s' already in use by another client", name), http.StatusConflict)
 				cancel()
+				// Without this every refused registration leaked its two
+				// port numbers and walked the allocator forward.
+				releaseServerPorts(portNoTLS, clientPortTLS)
 				return
 			}
 
@@ -1145,11 +1195,13 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Started reverse listener on %s -> client local %s for client %s", rc.Remote, rc.Local, clientID)
 	}
 
-	serverWg.Add(1)
-	go func() {
-		defer serverWg.Done()
-		waitForServerClientConnection(ctx, client, client.ClientPortTLS, true, clientID)
-	}()
+	if serverLegacyListeners {
+		serverWg.Add(1)
+		go func() {
+			defer serverWg.Done()
+			waitForServerClientConnection(ctx, client, client.ClientPortTLS, true, clientID)
+		}()
+	}
 
 	switch regReq.ConnectionType {
 	case "tls":
@@ -1511,13 +1563,34 @@ func waitForQUICConnections(ctx context.Context, port int) {
 			continue
 		}
 		backoff.reset()
+		select {
+		case serverQUICPendingSlots <- struct{}{}:
+		default:
+			log.Printf("QUIC: too many unauthenticated connections, dropping %s", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
 		go handleQUICServerConnection(ctx, conn.(*transport.QUICConn))
 	}
 }
 
 func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
-	// Accept first stream for registration
-	stream, err := conn.AcceptStream(ctx)
+	// The slot taken by the accept loop bounds unauthenticated connections;
+	// it is returned once the peer authenticated or was dropped.
+	pending := true
+	releasePending := func() {
+		if pending {
+			pending = false
+			<-serverQUICPendingSlots
+		}
+	}
+	defer releasePending()
+
+	// Accept first stream for registration. Keepalives keep an idle peer
+	// alive forever, so the wait for its first stream must be bounded.
+	authCtx, authCancel := context.WithTimeout(ctx, serverQUICAuthTimeout)
+	stream, err := conn.AcceptStream(authCtx)
+	authCancel()
 	if err != nil {
 		conn.Close()
 		return
@@ -1552,6 +1625,12 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 		return
 	}
 
+	if !claimServerAttach(client) {
+		log.Printf("QUIC: registration for client %s already expired", clientID)
+		conn.Close()
+		return
+	}
+	releasePending()
 	client.connMutex.Lock()
 	client.quicConn = conn
 	client.connMutex.Unlock()
@@ -1575,15 +1654,18 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 	conn.Close()
 
 	client.connMutex.Lock()
-	if client.quicConn == conn {
+	current := client.quicConn == conn
+	if current {
 		client.quicConn = nil
 	}
 	client.connMutex.Unlock()
 
 	// Like a closed mux session: free the subdomains and ports right away
 	// instead of holding them for the inactivity timeout (a reconnecting
-	// client without a fixed --id was refused with 409 meanwhile).
-	if peerGone {
+	// client without a fixed --id was refused with 409 meanwhile). A
+	// connection already replaced by a newer one must not tear down the
+	// registration its successor is using.
+	if peerGone && current {
 		closeServerClientConnections(clientID, client)
 		log.Printf("QUIC connection closed for client %s, resources released", clientID)
 	}
@@ -1708,9 +1790,27 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 		if strings.EqualFold(key, "Connection") || strings.EqualFold(key, "Proxy-Connection") {
 			continue
 		}
+		// Forwarding headers are set by the server below; visitor-supplied
+		// values must not be passed off as the server's.
+		switch http.CanonicalHeaderKey(key) {
+		case "X-Forwarded-For", "X-Real-Ip", "X-Forwarded-Proto", "X-Forwarded-Host":
+			continue
+		}
 		for _, value := range values {
 			reqBuf.WriteString(fmt.Sprintf("%s: %s\r\n", key, value))
 		}
+	}
+	// Tell the app who the visitor is. The visitor IP is appended to any
+	// existing X-Forwarded-For chain; only its last element is trustworthy.
+	xff := clientIP
+	if prior := r.Header.Values("X-Forwarded-For"); len(prior) > 0 {
+		xff = strings.Join(prior, ", ") + ", " + clientIP
+	}
+	reqBuf.WriteString("X-Forwarded-For: " + xff + "\r\n")
+	reqBuf.WriteString("X-Real-IP: " + clientIP + "\r\n")
+	reqBuf.WriteString("X-Forwarded-Proto: https\r\n")
+	if r.Host != "" {
+		reqBuf.WriteString("X-Forwarded-Host: " + r.Host + "\r\n")
 	}
 	// Protocol upgrades (WebSocket) leave HTTP after the 101 response, so no
 	// further request can reuse the socket; keep their Connection token.
@@ -1865,7 +1965,21 @@ func startReverseListener(ctx context.Context, client *serverClientInfo, remoteA
 		remoteAddr = ":" + remoteAddr
 	}
 
-	listener, err := net.Listen("tcp", remoteAddr)
+	// The previous registration of a reconnecting client releases this port
+	// asynchronously; retry briefly instead of failing the bind for good.
+	var listener net.Listener
+	var err error
+	for attempt := 0; ; attempt++ {
+		listener, err = net.Listen("tcp", remoteAddr)
+		if err == nil || !errors.Is(err, syscall.EADDRINUSE) || attempt >= 50 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 	if err != nil {
 		log.Printf("Failed to start reverse listener on %s: %v", remoteAddr, err)
 		return
@@ -2603,6 +2717,10 @@ func waitForServerClientConnection(ctx context.Context, client *serverClientInfo
 }
 
 func saveServerState() {
+	// Registrations save concurrently; the snapshot+write+rename must not
+	// interleave on the shared temp file.
+	serverStateSaveMu.Lock()
+	defer serverStateSaveMu.Unlock()
 	state := struct {
 		Clients   map[string]serializableClientInfoForSave
 		UsedPorts map[int]bool
@@ -2695,12 +2813,18 @@ func loadServerState() {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		client.cancelFunc = cancel
+		client.ctx = ctx
 
-		serverWg.Add(1)
-		go func(ctx context.Context, client *serverClientInfo, id string) {
-			defer serverWg.Done()
-			waitForServerClientConnection(ctx, client, client.ClientPortTLS, true, id)
-		}(ctx, client, id)
+		if serverLegacyListeners {
+			serverWg.Add(1)
+			go func(ctx context.Context, client *serverClientInfo, id string) {
+				defer serverWg.Done()
+				waitForServerClientConnection(ctx, client, client.ClientPortTLS, true, id)
+			}(ctx, client, id)
+		}
+		// A restored registration whose client never comes back must not
+		// keep its subdomains.
+		go reapUnattachedRegistration(ctx, id, client)
 
 		if client.ConnectionType == "non-tls" {
 			serverWg.Add(1)
@@ -2789,9 +2913,27 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !claimServerAttach(client) {
+		log.Printf("Mux: registration for client %s already expired", clientID)
+		session.Close()
+		return
+	}
 	client.muxSessionMutex.Lock()
 	client.muxSession = session
 	client.muxSessionMutex.Unlock()
+
+	// Whatever ends the registration (replacement, reaper, inactivity,
+	// shutdown) also ends its session, so the client notices and
+	// re-registers instead of holding a session whose routes are gone.
+	if client.ctx != nil {
+		go func() {
+			select {
+			case <-client.ctx.Done():
+				session.Close()
+			case <-session.CloseChan():
+			}
+		}()
+	}
 
 	log.Printf("Yamux session established for client %s", clientID)
 
@@ -2824,8 +2966,17 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	<-session.CloseChan()
 
 	client.muxSessionMutex.Lock()
-	client.muxSession = nil
+	current := client.muxSession == session
+	if current {
+		client.muxSession = nil
+	}
 	client.muxSessionMutex.Unlock()
+	if !current {
+		// A newer session of the same registration took over; it owns
+		// the routes and ports now.
+		log.Printf("Superseded yamux session closed for client %s", clientID)
+		return
+	}
 
 	// Release this registration's routes, entry and ports (stateless
 	// behaviour) unless a re-registration already replaced it. Cancel the

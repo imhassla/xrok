@@ -16,6 +16,10 @@ reverse_max_per_client: 5
 # SOCKS/UDP never reach loopback/private/metadata/host addresses.
 allow_private_egress: false
 
+# No legacy per-client listeners (7000+/4000+): current clients only use
+# the main port, and those ports would otherwise walk the host's port space.
+legacy_listeners: false
+
 rate_limit: 20
 state_file: /var/lib/xrok/state.dat
 log_file: /var/log/xrok/server.log

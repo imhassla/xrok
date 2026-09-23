@@ -137,8 +137,12 @@ func relayEgress(stream, target net.Conn, idle time.Duration) {
 	}
 	done := make(chan struct{}, 2)
 	pipe := func(dst net.Conn, src io.Reader) {
-		io.Copy(dst, src)
-		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+		// io.Copy returns nil on a clean EOF: only then half-close so the
+		// other direction can finish. A reset/closed session is an error and
+		// tears both sides down at once instead of waiting for the idle timer.
+		if _, err := io.Copy(dst, src); err != nil {
+			closeAll()
+		} else if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		} else {
 			dst.Close()

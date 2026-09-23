@@ -922,7 +922,14 @@ func RunClient(args []string) {
 
 	wg.Wait()
 
+	// Close the data connection explicitly before exiting: the session
+	// goroutines that would close it may not run before the process ends,
+	// and without a QUIC CONNECTION_CLOSE the server keeps this client's
+	// subdomains until its idle timeout.
 	clientStateMutex.Lock()
+	if state.QUICConn != nil {
+		state.QUICConn.Close()
+	}
 	clientState_ = nil
 	clientStateMutex.Unlock()
 
@@ -968,6 +975,11 @@ func setupClientLogging() {
 // loadClientConfigFile loads client configuration from a YAML file
 // defaultClientConfigPath returns $XROK_CONFIG, else ~/.xrok/config.yaml when
 // it exists, else "".
+// serverAuthority is host:port for URLs, bracketing IPv6 literals.
+func serverAuthority(host string, port int) string {
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
 func defaultClientConfigPath() string {
 	if p := os.Getenv("XROK_CONFIG"); p != "" {
 		return p
@@ -1136,7 +1148,7 @@ func startLocalProxy(ctx context.Context, localAddr string, wg *sync.WaitGroup) 
 				http.Error(w, "Hijacking unsupported", http.StatusInternalServerError)
 				return
 			}
-			clientConn, _, err := hijacker.Hijack()
+			clientConn, clientBuf, err := hijacker.Hijack()
 			if err != nil {
 				proxyConn.Close()
 				return
@@ -1146,7 +1158,9 @@ func startLocalProxy(ctx context.Context, localAddr string, wg *sync.WaitGroup) 
 				defer clientConn.Close()
 				defer proxyConn.Close()
 				done := make(chan struct{}, 2)
-				go func() { _, _ = io.Copy(proxyConn, clientConn); done <- struct{}{} }()
+				// Read through the hijack buffer: bytes sent right after the
+				// CONNECT headers may already sit in it.
+				go func() { _, _ = io.Copy(proxyConn, clientBuf); done <- struct{}{} }()
 				go func() { _, _ = io.Copy(clientConn, proxyConn); done <- struct{}{} }()
 				<-done
 			}()
@@ -1235,7 +1249,7 @@ func registerClient(state *clientState, token string) bool {
 
 	log.Printf("Registering client at %s with connection type %s, %d tunnel(s)", state.ServerAddr, connectionType, len(state.Tunnels))
 
-	fullURL := fmt.Sprintf("https://%s:%d/register_client", state.ServerAddr, clientRp)
+	fullURL := "https://" + serverAuthority(state.ServerAddr, clientRp) + "/register_client"
 
 	// Build reverse configs for JSON
 	var reverseConfigs []ReverseConfigJSON
@@ -1413,7 +1427,10 @@ func runWithReconnect(ctx context.Context, state *clientState, token string, wg 
 		}
 
 		sessionCtx, sessionCancel := context.WithCancel(ctx)
-		disconnected := make(chan struct{})
+		// Buffered: the session goroutines signal with a non-blocking send,
+		// which was lost if it fired before this loop reached its receive
+		// (e.g. an immediate QUIC failure), leaving the client stuck.
+		disconnected := make(chan struct{}, 1)
 
 		if state.UseQUIC {
 			go func() {
@@ -1666,7 +1683,7 @@ func connectMuxWithDisconnect(ctx context.Context, state *clientState, disconnec
 	scheme := "wss"
 	u := url.URL{
 		Scheme:   scheme,
-		Host:     fmt.Sprintf("%s:%d", state.ServerAddr, clientRp),
+		Host:     serverAuthority(state.ServerAddr, clientRp),
 		Path:     "/mux",
 		RawQuery: url.Values{"clientID": {clientID}}.Encode(),
 	}
@@ -1916,7 +1933,7 @@ func connectAndForwardSession(ctx context.Context, state *clientState) {
 	)
 
 	scheme := "wss"
-	u := url.URL{Scheme: scheme, Host: fmt.Sprintf("%s:%d", state.ServerAddr, clientRp), Path: "/client_ws"}
+	u := url.URL{Scheme: scheme, Host: serverAuthority(state.ServerAddr, clientRp), Path: "/client_ws"}
 
 	select {
 	case <-ctx.Done():
@@ -2009,7 +2026,7 @@ func establishNewWebSocketConnection(ctx context.Context, state *clientState, co
 
 	wsURL := url.URL{
 		Scheme: scheme,
-		Host:   fmt.Sprintf("%s:%s", state.ServerAddr, state.ClientPort),
+		Host:   net.JoinHostPort(state.ServerAddr, state.ClientPort),
 		Path:   "/client_ws",
 		RawQuery: url.Values{
 			"connectionID": {connectionID},
@@ -2218,7 +2235,7 @@ func runStdioMode(state *clientState, token string) {
 
 	u := url.URL{
 		Scheme:   scheme,
-		Host:     fmt.Sprintf("%s:%d", state.ServerAddr, clientRp),
+		Host:     serverAuthority(state.ServerAddr, clientRp),
 		Path:     "/mux",
 		RawQuery: url.Values{"clientID": {clientID}}.Encode(),
 	}
@@ -2436,7 +2453,7 @@ func connectP2PSignaling(ctx context.Context, state *clientState) {
 		return
 	}
 
-	wsURL := fmt.Sprintf("wss://%s:%d/p2p/ws?client_id=%s", state.ServerAddr, clientRp, clientID)
+	wsURL := fmt.Sprintf("wss://%s/p2p/ws?client_id=%s", serverAuthority(state.ServerAddr, clientRp), url.QueryEscape(clientID))
 
 	dialer := websocket.Dialer{
 		TLSClientConfig: state.TLSConfig,

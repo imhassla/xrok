@@ -129,6 +129,9 @@ type ServerConfig struct {
 	// AllowPrivateEgress lets SOCKS/UDP streams reach loopback, private,
 	// link-local (cloud metadata) and the host's own addresses.
 	AllowPrivateEgress bool `yaml:"allow_private_egress,omitempty"`
+	// LegacyListeners binds per-client ports (7000+) and allows non-tls
+	// registrations (4000+). Nil keeps the default (enabled).
+	LegacyListeners *bool `yaml:"legacy_listeners,omitempty"`
 	// Reverse (-R) listener policy; zero values keep the defaults.
 	ReversePortMin      int               `yaml:"reverse_port_min,omitempty"`
 	ReversePortMax      int               `yaml:"reverse_port_max,omitempty"`
