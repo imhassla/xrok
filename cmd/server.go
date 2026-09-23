@@ -802,11 +802,12 @@ func releaseServerPorts(ports ...int) {
 // session cannot interleave with its successor's registration.
 var serverClientLifecycleMu sync.Mutex
 
-// forgetServerClient removes client's registry entry and routes and releases
-// its ports, but only while it is still the registered instance for clientID.
-// After a re-registration the old session closes late; its successor owns the
-// ID, routes and possibly the same ports, so the stale teardown must not
-// touch them.
+// forgetServerClient removes client's registry entry and routes, but only
+// while it is still the registered instance for clientID, and reports whether
+// it was. After a re-registration the old session closes late; its successor
+// owns the ID, routes and possibly the same ports, so a stale teardown must
+// not touch them. Callers release the ports only when this returns true, and
+// only after the listeners bound to them are closed.
 func forgetServerClient(clientID string, client *serverClientInfo) bool {
 	serverClientLifecycleMu.Lock()
 	defer serverClientLifecycleMu.Unlock()
@@ -817,7 +818,6 @@ func forgetServerClient(clientID string, client *serverClientInfo) bool {
 		legacyRouteRegistry.DeleteOwned(t.Name, clientID)
 	}
 	legacyClientRegistry.Delete(clientID)
-	releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
 	return true
 }
 
@@ -827,7 +827,7 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 		srvActiveClients.Dec()
 	})
 
-	forgetServerClient(clientID, client)
+	current := forgetServerClient(clientID, client)
 
 	client.muxSessionMutex.Lock()
 	if client.muxSession != nil {
@@ -862,6 +862,9 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 		client.cancelFunc()
 	}
 
+	if current {
+		releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
+	}
 	if serverDebug {
 		log.Printf("Resources released for client %s", clientID)
 	}
@@ -1475,6 +1478,30 @@ func isUpgradeRequest(r *http.Request) bool {
 	return false
 }
 
+// relayUpgradeResponse forwards the upstream answer to an upgrade request and
+// reports whether the socket may become a raw bidirectional pipe. Only a 101
+// leaves HTTP; any other answer is relayed with Connection: close, because a
+// reusable socket would carry later requests past Basic Auth, capability
+// checks and header injection.
+func relayUpgradeResponse(conn net.Conn, upstream io.Reader, r *http.Request) bool {
+	var raw bytes.Buffer
+	br := bufio.NewReader(io.TeeReader(upstream, &raw))
+	resp, err := http.ReadResponse(br, r)
+	if err != nil {
+		return false
+	}
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		// raw holds the head plus anything read past it; later bytes are
+		// copied straight from upstream.
+		_, err := conn.Write(raw.Bytes())
+		return err == nil
+	}
+	defer resp.Body.Close()
+	resp.Close = true
+	_ = resp.Write(conn)
+	return false
+}
+
 // handleHijackedProxyConnection handles a hijacked HTTP connection for proxying
 func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http.Request, client *serverClientInfo, tunnelName string, basicAuth string, customHeaders map[string]string) {
 	defer conn.Close()
@@ -1586,6 +1613,10 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 			srvBytesSent.Add(float64(len(initialData)))
 		}
 
+		if isUpgradeRequest(r) && !relayUpgradeResponse(conn, stream, r) {
+			stream.Close()
+			return
+		}
 		handleMuxProxyConnection(conn, stream, client)
 		return
 	}
@@ -1629,6 +1660,10 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 			srvBytesSent.Add(float64(len(initialData)))
 		}
 
+		if isUpgradeRequest(r) && !relayUpgradeResponse(conn, stream, r) {
+			(*stream).Close()
+			return
+		}
 		handleQUICProxyConnection(conn, stream, client)
 		return
 	}
@@ -2579,7 +2614,9 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Release this registration's routes, entry and ports (stateless
 	// behaviour) unless a re-registration already replaced it.
-	forgetServerClient(clientID, client)
+	if forgetServerClient(clientID, client) {
+		releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
+	}
 
 	client.decrementOnce.Do(func() {
 		srvActiveClients.Dec()

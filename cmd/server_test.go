@@ -3,6 +3,8 @@ package cmd
 import (
 	"crypto/x509"
 	"encoding/base64"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -161,5 +163,32 @@ func TestStaleSessionTeardownKeepsReRegisteredClient(t *testing.T) {
 	}
 	if _, ok := legacyRouteRegistry.Get("app"); ok {
 		t.Fatal("current client's route survived its teardown")
+	}
+}
+
+func TestRelayUpgradeResponseOnlyPipesAfterSwitchingProtocols(t *testing.T) {
+	relay := func(upstream string) (bool, string) {
+		server, visitor := net.Pipe()
+		req := httptest.NewRequest(http.MethodGet, "/ws", nil)
+		result := make(chan bool, 1)
+		go func() {
+			result <- relayUpgradeResponse(server, strings.NewReader(upstream), req)
+			server.Close()
+		}()
+		got, _ := io.ReadAll(visitor)
+		return <-result, string(got)
+	}
+
+	switched := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nframe"
+	if ok, got := relay(switched); !ok || got != switched {
+		t.Fatalf("101 relay = %v %q; want verbatim head and early frame", ok, got)
+	}
+
+	ok, got := relay("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+	if ok {
+		t.Fatal("non-101 answer left the socket reusable")
+	}
+	if !strings.Contains(got, "200 OK") || !strings.Contains(got, "Connection: close") || !strings.HasSuffix(got, "ok") {
+		t.Fatalf("non-101 answer not relayed as a closing response: %q", got)
 	}
 }

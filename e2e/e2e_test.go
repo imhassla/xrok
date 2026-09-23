@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -102,7 +104,14 @@ func TestWebSocketRelayEndToEnd(t *testing.T) {
 	run(t, root, nil, "go", "build", "-o", binary, ".")
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var plainRequests atomic.Int32
 	upstream := newIPv4TestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/plain" {
+			// Ignores the upgrade and answers on a keep-alive connection.
+			plainRequests.Add(1)
+			_, _ = io.WriteString(w, "plain")
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -169,6 +178,36 @@ func TestWebSocketRelayEndToEnd(t *testing.T) {
 		if err != nil || string(got) != "echo:"+msg {
 			t.Fatalf("websocket echo = %q, %v; want %q", got, err, "echo:"+msg)
 		}
+	}
+
+	// A refused upgrade must not leave a raw pipe that later requests could
+	// use to skip the proxy's per-request policy.
+	raw, err := tls.Dial("tcp", fmt.Sprintf("localhost:%d", port), tlsClient.Transport.(*http.Transport).TLSClientConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
+	upgrade := "GET /plain HTTP/1.1\r\nHost: ws.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+	if _, err := io.WriteString(raw, upgrade); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("refused upgrade response: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "plain" || !resp.Close {
+		t.Fatalf("refused upgrade relayed as %d %q close=%v", resp.StatusCode, body, resp.Close)
+	}
+	_, _ = io.WriteString(raw, "GET /plain HTTP/1.1\r\nHost: ws.localhost\r\n\r\n")
+	if _, err := reader.ReadByte(); err == nil {
+		t.Fatal("socket stayed open after a refused upgrade")
+	}
+	if n := plainRequests.Load(); n != 1 {
+		t.Fatalf("upstream saw %d requests on the refused-upgrade socket, want 1", n)
 	}
 }
 
