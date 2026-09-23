@@ -185,10 +185,6 @@ func putServerClient(id string, c *serverClientInfo) {
 	legacyClientRegistry.Put(id, c)
 }
 
-func deleteServerClient(id string) {
-	legacyClientRegistry.Delete(id)
-}
-
 // Auth globals
 var (
 	serverApiToken             string
@@ -807,16 +803,36 @@ func releaseServerPorts(ports ...int) {
 	}
 }
 
+// serverClientLifecycleMu serialises registration with teardown so a stale
+// session cannot interleave with its successor's registration.
+var serverClientLifecycleMu sync.Mutex
+
+// forgetServerClient removes client's registry entry and routes and releases
+// its ports, but only while it is still the registered instance for clientID.
+// After a re-registration the old session closes late; its successor owns the
+// ID, routes and possibly the same ports, so the stale teardown must not
+// touch them.
+func forgetServerClient(clientID string, client *serverClientInfo) bool {
+	serverClientLifecycleMu.Lock()
+	defer serverClientLifecycleMu.Unlock()
+	if current, ok := legacyClientRegistry.Get(clientID); !ok || current != client {
+		return false
+	}
+	for _, t := range client.tunnels {
+		legacyRouteRegistry.DeleteOwned(t.Name, clientID)
+	}
+	legacyClientRegistry.Delete(clientID)
+	releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
+	return true
+}
+
 func closeServerClientConnections(clientID string, client *serverClientInfo) {
 	// Ensure counter is decremented exactly once when client is fully cleaned up
 	defer client.decrementOnce.Do(func() {
 		srvActiveClients.Dec()
 	})
 
-	// Clean up tunnel routes for this client
-	for _, t := range client.tunnels {
-		legacyRouteRegistry.DeleteOwned(t.Name, clientID)
-	}
+	forgetServerClient(clientID, client)
 
 	client.muxSessionMutex.Lock()
 	if client.muxSession != nil {
@@ -851,8 +867,6 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 		client.cancelFunc()
 	}
 
-	releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
-	deleteServerClient(clientID)
 	if serverDebug {
 		log.Printf("Resources released for client %s", clientID)
 	}
@@ -932,6 +946,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	portNoTLS, clientPortTLS := generateServerPorts()
 	ctx, cancel := context.WithCancel(context.Background())
 
+	serverClientLifecycleMu.Lock()
 	// Clean up existing client if reconnecting (stateless behavior)
 	if existing, exists := legacyClientRegistry.Get(clientID); exists {
 		// Clean up old tunnel routes
@@ -973,6 +988,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			// Check for duplicate subdomain (from different client)
 			existingRoute, routeExists := legacyRouteRegistry.Get(name)
 			if routeExists && existingRoute.ClientID != clientID {
+				serverClientLifecycleMu.Unlock()
 				http.Error(w, fmt.Sprintf("Subdomain '%s' already in use by another client", name), http.StatusConflict)
 				cancel()
 				return
@@ -1030,6 +1046,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			CapabilityAudience: t.CapabilityAudience,
 		})
 	}
+	serverClientLifecycleMu.Unlock()
 
 	// Start reverse forwarding listeners
 	for _, revConfig := range regReq.Reverse {
@@ -2565,16 +2582,9 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	client.muxSession = nil
 	client.muxSessionMutex.Unlock()
 
-	// Clean up tunnel routes when session closes (stateless behavior)
-	for _, t := range client.tunnels {
-		legacyRouteRegistry.DeleteOwned(t.Name, clientID)
-	}
-
-	// Remove client from server clients
-	deleteServerClient(clientID)
-
-	// Release ports
-	releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
+	// Release this registration's routes, entry and ports (stateless
+	// behaviour) unless a re-registration already replaced it.
+	forgetServerClient(clientID, client)
 
 	client.decrementOnce.Do(func() {
 		srvActiveClients.Dec()

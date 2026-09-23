@@ -120,3 +120,46 @@ func TestControlClientCertRequiredOnlyForControlPlane(t *testing.T) {
 		t.Fatal("verified client certificate rejected")
 	}
 }
+
+func TestStaleSessionTeardownKeepsReRegisteredClient(t *testing.T) {
+	const id = "reconnecting-client"
+	t.Cleanup(func() {
+		legacyClientRegistry.Delete(id)
+		legacyRouteRegistry.Delete("app")
+		releaseServerPorts(41001, 41002)
+	})
+	tunnels := []ServerTunnelConfig{{Name: "app"}}
+	stale := &serverClientInfo{serializableClientInfo: serializableClientInfo{PortNoTLS: 41001, ClientPortTLS: 41002}, tunnels: tunnels}
+	fresh := &serverClientInfo{serializableClientInfo: serializableClientInfo{PortNoTLS: 41001, ClientPortTLS: 41002}, tunnels: tunnels}
+
+	// The successor registered under the same ID and was handed the ports
+	// the stale session had released.
+	putServerClient(id, fresh)
+	legacyRouteRegistry.Put("app", &TunnelRoute{ClientID: id, TunnelName: "app"})
+	serverPortMutex.Lock()
+	serverUsedPorts[41001], serverUsedPorts[41002] = true, true
+	serverPortMutex.Unlock()
+
+	if forgetServerClient(id, stale) {
+		t.Fatal("stale session reported removing its successor")
+	}
+	if current, ok := legacyClientRegistry.Get(id); !ok || current != fresh {
+		t.Fatal("stale teardown removed the re-registered client")
+	}
+	if _, ok := legacyRouteRegistry.Get("app"); !ok {
+		t.Fatal("stale teardown removed the successor's route")
+	}
+	serverPortMutex.Lock()
+	inUse := serverUsedPorts[41001] && serverUsedPorts[41002]
+	serverPortMutex.Unlock()
+	if !inUse {
+		t.Fatal("stale teardown released ports now owned by the successor")
+	}
+
+	if !forgetServerClient(id, fresh) {
+		t.Fatal("current client was not removed")
+	}
+	if _, ok := legacyRouteRegistry.Get("app"); ok {
+		t.Fatal("current client's route survived its teardown")
+	}
+}
