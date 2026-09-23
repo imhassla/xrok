@@ -953,7 +953,8 @@ func reapUnattachedRegistration(ctx context.Context, clientID string, client *se
 	}
 	client.attachMu.Lock()
 	reap := !client.attached
-	client.reaped = reap
+	// Monotonic: never un-expire a registration a teardown already expired.
+	client.reaped = client.reaped || reap
 	client.attachMu.Unlock()
 	if reap {
 		log.Printf("Client %s registered but never connected within %s, releasing", clientID, serverAttachTimeout)
