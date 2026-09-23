@@ -1,0 +1,19 @@
+#!/bin/sh
+# Renew the xrok certificate via the control plane's certbot container
+# (Route53 DNS-01) and copy it where the xrok user can read it. xrok
+# hot-reloads the files within a minute; no restart needed.
+set -eu
+NAME=xrok.firestarter.click
+SRC=/etc/letsencrypt/live/$NAME
+DST=/etc/xrok/tls
+
+docker exec vpn-wildcard-cert-manager certbot renew --cert-name "$NAME" --non-interactive --quiet || true
+
+install -d -m 0750 -o root -g xrok "$DST"
+for f in fullchain.pem privkey.pem; do
+	if ! cmp -s "$SRC/$f" "$DST/$f"; then
+		install -m 0640 -o root -g xrok "$SRC/$f" "$DST/$f.new"
+		mv -f "$DST/$f.new" "$DST/$f"
+		echo "updated $DST/$f"
+	fi
+done

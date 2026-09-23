@@ -1,0 +1,6 @@
+[Unit]
+Description=Renew and sync xrok TLS certificate
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/xrok-cert-sync

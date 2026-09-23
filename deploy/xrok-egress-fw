@@ -1,0 +1,32 @@
+#!/bin/sh
+# Reject NEW outbound connections from the xrok user to loopback, private,
+# link-local (cloud metadata) and CGNAT ranges, and to the host's own global
+# IPv6 addresses. Local DNS (systemd-resolved) stays allowed. Idempotent.
+set -eu
+U=xrok
+
+v4() {
+	iptables -N XROK_EGRESS 2>/dev/null || iptables -F XROK_EGRESS
+	iptables -A XROK_EGRESS -d 127.0.0.53/32 -p udp --dport 53 -j RETURN
+	iptables -A XROK_EGRESS -d 127.0.0.53/32 -p tcp --dport 53 -j RETURN
+	for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 0.0.0.0/8; do
+		iptables -A XROK_EGRESS -d "$net" -j REJECT
+	done
+	iptables -C OUTPUT -m owner --uid-owner $U -m conntrack --ctstate NEW -j XROK_EGRESS 2>/dev/null ||
+		iptables -I OUTPUT -m owner --uid-owner $U -m conntrack --ctstate NEW -j XROK_EGRESS
+}
+
+v6() {
+	ip6tables -N XROK_EGRESS 2>/dev/null || ip6tables -F XROK_EGRESS
+	for net in ::1/128 fc00::/7 fe80::/10 ::/128 ::ffff:0:0/96 64:ff9b::/96; do
+		ip6tables -A XROK_EGRESS -d "$net" -j REJECT
+	done
+	for addr in $(ip -6 -o addr show scope global | awk '{print $4}' | cut -d/ -f1); do
+		ip6tables -A XROK_EGRESS -d "$addr" -j REJECT
+	done
+	ip6tables -C OUTPUT -m owner --uid-owner $U -m conntrack --ctstate NEW -j XROK_EGRESS 2>/dev/null ||
+		ip6tables -I OUTPUT -m owner --uid-owner $U -m conntrack --ctstate NEW -j XROK_EGRESS
+}
+
+v4
+v6

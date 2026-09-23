@@ -1,7 +1,7 @@
 
 # Binaries
-xrok
-xrok-*
+/xrok
+/xrok-*
 *.log
 .artifacts/
 local-certs/
