@@ -109,15 +109,21 @@ health() {
 }
 
 smoke() {
-  local out="$report_dir/smoke.txt"
-  {
-    echo "reference_lab=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    health prometheus "http://127.0.0.1:${PROMETHEUS_PORT:-9090}/-/ready"
-    health grafana "http://127.0.0.1:${GRAFANA_PORT:-3000}/api/health"
-    health otel "http://127.0.0.1:${OTEL_HEALTH_PORT:-13133}/"
-    health toxiproxy "http://127.0.0.1:${TOXIPROXY_API_PORT:-8474}/version"
-    "${c[@]}" ps
-  } | tee "$out"
+  # Callers invoke smoke from `if !`, which disables errexit here, so every
+  # check records its failure explicitly instead of relying on set -e.
+  local out="$report_dir/smoke.txt" failed=0
+  echo "reference_lab=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$out"
+  health prometheus "http://127.0.0.1:${PROMETHEUS_PORT:-9090}/-/ready" >>"$out" 2>&1 || failed=1
+  health grafana "http://127.0.0.1:${GRAFANA_PORT:-3000}/api/health" >>"$out" 2>&1 || failed=1
+  health otel "http://127.0.0.1:${OTEL_HEALTH_PORT:-13133}/" >>"$out" 2>&1 || failed=1
+  health toxiproxy "http://127.0.0.1:${TOXIPROXY_API_PORT:-8474}/version" >>"$out" 2>&1 || failed=1
+  "${c[@]}" ps >>"$out" 2>&1 || failed=1
+  cat "$out"
+  if (( failed )); then
+    write_artifact failed "one or more health checks failed" "$out"
+    echo "reference lab: unhealthy (report: $out)" >&2
+    return 1
+  fi
   write_artifact passed "" "$out"
   echo "reference lab: healthy (report: $out)"
 }

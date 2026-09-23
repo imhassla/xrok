@@ -16,8 +16,13 @@ race:
 vet:
 	$(GO_ENV) go vet ./...
 
+FUZZTIME ?= 10s
+
+# go test -fuzz accepts one package and one matching target per invocation.
 fuzz:
-	$(GO_ENV) go test ./cmd/config ./cmd/p2p -run '^$$' -fuzz=Fuzz -fuzztime=10s
+	$(GO_ENV) go test ./cmd/config -run '^$$' -fuzz='^FuzzLoadServerConfigBytes$$' -fuzztime=$(FUZZTIME)
+	$(GO_ENV) go test ./cmd/config -run '^$$' -fuzz='^FuzzLoadClientConfigBytes$$' -fuzztime=$(FUZZTIME)
+	$(GO_ENV) go test ./cmd/p2p -run '^$$' -fuzz='^FuzzDecodeSignal$$' -fuzztime=$(FUZZTIME)
 
 fault-injection:
 	$(GO_ENV) go test ./cmd/p2p -run 'TestFault' -count=1
