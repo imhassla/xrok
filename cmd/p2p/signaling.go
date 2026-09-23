@@ -1,8 +1,6 @@
 package p2p
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -124,11 +122,7 @@ func ShouldInitiateICE(localPeer, remotePeer string) bool {
 }
 
 func NewICESessionID() string {
-	b := make([]byte, 18)
-	if _, err := rand.Read(b); err != nil {
-		return ""
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
+	return randomToken(18)
 }
 
 func NewICEOfferSignal(fromPeer, toPeer, sessionID string, candidates []Candidate) *SignalMessage {

@@ -226,8 +226,6 @@ type clientState struct {
 	ClientCert        string              // Path to client certificate for mTLS
 	ClientKey         string              // Path to client private key for mTLS
 	TLSConfig         *tls.Config         // TLS config with mTLS if configured
-	p2pLookupOnce     sync.Once
-	p2pLookupClient   *http.Client // shared by FetchViaP2P owner lookups
 	SessionToken      string              // Credential returned by registration
 	APIToken          string              // Control-plane credential
 	StdioMode         bool                // Stdio tunneling mode
@@ -247,6 +245,10 @@ type clientState struct {
 	P2PStunServer     string
 	P2PTURN           config.TURNConfig
 	P2PActiveSessions map[string]string
+
+	// p2pLookupClient is shared by FetchViaP2P owner lookups.
+	p2pLookupOnce   sync.Once
+	p2pLookupClient *http.Client
 }
 
 // ClientRuntime owns client lifecycle state and synchronization.  The CLI keeps
@@ -2753,8 +2755,6 @@ func requestP2PConnection(state *clientState, peerID string) {
 	sendP2PSignal(state, p2p.NewDiscoverSignal(clientRuntimeID(state), peerID))
 }
 
-// FetchViaP2P attempts to fetch from a tunnel using P2P if available
-// Returns the response, whether P2P was used, and any error
 // p2pOwnerLookupClient returns one keep-alive client per state; a transport
 // per request would leak its idle connections and goroutines.
 func (state *clientState) p2pOwnerLookupClient() *http.Client {
@@ -2767,6 +2767,8 @@ func (state *clientState) p2pOwnerLookupClient() *http.Client {
 	return state.p2pLookupClient
 }
 
+// FetchViaP2P attempts to fetch from a tunnel using P2P if available
+// Returns the response, whether P2P was used, and any error
 func FetchViaP2P(state *clientState, tunnelURL string, req *http.Request) (*http.Response, bool, error) {
 	if !state.P2PEnabled {
 		return nil, false, nil // P2P not enabled, caller should use normal path

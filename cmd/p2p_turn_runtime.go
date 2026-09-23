@@ -2,9 +2,7 @@ package cmd
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"os"
 
 	"xrok/cmd/config"
 	"xrok/cmd/p2p"
@@ -31,16 +29,9 @@ func newClientTURNSplitAllocator(turn config.TURNConfig) (p2p.RelayCandidateAllo
 func clientTURNProviderConfig(turn config.TURNConfig) (p2p.TURNConfig, error) {
 	var tlsConfig *tls.Config
 	if turn.Transport == "tls" && turn.CACert != "" {
-		roots, err := x509.SystemCertPool()
-		if err != nil || roots == nil {
-			roots = x509.NewCertPool()
-		}
-		pemBytes, err := os.ReadFile(turn.CACert)
+		roots, err := loadRootCAs(turn.CACert)
 		if err != nil {
-			return p2p.TURNConfig{}, fmt.Errorf("read TURN CA certificate: %w", err)
-		}
-		if !roots.AppendCertsFromPEM(pemBytes) {
-			return p2p.TURNConfig{}, fmt.Errorf("TURN CA certificate contains no certificates")
+			return p2p.TURNConfig{}, fmt.Errorf("load TURN CA certificate: %w", err)
 		}
 		tlsConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
 	}

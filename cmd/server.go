@@ -484,11 +484,6 @@ func generateServerToken() string {
 	return hex.EncodeToString(bytes)
 }
 
-func validateServerToken(r *http.Request) bool {
-	_, ok := authenticateControlRequest(r)
-	return ok
-}
-
 func getServerRateLimiter(ip string, limiters map[string]*rate.Limiter, r rate.Limit, b int) *rate.Limiter {
 	serverRateLimiterMutex.Lock()
 	defer serverRateLimiterMutex.Unlock()

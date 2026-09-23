@@ -8,8 +8,8 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"testing"
 	"sync/atomic"
+	"testing"
 	"time"
 )
 

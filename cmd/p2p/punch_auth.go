@@ -59,21 +59,19 @@ func (c *PunchReplayCache) consume(key string, now time.Time, ttl time.Duration)
 	return true
 }
 
-func newPunchSessionID() string {
-	b := make([]byte, 18)
+// randomToken returns n random bytes as unpadded base64url, or "" when
+// crypto/rand fails so that callers fail closed.
+func randomToken(n int) string {
+	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return ""
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-func newPunchNonce() string {
-	b := make([]byte, 18)
-	if _, err := rand.Read(b); err != nil {
-		return ""
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
-}
+func newPunchSessionID() string { return randomToken(18) }
+
+func newPunchNonce() string { return randomToken(18) }
 
 func punchMACInput(peerID, sessionID string, timestamp int64, nonce string) string {
 	return strings.Join([]string{punchProtocolVersion, peerID, sessionID, strconv.FormatInt(timestamp, 10), nonce}, ":")

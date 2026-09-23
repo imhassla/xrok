@@ -216,12 +216,16 @@ type P2PManager struct {
     P2PManager handles P2P connections
 
 func NewP2PManager(peerID, stunServer string) *P2PManager
-    NewP2PManager creates a new P2P manager
 
 func NewP2PManagerWithToken(peerID, stunServer, token string) *P2PManager
     NewP2PManagerWithToken creates a manager whose UDP probes are authenticated.
     The token should be a short-lived per-session capability delivered by the
     authenticated signaling channel.
+
+func (m *P2PManager) AdoptPeerID(id string) bool
+    AdoptPeerID sets the identity of a manager created without one, typically
+    the ID the server assigned at registration. An established identity is never
+    replaced, because punch and consent material are bound to it.
 
 func (m *P2PManager) CancelPreparedICE(sessionID string)
 

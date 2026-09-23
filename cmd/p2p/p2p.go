@@ -4,12 +4,9 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"time"
 
@@ -104,33 +101,9 @@ func NewP2PManagerWithToken(peerID, stunServer, token string) *P2PManager {
 	return m
 }
 
+// newPunchToken is empty on crypto/rand failure, so PunchHole fails closed.
 func newPunchToken() string {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		// crypto/rand failure means that authenticated P2P cannot be made safe.
-		// Leave the token empty so PunchHole fails closed.
-		return ""
-	}
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-func punchProof(token, peerID string) string {
-	h := hmac.New(sha256.New, []byte(token))
-	h.Write([]byte(peerID))
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-func punchMessage(token, peerID string) []byte {
-	return []byte(fmt.Sprintf("XROK-P2P-PUNCH:v1:%s:%s", peerID, punchProof(token, peerID)))
-}
-
-func validPunchMessage(msg, token, peerID string) bool {
-	if token == "" || peerID == "" {
-		return false
-	}
-	parts := strings.Split(msg, ":")
-	return len(parts) == 4 && parts[0] == "XROK-P2P-PUNCH" && parts[1] == "v1" &&
-		parts[2] == peerID && hmac.Equal([]byte(parts[3]), []byte(punchProof(token, peerID)))
+	return randomToken(32)
 }
 
 // DiscoverPublicAddr uses STUN to discover public address

@@ -2,57 +2,15 @@ package p2p
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"fmt"
 	"net"
 	"testing"
 	"time"
 )
 
-func TestPunchProofDeterministicAndSecret(t *testing.T) {
-	a := punchProof("secret", "peer-a")
-	b := punchProof("secret", "peer-a")
-	if a != b || len(a) != 64 {
-		t.Fatalf("unexpected proof: %q %q", a, b)
-	}
-	h := hmac.New(sha256.New, []byte("secret"))
-	h.Write([]byte("peer-a"))
-	if !hmac.Equal([]byte(a), []byte(fmt.Sprintf("%x", h.Sum(nil)))) {
-		t.Fatal("proof is not HMAC-SHA256")
-	}
-	if punchProof("other", "peer-a") == a {
-		t.Fatal("proof reused across tokens")
-	}
-}
-
 func TestP2PManagerCreatesAuthenticatedCapability(t *testing.T) {
 	m := NewP2PManager("peer-a", "stun.invalid:3478")
 	if m.authToken == "" || len(m.authToken) < 32 {
 		t.Fatalf("missing strong P2P capability: %q", m.authToken)
-	}
-	if !validPunchMessage(string(punchMessage(m.authToken, "peer-b")), m.authToken, "peer-b") {
-		t.Fatal("valid authenticated punch rejected")
-	}
-}
-
-func TestPunchMessageFailsClosed(t *testing.T) {
-	valid := string(punchMessage("target-capability", "peer-a"))
-	tests := []struct {
-		name, message, token, peer string
-	}{
-		{"legacy", "XROK-P2P-PUNCH:peer-a", "target-capability", "peer-a"},
-		{"empty token", valid, "", "peer-a"},
-		{"wrong token", valid, "other-capability", "peer-a"},
-		{"wrong peer", valid, "target-capability", "peer-b"},
-		{"extra field", valid + ":extra", "target-capability", "peer-a"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if validPunchMessage(tt.message, tt.token, tt.peer) {
-				t.Fatal("unauthenticated punch accepted")
-			}
-		})
 	}
 }
 
@@ -74,12 +32,6 @@ func TestPunchHoleHonorsCancelledContext(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("cancelled hole punch blocked for %v", elapsed)
-	}
-}
-
-func BenchmarkPunchProof(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		_ = punchProof("benchmark-session-token", "peer-benchmark")
 	}
 }
 
