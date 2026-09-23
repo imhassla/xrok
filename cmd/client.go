@@ -226,6 +226,8 @@ type clientState struct {
 	ClientCert        string              // Path to client certificate for mTLS
 	ClientKey         string              // Path to client private key for mTLS
 	TLSConfig         *tls.Config         // TLS config with mTLS if configured
+	p2pLookupOnce     sync.Once
+	p2pLookupClient   *http.Client // shared by FetchViaP2P owner lookups
 	SessionToken      string              // Credential returned by registration
 	APIToken          string              // Control-plane credential
 	StdioMode         bool                // Stdio tunneling mode
@@ -764,12 +766,9 @@ func RunClient(args []string) {
 		*enableP2P = false
 	}
 	if *enableP2P {
-		// P2P identities must be stable before registration because the punch
-		// session and signaling authorization are both bound to this ID.
-		if clientID == "" {
-			clientID = fmt.Sprintf("client-%08x", rand.Uint32())
-			state.ClientID = clientID
-		}
+		// Without --id the server assigns the identity (the principal of a
+		// scoped credential, or a fresh ID for the legacy token). The manager
+		// then adopts it after the first registration; see registerClient.
 		p2pMgr := p2p.NewP2PManager(clientID, *p2pStunServer)
 		peerInfo, err := p2pMgr.DiscoverPublicAddr()
 		if err != nil {
@@ -894,6 +893,18 @@ func RunClient(args []string) {
 	clientStateMutex.Unlock()
 
 	clientLog.Info("Client has shut down.")
+}
+
+// adoptAssignedP2PIdentity binds a P2P manager started without an ID to the
+// client ID the server assigned, so punch and signaling use the same identity
+// the server bound to this registration.
+func adoptAssignedP2PIdentity(state *clientState, assigned string) {
+	if state.P2PManager == nil || !state.P2PManager.AdoptPeerID(assigned) {
+		return
+	}
+	if state.P2PInfo != nil {
+		state.P2PInfo.PeerID = assigned
+	}
 }
 
 func activateP2PManager(state *clientState, manager *p2p.P2PManager, info *p2p.PeerInfo) {
@@ -1261,6 +1272,7 @@ func registerClient(state *clientState, token string) bool {
 
 		clientID = res.UDID
 		state.ClientID = res.UDID
+		adoptAssignedP2PIdentity(state, res.UDID)
 		state.SessionToken = res.SessionToken
 		state.ClientPort = res.ClientPortTLS
 
@@ -2743,6 +2755,18 @@ func requestP2PConnection(state *clientState, peerID string) {
 
 // FetchViaP2P attempts to fetch from a tunnel using P2P if available
 // Returns the response, whether P2P was used, and any error
+// p2pOwnerLookupClient returns one keep-alive client per state; a transport
+// per request would leak its idle connections and goroutines.
+func (state *clientState) p2pOwnerLookupClient() *http.Client {
+	state.p2pLookupOnce.Do(func() {
+		state.p2pLookupClient = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
+			TLSClientConfig: state.TLSConfig,
+			IdleConnTimeout: 90 * time.Second,
+		}}
+	})
+	return state.p2pLookupClient
+}
+
 func FetchViaP2P(state *clientState, tunnelURL string, req *http.Request) (*http.Response, bool, error) {
 	if !state.P2PEnabled {
 		return nil, false, nil // P2P not enabled, caller should use normal path
@@ -2762,7 +2786,7 @@ func FetchViaP2P(state *clientState, tunnelURL string, req *http.Request) (*http
 	tunnelName := parts[0]
 
 	// Query server for tunnel owner
-	lookupURL := fmt.Sprintf("https://%s/p2p/tunnel-owner?tunnel=%s", state.ServerAddr, url.QueryEscape(tunnelName))
+	lookupURL := fmt.Sprintf("https://%s:%d/p2p/tunnel-owner?tunnel=%s", state.ServerAddr, state.ServerPort, url.QueryEscape(tunnelName))
 	lookupReq, err := http.NewRequestWithContext(req.Context(), http.MethodGet, lookupURL, nil)
 	if err != nil {
 		return nil, false, nil
@@ -2770,8 +2794,7 @@ func FetchViaP2P(state *clientState, tunnelURL string, req *http.Request) (*http
 	if state.APIToken != "" {
 		lookupReq.Header.Set("X-API-Token", state.APIToken)
 	}
-	lookupClient := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{TLSClientConfig: state.TLSConfig}}
-	lookupResp, err := lookupClient.Do(lookupReq)
+	lookupResp, err := state.p2pOwnerLookupClient().Do(lookupReq)
 	if err != nil {
 		return nil, false, nil
 	}

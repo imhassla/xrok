@@ -49,7 +49,7 @@ func TURNRelayCandidateAllocator(provider *TURNRelayProvider) RelayCandidateAllo
 func (m *P2PManager) SignalingPeerInfo() *PeerInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return &PeerInfo{PeerID: m.peerID, PublicAddr: m.publicAddr, LocalAddr: m.localAddr, NATType: m.natType.String(), AuthToken: m.authToken, SessionID: m.sessionID}
+	return &PeerInfo{PeerID: m.localID(), PublicAddr: m.publicAddr, LocalAddr: m.localAddr, NATType: m.natType.String(), AuthToken: m.authToken, SessionID: m.sessionID}
 }
 
 // PrepareICE binds the negotiation socket before advertising candidates. The
@@ -455,7 +455,7 @@ func (m *P2PManager) punchPrepared(ctx context.Context, conn *net.UDPConn, peer 
 	if err != nil {
 		return nil, fmt.Errorf("resolve ICE candidate: %w", err)
 	}
-	probe, err := authenticatedPunchMessage(peer.AuthToken, m.peerID, peer.SessionID, time.Now())
+	probe, err := authenticatedPunchMessage(peer.AuthToken, m.localID(), peer.SessionID, time.Now())
 	if err != nil {
 		return nil, err
 	}

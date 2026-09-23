@@ -5,8 +5,13 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"xrok/cmd/p2p"
 )
 
 func TestSOCKS5ConnectDomainAndCloseIdempotent(t *testing.T) {
@@ -131,5 +136,48 @@ func TestReconnectBackoffBounds(t *testing.T) {
 	}
 	if got := cfg.Backoff(10); got < 4*time.Second || got > 5*time.Second {
 		t.Fatalf("capped jittered backoff out of range: %s", got)
+	}
+}
+
+func TestP2PWithoutIDAdoptsServerAssignedIdentity(t *testing.T) {
+	manager := p2p.NewP2PManager("", "")
+	state := &clientState{}
+	activateP2PManager(state, manager, manager.SignalingPeerInfo())
+
+	adoptAssignedP2PIdentity(state, "alice")
+	if state.P2PInfo.PeerID != "alice" || manager.SignalingPeerInfo().PeerID != "alice" {
+		t.Fatalf("assigned identity not adopted: info=%q manager=%q", state.P2PInfo.PeerID, manager.SignalingPeerInfo().PeerID)
+	}
+	adoptAssignedP2PIdentity(state, "mallory")
+	if state.P2PInfo.PeerID != "alice" || manager.SignalingPeerInfo().PeerID != "alice" {
+		t.Fatal("an established P2P identity was replaced")
+	}
+}
+
+func TestFetchViaP2PLooksUpOwnerOnRegistrationPort(t *testing.T) {
+	var lookups atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/p2p/tunnel-owner" && r.URL.Query().Get("tunnel") == "app" {
+			lookups.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	addr := srv.Listener.Addr().(*net.TCPAddr)
+	state := &clientState{
+		P2PEnabled: true, ServerAddr: "127.0.0.1", ServerPort: addr.Port,
+		TLSConfig: srv.Client().Transport.(*http.Transport).TLSClientConfig,
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://app.example.com/", nil)
+	for i := 0; i < 2; i++ {
+		if _, used, err := FetchViaP2P(state, "https://app.example.com/", req); used || err != nil {
+			t.Fatalf("unexpected P2P result: used=%v err=%v", used, err)
+		}
+	}
+	if lookups.Load() != 2 {
+		t.Fatalf("owner lookups on registration port = %d, want 2", lookups.Load())
+	}
+	if first := state.p2pOwnerLookupClient(); first != state.p2pOwnerLookupClient() {
+		t.Fatal("owner lookup client is not reused")
 	}
 }

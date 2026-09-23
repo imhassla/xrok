@@ -71,7 +71,7 @@ func (m *P2PManager) establishICENegotiated(ctx context.Context, agent *ICEAgent
 	cfg.ConsentKey, cfg.ConsentSession = m.consentMaterial(peer, negotiationID)
 	if len(cfg.ConsentKey) != 0 {
 		cfg.ConsentProbe = RuntimeConsentProbe{}
-		cfg.consentSendLabel = m.peerID
+		cfg.consentSendLabel = m.localID()
 		cfg.consentReceiveLabel = peer.PeerID
 	}
 	if negotiationID != "" {
@@ -173,7 +173,7 @@ func (m *P2PManager) connectPreparedRelay(ctx context.Context, agent *ICEAgent, 
 }
 
 func (m *P2PManager) punchConnected(ctx context.Context, conn net.Conn, peer *PeerInfo) (net.Conn, error) {
-	probe, err := authenticatedPunchMessage(peer.AuthToken, m.peerID, peer.SessionID, time.Now())
+	probe, err := authenticatedPunchMessage(peer.AuthToken, m.localID(), peer.SessionID, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -222,11 +222,11 @@ func unwrapUDPConn(conn net.Conn) (*net.UDPConn, bool) {
 }
 
 func (m *P2PManager) consentMaterial(peer *PeerInfo, negotiationID string) ([]byte, string) {
-	if peer == nil || m.peerID == "" || m.authToken == "" || m.sessionID == "" || peer.PeerID == "" || peer.AuthToken == "" || peer.SessionID == "" {
+	if peer == nil || m.localID() == "" || m.authToken == "" || m.sessionID == "" || peer.PeerID == "" || peer.AuthToken == "" || peer.SessionID == "" {
 		return nil, ""
 	}
 	endpoints := []string{
-		strings.Join([]string{m.peerID, m.sessionID, m.authToken}, "\x00"),
+		strings.Join([]string{m.localID(), m.sessionID, m.authToken}, "\x00"),
 		strings.Join([]string{peer.PeerID, peer.SessionID, peer.AuthToken}, "\x00"),
 	}
 	sort.Strings(endpoints)

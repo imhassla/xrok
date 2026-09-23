@@ -32,6 +32,7 @@ type PeerInfo struct {
 
 // P2PManager handles P2P connections
 type P2PManager struct {
+	idMu         sync.RWMutex // guards peerID, which AdoptPeerID may set once
 	peerID       string
 	stunServer   string
 	publicAddr   string
@@ -56,6 +57,26 @@ type P2PConnection struct {
 }
 
 // NewP2PManager creates a new P2P manager
+// localID returns this manager's peer identity.
+func (m *P2PManager) localID() string {
+	m.idMu.RLock()
+	defer m.idMu.RUnlock()
+	return m.peerID
+}
+
+// AdoptPeerID sets the identity of a manager created without one, typically
+// the ID the server assigned at registration. An established identity is
+// never replaced, because punch and consent material are bound to it.
+func (m *P2PManager) AdoptPeerID(id string) bool {
+	m.idMu.Lock()
+	defer m.idMu.Unlock()
+	if m.peerID != "" || id == "" {
+		return false
+	}
+	m.peerID = id
+	return true
+}
+
 func NewP2PManager(peerID, stunServer string) *P2PManager {
 	if stunServer == "" {
 		stunServer = "stun.l.google.com:19302"
@@ -139,7 +160,7 @@ func (m *P2PManager) DiscoverPublicAddr() (*PeerInfo, error) {
 		log.Printf("P2P: Discovered public address %s (NAT type: %s)", m.publicAddr, natType)
 
 		return &PeerInfo{
-			PeerID:     m.peerID,
+			PeerID:     m.localID(),
 			PublicAddr: m.publicAddr,
 			LocalAddr:  m.localAddr,
 			NATType:    natType.String(),
@@ -155,7 +176,7 @@ func (m *P2PManager) DiscoverPublicAddr() (*PeerInfo, error) {
 	log.Printf("P2P: Discovered public address %s (via simple binding)", m.publicAddr)
 
 	return &PeerInfo{
-		PeerID:     m.peerID,
+		PeerID:     m.localID(),
 		PublicAddr: m.publicAddr,
 		LocalAddr:  m.localAddr,
 		NATType:    "unknown",
@@ -315,7 +336,7 @@ func (m *P2PManager) PunchHole(ctx context.Context, peerInfo *PeerInfo) (*P2PCon
 		// Prove possession of the target's capability. The peer performs the
 		// mirror operation using our token received through authenticated
 		// signaling.
-		punchMsg, err := authenticatedPunchMessage(peerInfo.AuthToken, m.peerID, peerInfo.SessionID, time.Now())
+		punchMsg, err := authenticatedPunchMessage(peerInfo.AuthToken, m.localID(), peerInfo.SessionID, time.Now())
 		if err != nil {
 			return
 		}
