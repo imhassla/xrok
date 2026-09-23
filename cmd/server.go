@@ -961,17 +961,33 @@ func reapUnattachedRegistration(ctx context.Context, clientID string, client *se
 	}
 }
 
-// claimServerAttach marks a registration as having a live data connection.
-// It fails once the unattached reaper (or any teardown) has expired the
-// registration, so a late mux/QUIC connection cannot revive a registration
-// whose routes are already gone.
-func claimServerAttach(client *serverClientInfo) bool {
+// claimServerAttach publishes a new data connection for a registration under
+// attachMu, the lock that also orders the unattached reaper and connection
+// teardown (lock order: attachMu, then muxSessionMutex/connMutex). It fails
+// once the registration was expired, so a late connection cannot revive one
+// whose routes are gone. publish runs under the lock and returns the
+// connection it displaced, which the caller closes outside the lock.
+func claimServerAttach(client *serverClientInfo, publish func() io.Closer) (io.Closer, bool) {
 	client.attachMu.Lock()
 	defer client.attachMu.Unlock()
 	if client.reaped || (client.ctx != nil && client.ctx.Err() != nil) {
-		return false
+		return nil, false
 	}
 	client.attached = true
+	return publish(), true
+}
+
+// releaseServerAttach runs when a data connection ends. Under attachMu it
+// checks whether that connection is still the published one and, if so,
+// unpublishes it and marks the registration expired, so a successor cannot
+// attach between this decision and the teardown that follows.
+func releaseServerAttach(client *serverClientInfo, unpublishIfCurrent func() bool) bool {
+	client.attachMu.Lock()
+	defer client.attachMu.Unlock()
+	if !unpublishIfCurrent() {
+		return false
+	}
+	client.reaped = true
 	return true
 }
 
@@ -1071,10 +1087,16 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "non-tls connections are disabled on this server", http.StatusForbidden)
 		return
 	}
-	portNoTLS, clientPortTLS, err := generateServerPorts()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+	// Legacy ports are only reserved when legacy listeners exist; otherwise
+	// they would cap registrations at the range size for nothing. Clients
+	// only require a non-empty client_port_tls, which "0" satisfies.
+	var portNoTLS, clientPortTLS int
+	if serverLegacyListeners {
+		var err error
+		if portNoTLS, clientPortTLS, err = generateServerPorts(); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -1092,8 +1114,11 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Close old connections
-		if existing.muxSession != nil {
-			existing.muxSession.Close()
+		existing.muxSessionMutex.Lock()
+		oldMux := existing.muxSession
+		existing.muxSessionMutex.Unlock()
+		if oldMux != nil {
+			oldMux.Close()
 		}
 
 		// Release old ports
@@ -1221,7 +1246,9 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		defer serverWg.Done()
 		monitorServerClientActivity(ctx, clientID, client)
 	}()
-	if regReq.ConnectionType == "tls" || regReq.ConnectionType == "quic" {
+	// With legacy listeners a "tls" client may attach through the legacy
+	// /ws path, which the reaper cannot see.
+	if !serverLegacyListeners {
 		go reapUnattachedRegistration(ctx, clientID, client)
 	}
 	saveServerState()
@@ -1588,7 +1615,8 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 
 	// Accept first stream for registration. Keepalives keep an idle peer
 	// alive forever, so the wait for its first stream must be bounded.
-	authCtx, authCancel := context.WithTimeout(ctx, serverQUICAuthTimeout)
+	authDeadline := time.Now().Add(serverQUICAuthTimeout)
+	authCtx, authCancel := context.WithDeadline(ctx, authDeadline)
 	stream, err := conn.AcceptStream(authCtx)
 	authCancel()
 	if err != nil {
@@ -1599,7 +1627,7 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 	// Read registration message; a peer that never sends one must not pin
 	// the connection.
 	regBuf := make([]byte, 256)
-	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
+	stream.SetReadDeadline(authDeadline)
 	n, err := stream.Read(regBuf)
 	stream.SetReadDeadline(time.Time{})
 	if err != nil {
@@ -1625,15 +1653,25 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 		return
 	}
 
-	if !claimServerAttach(client) {
+	displaced, ok := claimServerAttach(client, func() io.Closer {
+		client.connMutex.Lock()
+		defer client.connMutex.Unlock()
+		old := client.quicConn
+		client.quicConn = conn
+		if old != nil && old != conn {
+			return old
+		}
+		return nil
+	})
+	if !ok {
 		log.Printf("QUIC: registration for client %s already expired", clientID)
 		conn.Close()
 		return
 	}
 	releasePending()
-	client.connMutex.Lock()
-	client.quicConn = conn
-	client.connMutex.Unlock()
+	if displaced != nil {
+		displaced.Close() // its handler sees it is no longer current
+	}
 
 	log.Printf("QUIC connection established for client %s", clientID)
 
@@ -1653,12 +1691,15 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 	}
 	conn.Close()
 
-	client.connMutex.Lock()
-	current := client.quicConn == conn
-	if current {
+	current := releaseServerAttach(client, func() bool {
+		client.connMutex.Lock()
+		defer client.connMutex.Unlock()
+		if client.quicConn != conn {
+			return false
+		}
 		client.quicConn = nil
-	}
-	client.connMutex.Unlock()
+		return true
+	})
 
 	// Like a closed mux session: free the subdomains and ports right away
 	// instead of holding them for the inactivity timeout (a reconnecting
@@ -2794,6 +2835,9 @@ func loadServerState() {
 	}
 
 	for id, clientData := range state.Clients {
+		if !serverLegacyListeners && clientData.ConnectionType == "non-tls" {
+			continue // disabled on this server; do not reopen its port
+		}
 		client := &serverClientInfo{
 			serializableClientInfo: serializableClientInfo{
 				UDID:            clientData.UDID,
@@ -2823,10 +2867,13 @@ func loadServerState() {
 			}(ctx, client, id)
 		}
 		// A restored registration whose client never comes back must not
-		// keep its subdomains.
-		go reapUnattachedRegistration(ctx, id, client)
+		// keep its subdomains. Legacy clients attach through /ws, which the
+		// reaper cannot see, so it only runs when legacy listeners are off.
+		if !serverLegacyListeners {
+			go reapUnattachedRegistration(ctx, id, client)
+		}
 
-		if client.ConnectionType == "non-tls" {
+		if client.ConnectionType == "non-tls" && serverLegacyListeners {
 			serverWg.Add(1)
 			go func(ctx context.Context, client *serverClientInfo) {
 				defer serverWg.Done()
@@ -2841,8 +2888,10 @@ func loadServerState() {
 		}(id, client)
 	}
 	serverPortMutex.Lock()
-	for port, used := range state.UsedPorts {
-		serverUsedPorts[port] = used
+	if serverLegacyListeners {
+		for port, used := range state.UsedPorts {
+			serverUsedPorts[port] = used
+		}
 	}
 	serverPortMutex.Unlock()
 }
@@ -2913,14 +2962,24 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !claimServerAttach(client) {
+	displaced, ok := claimServerAttach(client, func() io.Closer {
+		client.muxSessionMutex.Lock()
+		defer client.muxSessionMutex.Unlock()
+		old := client.muxSession
+		client.muxSession = session
+		if old != nil && old != session {
+			return old
+		}
+		return nil
+	})
+	if !ok {
 		log.Printf("Mux: registration for client %s already expired", clientID)
 		session.Close()
 		return
 	}
-	client.muxSessionMutex.Lock()
-	client.muxSession = session
-	client.muxSessionMutex.Unlock()
+	if displaced != nil {
+		displaced.Close() // its handler sees it is no longer current
+	}
 
 	// Whatever ends the registration (replacement, reaper, inactivity,
 	// shutdown) also ends its session, so the client notices and
@@ -2965,12 +3024,15 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 
 	<-session.CloseChan()
 
-	client.muxSessionMutex.Lock()
-	current := client.muxSession == session
-	if current {
+	current := releaseServerAttach(client, func() bool {
+		client.muxSessionMutex.Lock()
+		defer client.muxSessionMutex.Unlock()
+		if client.muxSession != session {
+			return false
+		}
 		client.muxSession = nil
-	}
-	client.muxSessionMutex.Unlock()
+		return true
+	})
 	if !current {
 		// A newer session of the same registration took over; it owns
 		// the routes and ports now.

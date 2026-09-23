@@ -54,6 +54,8 @@ func TestHTTPRelayEndToEnd(t *testing.T) {
 
 	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
 		"server", "--domain", "localhost", "--port", fmt.Sprint(port),
+		// Production mode: no legacy per-client listeners, unattached reaper on.
+		"--legacy-listeners=false",
 		"--tls-cert", certFile, "--tls-key", keyFile,
 		"--state-file", filepath.Join(tmp, "state.dat"),
 		"--log-file", filepath.Join(tmp, "server.log"))
@@ -368,6 +370,8 @@ func TestQUICHTTPRelayEndToEnd(t *testing.T) {
 	token := "e2e-quic-token"
 	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
 		"server", "--domain", "localhost", "--port", fmt.Sprint(port),
+		// Production mode: no legacy per-client listeners, unattached reaper on.
+		"--legacy-listeners=false",
 		"--tls-cert", certFile, "--tls-key", keyFile,
 		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
 	defer stopProcess(t, server)
@@ -506,6 +510,8 @@ func TestReverseTCPRelayEndToEnd(t *testing.T) {
 	token := "e2e-reverse-token"
 	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
 		"server", "--domain", "localhost", "--port", fmt.Sprint(serverPort),
+		// Production mode: no legacy per-client listeners, unattached reaper on.
+		"--legacy-listeners=false",
 		"--tls-cert", certFile, "--tls-key", keyFile,
 		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
 	defer stopProcess(t, server)

@@ -2877,7 +2877,7 @@ func FetchViaP2P(state *clientState, tunnelURL string, req *http.Request) (*http
 	tunnelName := parts[0]
 
 	// Query server for tunnel owner
-	lookupURL := fmt.Sprintf("https://%s:%d/p2p/tunnel-owner?tunnel=%s", state.ServerAddr, state.ServerPort, url.QueryEscape(tunnelName))
+	lookupURL := "https://" + serverAuthority(state.ServerAddr, state.ServerPort) + "/p2p/tunnel-owner?tunnel=" + url.QueryEscape(tunnelName)
 	lookupReq, err := http.NewRequestWithContext(req.Context(), http.MethodGet, lookupURL, nil)
 	if err != nil {
 		return nil, false, nil
