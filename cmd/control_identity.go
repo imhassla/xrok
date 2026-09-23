@@ -114,7 +114,8 @@ func authenticateControlRequest(r *http.Request) (controlPrincipal, bool) {
 	if principal, ok := serverClientIdentityPolicy.authenticate(token); ok {
 		return principal, true
 	}
-	if serverAuthEnabled && subtle.ConstantTimeCompare([]byte(token), []byte(serverApiToken)) == 1 {
+	// An unset administrator token must never match an absent credential.
+	if serverAuthEnabled && serverApiToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(serverApiToken)) == 1 {
 		return controlPrincipal{ClientID: legacyPrincipalID, Legacy: true}, true
 	}
 	if !serverAuthEnabled && len(serverClientIdentityPolicy.credentials) == 0 {

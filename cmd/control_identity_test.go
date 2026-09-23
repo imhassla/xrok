@@ -76,6 +76,21 @@ func TestControlIdentityRejectsMissingScopeAndWrongToken(t *testing.T) {
 	}
 }
 
+func TestIdentitiesWithoutAdminTokenRejectMissingCredential(t *testing.T) {
+	oldPolicy, oldEnabled, oldToken := serverClientIdentityPolicy, serverAuthEnabled, serverApiToken
+	t.Cleanup(func() {
+		serverClientIdentityPolicy, serverAuthEnabled, serverApiToken = oldPolicy, oldEnabled, oldToken
+	})
+	serverClientIdentityPolicy = newControlIdentityPolicy([]config.ClientIdentityConfig{{ID: "alice", Token: "alice-secret", Scopes: []string{"client"}}})
+	serverAuthEnabled, serverApiToken = true, ""
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	w := httptest.NewRecorder()
+	serverAuthMiddleware(func(http.ResponseWriter, *http.Request) { t.Fatal("unauthenticated handler called") })(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("missing credential accepted as legacy admin: code=%d", w.Code)
+	}
+}
+
 func TestLegacyAPITokenRetainsAdminCompatibility(t *testing.T) {
 	oldPolicy, oldEnabled, oldToken := serverClientIdentityPolicy, serverAuthEnabled, serverApiToken
 	t.Cleanup(func() {

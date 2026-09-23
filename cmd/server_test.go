@@ -44,3 +44,31 @@ func BenchmarkInjectHeaders(b *testing.B) {
 		_ = injectHeaders(request, headers)
 	}
 }
+
+func TestRestoredClientWithoutSessionTokenCannotAttach(t *testing.T) {
+	restored := &serverClientInfo{}
+	if restored.validSessionToken("") {
+		t.Fatal("empty presented token matched a client restored without a session token")
+	}
+	live := &serverClientInfo{sessionToken: "s3cret"}
+	if !live.validSessionToken("s3cret") || live.validSessionToken("") || live.validSessionToken("other") {
+		t.Fatal("session token comparison is incorrect for a live client")
+	}
+}
+
+func TestServerConfigPathAcceptsBothFlagForms(t *testing.T) {
+	cases := map[string][]string{
+		"/a.yaml": {"--config", "/a.yaml"},
+		"/b.yaml": {"--config=/b.yaml"},
+		"/c.yaml": {"--domain", "x", "-config=/c.yaml"},
+		"/d.yaml": {"-config", "/d.yaml", "--debug"},
+	}
+	for want, args := range cases {
+		if got, ok := serverConfigPath(args); !ok || got != want {
+			t.Fatalf("serverConfigPath(%q) = %q, %v; want %q", args, got, ok, want)
+		}
+	}
+	if _, ok := serverConfigPath([]string{"--", "--config=/e.yaml"}); ok {
+		t.Fatal("config after the -- terminator must be ignored")
+	}
+}

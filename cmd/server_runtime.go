@@ -97,7 +97,7 @@ func newServerRuntime(cfg config.ServerConfig, deps ServerRuntimeDeps) (*ServerR
 		ha: ha, store: store, legacy: true, telemetry: runtimeTelemetry,
 		telemetryConfig: cfg.Telemetry, serverDeps: serverDeps,
 	}
-	r.run = func(args []string) { runServer(args, r.telemetry.exporter) }
+	r.run = func(args []string) { runServerWithConfig(args, &r.cfg, r.telemetry.exporter) }
 	return r, nil
 }
 

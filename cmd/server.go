@@ -123,6 +123,13 @@ type serverClientInfo struct {
 	decrementOnce       sync.Once             // Ensure active clients counter only decremented once
 }
 
+// validSessionToken reports whether presented matches the client's data-plane
+// credential. Clients restored from state carry no credential and must
+// re-register before a data-plane session can attach.
+func (c *serverClientInfo) validSessionToken(presented string) bool {
+	return c.sessionToken != "" && subtle.ConstantTimeCompare([]byte(presented), []byte(c.sessionToken)) == 1
+}
+
 // TunnelRoute maps a subdomain to client and tunnel info
 type TunnelRoute struct {
 	ClientID           string
@@ -277,21 +284,44 @@ func RunServer(args []string) {
 }
 
 func runServer(args []string, injectedExporter telemetry.Exporter) {
-	var loadedConfig *config.ServerConfig
+	runServerWithConfig(args, nil, injectedExporter)
+}
+
+// serverConfigPath returns the --config value in either "--config path" or
+// "--config=path" form. Parsing stops at the "--" terminator like FlagSet.
+func serverConfigPath(args []string) (string, bool) {
 	for i, arg := range args {
-		if (arg == "-config" || arg == "--config") && i+1 < len(args) {
-			cfg, err := config.LoadServerConfig(args[i+1])
-			if err != nil {
-				fmt.Printf("Failed to load server config: %v\n", err)
-				return
-			}
-			if err := cfg.Validate(); err != nil {
-				fmt.Printf("Invalid server config: %v\n", err)
-				return
-			}
-			loadedConfig = cfg
+		if arg == "--" {
 			break
 		}
+		for _, name := range []string{"-config", "--config"} {
+			if arg == name && i+1 < len(args) {
+				return args[i+1], true
+			}
+			if value, ok := strings.CutPrefix(arg, name+"="); ok {
+				return value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// runServerWithConfig serves with preset applied before CLI flags. Embedded
+// runtimes pass their validated config here so authentication, identities
+// and rate limits are not lost in the flag translation.
+func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExporter telemetry.Exporter) {
+	loadedConfig := preset
+	if path, ok := serverConfigPath(args); ok {
+		cfg, err := config.LoadServerConfig(path)
+		if err != nil {
+			fmt.Printf("Failed to load server config: %v\n", err)
+			os.Exit(1)
+		}
+		if err := cfg.Validate(); err != nil {
+			fmt.Printf("Invalid server config: %v\n", err)
+			os.Exit(1)
+		}
+		loadedConfig = cfg
 	}
 	if loadedConfig != nil {
 		serverDomain = loadedConfig.Domain
@@ -1384,7 +1414,7 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 
 	client, exists := legacyClientRegistry.Get(clientID)
 
-	if !exists || subtle.ConstantTimeCompare([]byte(sessionToken), []byte(client.sessionToken)) != 1 {
+	if !exists || !client.validSessionToken(sessionToken) {
 		log.Printf("QUIC: Unknown client %s", clientID)
 		conn.Close()
 		return
@@ -2447,7 +2477,7 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	if sessionToken == "" {
 		sessionToken = r.URL.Query().Get("session_token")
 	}
-	if subtle.ConstantTimeCompare([]byte(sessionToken), []byte(client.sessionToken)) != 1 {
+	if !client.validSessionToken(sessionToken) {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
