@@ -584,8 +584,11 @@ func TestUDPTunnelEndToEnd(t *testing.T) {
 	serverPort := freePort(t)
 	localPort := freeUDPPort(t)
 	token := "e2e-udp-token"
+	// The UDP echo target is on loopback, which the default egress policy
+	// refuses; the lab opts in explicitly.
 	server := startProcess(t, tmp, []string{"XROK_API_TOKEN=" + token}, binary,
 		"server", "--domain", "localhost", "--port", fmt.Sprint(serverPort),
+		"--allow-private-egress",
 		"--tls-cert", certFile, "--tls-key", keyFile,
 		"--state-file", filepath.Join(tmp, "state.dat"), "--log-file", filepath.Join(tmp, "server.log"))
 	defer stopProcess(t, server)

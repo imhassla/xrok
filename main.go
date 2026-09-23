@@ -24,6 +24,12 @@ func main() {
 		cmd.RunClient(os.Args[2:])
 	case "status":
 		cmd.RunStatus(os.Args[2:])
+	case "http":
+		runHTTP(os.Args[2:])
+	case "tcp":
+		runTCP(os.Args[2:])
+	case "socks":
+		runSOCKS(os.Args[2:])
 	case "init":
 		runInit(os.Args[2:])
 	case "version", "-v", "--version":
@@ -89,10 +95,16 @@ Usage:
 Commands:
   server    Start the xrok server
   client    Start the xrok client
+  http      Expose a local HTTP port:  xrok http 3000 [name]
+  tcp       Expose a local TCP port on a server port:  xrok tcp 22 9001
+  socks     Local SOCKS5 proxy through the server:  xrok socks [1080]
   status    Show status of running tunnels
   init      Generate example config file
   version   Show version information
   help      Show this help message
+
+Shortcuts read server, server_port and token from ~/.xrok/config.yaml
+(or $XROK_CONFIG); extra arguments are passed to 'xrok client'.
 
 Examples:
   # Start server with config file

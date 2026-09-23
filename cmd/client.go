@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -434,6 +435,18 @@ func RunClient(args []string) {
 	turnRetransmits := fs.Int("turn-retransmits", 0, "TURN UDP retransmits (0 uses bounded default)")
 
 	fs.Parse(args)
+	rpSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "rp" {
+			rpSet = true
+		}
+	})
+	// Without --config, fall back to $XROK_CONFIG or ~/.xrok/config.yaml so
+	// a profile holding server/port/token makes `xrok client --tunnel ...`
+	// work without repeating them.
+	if *configFile == "" {
+		*configFile = defaultClientConfigPath()
+	}
 
 	// Setup logging
 	setupClientLogging()
@@ -460,6 +473,9 @@ func RunClient(args []string) {
 		// Apply config values (CLI flags override config)
 		if *serverAddr == "" {
 			*serverAddr = cfg.Server
+		}
+		if cfg.ServerPort > 0 && !rpSet {
+			clientRp = cfg.ServerPort
 		}
 		if *apiToken == "" {
 			*apiToken = cfg.Token
@@ -598,6 +614,21 @@ func RunClient(args []string) {
 	if *serverAddr == "" {
 		clientLog.Error("The --server flag or 'server' in config file is required.")
 		os.Exit(1)
+	}
+	// Accept --server host:port; every URL is built as host:rp.
+	if host, port, err := net.SplitHostPort(*serverAddr); err == nil {
+		p, perr := strconv.Atoi(port)
+		if perr != nil || p <= 0 || p > 65535 {
+			clientLog.Error("Invalid port in --server %q", *serverAddr)
+			os.Exit(1)
+		}
+		*serverAddr = host
+		if !rpSet {
+			clientRp = p
+		}
+	}
+	if *apiToken == "" {
+		*apiToken = os.Getenv("XROK_TOKEN")
 	}
 
 	turnRuntimeConfig := config.TURNConfig{
@@ -934,6 +965,21 @@ func setupClientLogging() {
 }
 
 // loadClientConfigFile loads client configuration from a YAML file
+// defaultClientConfigPath returns $XROK_CONFIG, else ~/.xrok/config.yaml when
+// it exists, else "".
+func defaultClientConfigPath() string {
+	if p := os.Getenv("XROK_CONFIG"); p != "" {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, ".xrok", "config.yaml")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 func loadClientConfigFile(path string) (*config.ClientConfig, error) {
 	return config.LoadClientConfig(path)
 }

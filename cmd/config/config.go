@@ -16,22 +16,24 @@ import (
 // ClientConfig represents client configuration
 type ClientConfig struct {
 	// Version is the schema version. Zero denotes the legacy unversioned format.
-	Version   int               `yaml:"version,omitempty"`
-	Server    string            `yaml:"server"`
-	ID        string            `yaml:"id,omitempty"`
-	Token     string            `yaml:"token,omitempty"`
-	TLS       bool              `yaml:"tls"`
-	Debug     bool              `yaml:"debug"`
-	Quiet     bool              `yaml:"quiet"`
-	Verbose   bool              `yaml:"verbose"`
-	Tunnels   []TunnelConfig    `yaml:"tunnels,omitempty"`
-	Socks5    string            `yaml:"socks5,omitempty"`
-	UDP       []UDPConfig       `yaml:"udp,omitempty"`
-	Reverse   []ReverseConfig   `yaml:"reverse,omitempty"`
-	Reconnect ReconnectConfig   `yaml:"reconnect"`
-	Headers   map[string]string `yaml:"headers,omitempty"`
-	Compress  bool              `yaml:"compress"`
-	LogFile   string            `yaml:"log_file,omitempty"`
+	Version int    `yaml:"version,omitempty"`
+	Server  string `yaml:"server"`
+	// ServerPort is the server's registration/HTTPS port (default 443).
+	ServerPort int               `yaml:"server_port,omitempty"`
+	ID         string            `yaml:"id,omitempty"`
+	Token      string            `yaml:"token,omitempty"`
+	TLS        bool              `yaml:"tls"`
+	Debug      bool              `yaml:"debug"`
+	Quiet      bool              `yaml:"quiet"`
+	Verbose    bool              `yaml:"verbose"`
+	Tunnels    []TunnelConfig    `yaml:"tunnels,omitempty"`
+	Socks5     string            `yaml:"socks5,omitempty"`
+	UDP        []UDPConfig       `yaml:"udp,omitempty"`
+	Reverse    []ReverseConfig   `yaml:"reverse,omitempty"`
+	Reconnect  ReconnectConfig   `yaml:"reconnect"`
+	Headers    map[string]string `yaml:"headers,omitempty"`
+	Compress   bool              `yaml:"compress"`
+	LogFile    string            `yaml:"log_file,omitempty"`
 	// Transport protocol: "websocket" (default), "quic"
 	Transport string `yaml:"transport,omitempty"`
 	// ConnectionType is a deprecated alias retained for older examples.
@@ -121,12 +123,22 @@ type ServerConfig struct {
 	// retained as an administrator/legacy fallback during migration.
 	ClientIdentities []ClientIdentityConfig `yaml:"client_identities,omitempty"`
 	RateLimit        int                    `yaml:"rate_limit"`
-	LogFile          string                 `yaml:"log_file,omitempty"`
-	StateFile        string                 `yaml:"state_file,omitempty"`
-	IPWhitelist      []string               `yaml:"ip_whitelist,omitempty"`
-	RequestLog       bool                   `yaml:"request_log"`
-	Compress         bool                   `yaml:"compress"`
-	HealthCheck      HealthCheckConfig      `yaml:"health_check"`
+	// AllowAnonymous permits starting without api_token/client_identities.
+	// Without auth anyone can register tunnels and use the server as a proxy.
+	AllowAnonymous bool `yaml:"allow_anonymous,omitempty"`
+	// AllowPrivateEgress lets SOCKS/UDP streams reach loopback, private,
+	// link-local (cloud metadata) and the host's own addresses.
+	AllowPrivateEgress bool `yaml:"allow_private_egress,omitempty"`
+	// Reverse (-R) listener policy; zero values keep the defaults.
+	ReversePortMin      int               `yaml:"reverse_port_min,omitempty"`
+	ReversePortMax      int               `yaml:"reverse_port_max,omitempty"`
+	ReverseMaxPerClient int               `yaml:"reverse_max_per_client,omitempty"`
+	LogFile             string            `yaml:"log_file,omitempty"`
+	StateFile           string            `yaml:"state_file,omitempty"`
+	IPWhitelist         []string          `yaml:"ip_whitelist,omitempty"`
+	RequestLog          bool              `yaml:"request_log"`
+	Compress            bool              `yaml:"compress"`
+	HealthCheck         HealthCheckConfig `yaml:"health_check"`
 	// mTLS: CA certificate for verifying client certificates
 	ClientCAPath string `yaml:"client_ca_path,omitempty"`
 	Insecure     bool   `yaml:"insecure,omitempty"`

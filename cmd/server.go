@@ -106,6 +106,7 @@ type serverClientInfo struct {
 	clientListenerTLS   *http.Server
 	clientListenerNoTLS *http.Server
 	cancelFunc          context.CancelFunc
+	ctx                 context.Context // registration lifetime; nil for restored clients
 	connMutex           sync.Mutex
 	wsConnChans         map[string]chan *websocket.Conn
 	tunnels             []ServerTunnelConfig  // Multiple tunnels per client
@@ -159,6 +160,7 @@ var (
 	serverUsedPorts                = make(map[int]bool)
 	serverPortMutex                sync.Mutex
 	serverInactivityTimeout        = 60 * time.Minute
+	serverMaxClientStreams         = 1024
 	serverStartTime                = time.Now()
 
 	serverBasePortNoTLS     = 4000
@@ -189,6 +191,7 @@ func putServerClient(id string, c *serverClientInfo) {
 var (
 	serverApiToken             string
 	serverAuthEnabled          bool
+	serverAllowAnonymous       bool
 	serverClientIdentityPolicy = newControlIdentityPolicy(nil)
 
 	serverRateLimiters     = make(map[string]*rate.Limiter)
@@ -339,6 +342,17 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 		}
 		serverApiToken = loadedConfig.APIToken
 		serverClientIdentityPolicy = newControlIdentityPolicy(loadedConfig.ClientIdentities)
+		serverAllowAnonymous = loadedConfig.AllowAnonymous
+		serverAllowPrivateEgress = loadedConfig.AllowPrivateEgress
+		if loadedConfig.ReversePortMin > 0 {
+			serverReversePortMin = loadedConfig.ReversePortMin
+		}
+		if loadedConfig.ReversePortMax > 0 {
+			serverReversePortMax = loadedConfig.ReversePortMax
+		}
+		if loadedConfig.ReverseMaxPerClient > 0 {
+			serverReverseMaxPerCli = loadedConfig.ReverseMaxPerClient
+		}
 	}
 
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
@@ -355,6 +369,12 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	fs.BoolVar(&serverDebug, "debug", serverDebug, "Enable debug logging")
 	fs.BoolVar(&serverRequestLog, "request-log", serverRequestLog, "Enable HTTP request logging")
 	fs.StringVar(&serverClientCA, "client-ca", serverClientCA, "Path to CA certificate for mTLS client verification")
+	fs.StringVar(&serverPprofAddr, "pprof", serverPprofAddr, "Serve net/http/pprof on this loopback address (e.g. 127.0.0.1:6060)")
+	fs.BoolVar(&serverTrustProxyHeaders, "trust-proxy-headers", serverTrustProxyHeaders, "Key rate limits on X-Forwarded-For/X-Real-IP (only behind a trusted proxy)")
+	fs.BoolVar(&serverAllowAnonymous, "allow-anonymous", serverAllowAnonymous, "Start without authentication (anyone can register and proxy)")
+	fs.BoolVar(&serverAllowPrivateEgress, "allow-private-egress", serverAllowPrivateEgress, "Let SOCKS/UDP streams reach loopback, private and link-local addresses")
+	fs.IntVar(&serverReversePortMin, "reverse-port-min", serverReversePortMin, "Lowest port a client may bind with -R")
+	fs.IntVar(&serverReversePortMax, "reverse-port-max", serverReversePortMax, "Highest port a client may bind with -R")
 	fs.Parse(args)
 	telemetryConfig := config.DefaultServerConfig().Telemetry
 	if loadedConfig != nil {
@@ -392,6 +412,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	go cleanupServerRateLimiters(serverShutdownChan, &serverWg)
 
 	initServerMetrics()
+	startServerPprof(serverPprofAddr)
 
 	loadServerState()
 
@@ -439,7 +460,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 }
 
 func setupServerLogging() {
-	file, err := os.OpenFile(serverLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	file, err := os.OpenFile(serverLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 	if err != nil {
 		fmt.Printf("Failed to open log file %s: %v", serverLogFile, err)
 		os.Exit(1)
@@ -471,8 +492,11 @@ func initServerAuth() {
 	if serverApiToken != "" || len(serverClientIdentityPolicy.credentials) > 0 {
 		serverAuthEnabled = true
 		log.Printf("API authentication enabled (client identities: %d)", len(serverClientIdentityPolicy.credentials))
-	} else {
+	} else if serverAllowAnonymous {
 		log.Printf("Warning: XROK_API_TOKEN not set, authentication disabled")
+	} else {
+		fmt.Println("Refusing to start without authentication: set XROK_API_TOKEN, api_token or client_identities (or pass -allow-anonymous).")
+		os.Exit(1)
 	}
 }
 
@@ -496,7 +520,27 @@ func getServerRateLimiter(ip string, limiters map[string]*rate.Limiter, r rate.L
 	return limiter
 }
 
+// serverTrustProxyHeaders keys rate limits on X-Forwarded-For/X-Real-IP.
+// Only safe behind a proxy that overwrites them; otherwise any caller could
+// pick a fresh key per request and bypass the limiter.
+var serverTrustProxyHeaders bool
+
+// serverPublicURL is the visitor URL of a tunnel; a non-default listen port
+// must be part of it or the printed link is unreachable.
+func serverPublicURL(name, domain string) string {
+	if serverPort == 443 {
+		return fmt.Sprintf("https://%s.%s", name, domain)
+	}
+	return fmt.Sprintf("https://%s.%s:%d", name, domain, serverPort)
+}
+
 func getServerClientIP(r *http.Request) string {
+	if !serverTrustProxyHeaders {
+		if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && ip != "" {
+			return ip
+		}
+		return r.RemoteAddr
+	}
 	xff := r.Header.Get("X-Forwarded-For")
 	if xff != "" {
 		parts := strings.Split(xff, ",")
@@ -870,11 +914,26 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 	}
 }
 
-func monitorServerClientActivity(clientID string, client *serverClientInfo) {
+// monitorServerClientActivity reaps registrations without traffic. It exits
+// with the registration context so shutdown does not wait on its ticker, and
+// never reaps a client whose mux session is still up: yamux keepalives prove
+// it alive even when its tunnels are idle.
+func monitorServerClientActivity(ctx context.Context, clientID string, client *serverClientInfo) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		client.muxSessionMutex.Lock()
+		muxAlive := client.muxSession != nil && !client.muxSession.IsClosed()
+		client.muxSessionMutex.Unlock()
+		if muxAlive {
+			continue
+		}
 		if time.Since(client.GetLastActivity()) > serverInactivityTimeout {
 			if serverDebug {
 				log.Printf("Client %s inactive, closing connections", clientID)
@@ -940,6 +999,12 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
+	reverse, err := validateReverseConfigs(regReq.Reverse)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	regReq.Reverse = reverse
 
 	portNoTLS, clientPortTLS := generateServerPorts()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -995,7 +1060,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			tunnels = append(tunnels, ServerTunnelConfig{Name: name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability, CapabilityAudience: t.CapabilityAudience})
 			tunnelMap[name] = t.Target
 
-			url := fmt.Sprintf("https://%s.%s", name, serverDomain)
+			url := serverPublicURL(name, serverDomain)
 			tunnelInfos = append(tunnelInfos, ServerTunnelInfo{
 				Name:   name,
 				Target: t.Target,
@@ -1017,6 +1082,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			Registered:     true,
 		},
 		cancelFunc:     cancel,
+		ctx:            ctx,
 		wsConnChans:    make(map[string]chan *websocket.Conn),
 		tunnels:        tunnels,
 		tunnelMap:      tunnelMap,
@@ -1079,7 +1145,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	serverWg.Add(1)
 	go func() {
 		defer serverWg.Done()
-		monitorServerClientActivity(clientID, client)
+		monitorServerClientActivity(ctx, clientID, client)
 	}()
 	saveServerState()
 
@@ -1105,7 +1171,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if regReq.ConnectionType == "tls" {
-		response.ProxyURLTLS = fmt.Sprintf("https://%s.%s", clientID, serverDomain)
+		response.ProxyURLTLS = serverPublicURL(clientID, serverDomain)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -1153,7 +1219,7 @@ func resolveServerTunnel(deps *ServerDeps, subdomain string) (*serverClientInfo,
 }
 
 func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter telemetry.Exporter) {
-	cert, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
+	certs, err := serverCertReloader()
 	if err != nil {
 		log.Printf("Failed to load certificate for port %d: %v", proxyPort, err)
 		return
@@ -1292,14 +1358,19 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 			log.Printf("Failed to hijack connection: %v", err)
 			return
 		}
+		// The server's Read/WriteTimeout deadlines stay armed on a hijacked
+		// conn and would cut WebSocket, SSE and long downloads at 5 minutes.
+		// Dead visitors are still reaped by TCP keepalive.
+		conn.SetDeadline(time.Time{})
 
 		// Handle the proxy connection with the buffered data
 		go handleHijackedProxyConnection(conn, buf, r, client, tunnelName, basicAuth, customHeaders)
 	}), deps.Exporter)
 
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"http/1.1"}, // Disable HTTP/2 for hijacking support
+		GetCertificate: certs.GetCertificate,
+		NextProtos:     []string{"http/1.1"}, // Disable HTTP/2 for hijacking support
+		MinVersion:     tls.VersionTLS12,
 	}
 
 	// Configure mTLS if client CA is specified
@@ -1361,7 +1432,7 @@ func serverStatusHandler(w http.ResponseWriter, r *http.Request) {
 		tunnels = append(tunnels, TunnelStatus{
 			Name:     route.TunnelName,
 			Target:   route.Target,
-			URL:      fmt.Sprintf("https://%s.%s", route.TunnelName, deps.Domain),
+			URL:      serverPublicURL(route.TunnelName, deps.Domain),
 			ClientID: route.ClientID,
 		})
 	}
@@ -1377,15 +1448,15 @@ func serverStatusHandler(w http.ResponseWriter, r *http.Request) {
 
 // waitForQUICConnections handles QUIC connections
 func waitForQUICConnections(ctx context.Context, port int) {
-	cert, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
+	certs, err := serverCertReloader()
 	if err != nil {
 		log.Printf("Failed to load certificate for QUIC: %v", err)
 		return
 	}
 
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"xrok-quic"},
+		GetCertificate: certs.GetCertificate,
+		NextProtos:     []string{"xrok-quic"},
 	}
 
 	quicTransport := transport.NewQUICTransport(tlsConfig)
@@ -1403,16 +1474,16 @@ func waitForQUICConnections(ctx context.Context, port int) {
 
 	log.Printf("QUIC server listening on port %d (UDP)", port)
 
+	var backoff acceptBackoff
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if !backoff.retry(ctx, err) {
 				return
-			default:
-				continue
 			}
+			continue
 		}
+		backoff.reset()
 		go handleQUICServerConnection(ctx, conn.(*transport.QUICConn))
 	}
 }
@@ -1425,9 +1496,12 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 		return
 	}
 
-	// Read registration message
+	// Read registration message; a peer that never sends one must not pin
+	// the connection.
 	regBuf := make([]byte, 256)
+	stream.SetReadDeadline(time.Now().Add(10 * time.Second))
 	n, err := stream.Read(regBuf)
+	stream.SetReadDeadline(time.Time{})
 	if err != nil {
 		conn.Close()
 		return
@@ -1457,9 +1531,25 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 
 	log.Printf("QUIC connection established for client %s", clientID)
 
-	// Keep connection open and handle lifecycle
-	<-ctx.Done()
+	// Hold until the server stops, the peer goes away or the registration
+	// is replaced/released; waiting on the server context alone leaked one
+	// goroutine and connection per reconnect.
+	var clientDone <-chan struct{}
+	if client.ctx != nil {
+		clientDone = client.ctx.Done()
+	}
+	select {
+	case <-ctx.Done():
+	case <-conn.Connection().Context().Done():
+	case <-clientDone:
+	}
 	conn.Close()
+
+	client.connMutex.Lock()
+	if client.quicConn == conn {
+		client.quicConn = nil
+	}
+	client.connMutex.Unlock()
 }
 
 // isUpgradeRequest reports whether r asks to switch protocols, i.e. carries
@@ -1769,19 +1859,17 @@ func startReverseListener(ctx context.Context, client *serverClientInfo, remoteA
 
 	log.Printf("Reverse listener started on %s for client %s", remoteAddr, client.UDID)
 
+	var backoff acceptBackoff
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if !backoff.retry(ctx, err) {
 				return
-			default:
-				if !strings.Contains(err.Error(), "use of closed") {
-					log.Printf("Reverse listener accept error: %v", err)
-				}
-				continue
 			}
+			log.Printf("Reverse listener accept error: %v", err)
+			continue
 		}
+		backoff.reset()
 
 		go handleReverseConnection(ctx, conn, client, localTarget)
 	}
@@ -1868,6 +1956,13 @@ func waitForProxyConnectionNoTLS(ctx context.Context, client *serverClientInfo, 
 func acceptServerConnections(ctx context.Context, listener net.Listener, client *serverClientInfo, handleFunc func(net.Conn, *serverClientInfo)) {
 	log.Printf("Starting to accept connections on port %d", listener.Addr().(*net.TCPAddr).Port)
 	var wg sync.WaitGroup
+	var backoff acceptBackoff
+	// Accept blocks, so the ctx check below never runs while idle; close the
+	// listener on cancel so the port is actually unbound.
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
 
 	for {
 		select {
@@ -1882,13 +1977,12 @@ func acceptServerConnections(ctx context.Context, listener net.Listener, client 
 		default:
 			proxyConn, err := listener.Accept()
 			if err != nil {
-				select {
-				case <-ctx.Done():
+				if !backoff.retry(ctx, err) {
 					return
-				default:
-					continue
 				}
+				continue
 			}
+			backoff.reset()
 
 			log.Printf("Accepted connection for client %s", client.UDID)
 			wg.Add(1)
@@ -2447,11 +2541,12 @@ func waitForServerClientConnection(ctx context.Context, client *serverClientInfo
 
 	go func() {
 		if useTLS {
-			cert, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
+			certs, err := serverCertReloader()
 			if err != nil {
-				log.Fatalf("Failed to load certificate: %v", err)
+				log.Printf("Failed to load certificate for client port %d: %v", clientPort, err)
+				return
 			}
-			server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+			server.TLSConfig = &tls.Config{GetCertificate: certs.GetCertificate, MinVersion: tls.VersionTLS12}
 			log.Printf("Secure WebSocket server listening on port %d", clientPort)
 			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("Failed to start TLS server on port %d: %v", clientPort, err)
@@ -2498,16 +2593,27 @@ func saveServerState() {
 	}
 	serverPortMutex.Unlock()
 
-	file, err := os.Create(serverStateFile)
+	// Write to a temp file and rename so a crash mid-write never leaves a
+	// truncated state file behind.
+	tmp := serverStateFile + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		log.Printf("Failed to create state file: %v", err)
 		return
 	}
-	defer file.Close()
-
-	encoder := gob.NewEncoder(file)
-	if err := encoder.Encode(state); err != nil {
+	if err := gob.NewEncoder(file).Encode(state); err != nil {
 		log.Printf("Failed to encode state: %v", err)
+		file.Close()
+		os.Remove(tmp)
+		return
+	}
+	if err := file.Close(); err != nil {
+		log.Printf("Failed to write state file: %v", err)
+		os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, serverStateFile); err != nil {
+		log.Printf("Failed to replace state file: %v", err)
 	}
 }
 
@@ -2570,7 +2676,7 @@ func loadServerState() {
 		serverWg.Add(1)
 		go func(id string, client *serverClientInfo) {
 			defer serverWg.Done()
-			monitorServerClientActivity(id, client)
+			monitorServerClientActivity(ctx, id, client)
 		}(id, client)
 	}
 	serverPortMutex.Lock()
@@ -2652,8 +2758,10 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Yamux session established for client %s", clientID)
 
-	// Accept streams from client (for SOCKS5/dynamic connections)
+	// Accept streams from client (for SOCKS5/dynamic connections). A
+	// per-session cap bounds goroutines/FDs a single client can pin.
 	go func() {
+		slots := make(chan struct{}, serverMaxClientStreams)
 		for {
 			stream, err := session.Accept()
 			if err != nil {
@@ -2662,7 +2770,17 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 				}
 				return
 			}
-			go handleClientInitiatedStream(stream, client)
+			select {
+			case slots <- struct{}{}:
+			default:
+				log.Printf("Client %s exceeded %d concurrent streams, rejecting", clientID, serverMaxClientStreams)
+				stream.Close()
+				continue
+			}
+			go func() {
+				defer func() { <-slots }()
+				handleClientInitiatedStream(stream, client)
+			}()
 		}
 	}()
 
@@ -2673,8 +2791,13 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	client.muxSessionMutex.Unlock()
 
 	// Release this registration's routes, entry and ports (stateless
-	// behaviour) unless a re-registration already replaced it.
+	// behaviour) unless a re-registration already replaced it. Cancel the
+	// registration context first so its per-client and -R listeners unbind
+	// before the port numbers are handed out again.
 	if forgetServerClient(clientID, client) {
+		if client.cancelFunc != nil {
+			client.cancelFunc()
+		}
 		releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
 	}
 
@@ -2715,8 +2838,8 @@ func handleClientInitiatedStream(stream net.Conn, client *serverClientInfo) {
 			log.Printf("SOCKS5 dynamic connection to: %s", target)
 		}
 
-		// Connect to target
-		targetConn, err := net.DialTimeout("tcp", target, 30*time.Second)
+		// Connect to target under the egress policy (no loopback/private/metadata)
+		targetConn, err := dialEgress("tcp", target, 30*time.Second)
 		if err != nil {
 			log.Printf("Failed to connect to SOCKS5 target %s: %v", target, err)
 			return
@@ -2724,21 +2847,7 @@ func handleClientInitiatedStream(stream net.Conn, client *serverClientInfo) {
 		defer targetConn.Close()
 
 		client.SetLastActivity(time.Now())
-
-		// Bridge the connections
-		done := make(chan struct{}, 2)
-
-		go func() {
-			io.Copy(targetConn, stream)
-			done <- struct{}{}
-		}()
-
-		go func() {
-			io.Copy(stream, targetConn)
-			done <- struct{}{}
-		}()
-
-		<-done
+		relayEgress(stream, targetConn, serverEgressIdleTimeout)
 		return
 	}
 
@@ -2783,14 +2892,7 @@ func handleClientInitiatedStream(stream net.Conn, client *serverClientInfo) {
 			log.Printf("UDP packet to %s, %d bytes", remoteAddr, packetLen)
 		}
 
-		// Resolve and connect UDP
-		udpAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
-		if err != nil {
-			log.Printf("Failed to resolve UDP address %s: %v", remoteAddr, err)
-			return
-		}
-
-		udpConn, err := net.DialUDP("udp", nil, udpAddr)
+		udpConn, err := dialEgress("udp", remoteAddr, 10*time.Second)
 		if err != nil {
 			log.Printf("Failed to dial UDP %s: %v", remoteAddr, err)
 			return
