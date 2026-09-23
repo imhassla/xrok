@@ -483,3 +483,29 @@ func TestRemoteStreamCloseDoesNotStallReliableTunnel(t *testing.T) {
 		t.Fatal("reliable tunnel closed after handling a remote stream close")
 	}
 }
+
+// The side that hears the peer first must still get its own probe through:
+// the peer's NAT dropped everything sent before the peer's first probe.
+func TestPunchCompletesOnBothSidesWhenEarlyProbesAreDropped(t *testing.T) {
+	alice := NewP2PManagerWithToken("alice", "", "alice-token")
+	bob := NewP2PManagerWithToken("bob", "", "bob-token")
+	rawA, rawB := messagePipe()
+	var bobSent atomic.Bool
+	rawA.writeHook = func([]byte, chan []byte) bool { return !bobSent.Load() }
+	rawB.writeHook = func([]byte, chan []byte) bool { bobSent.Store(true); return false }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	aliceDone := make(chan error, 1)
+	go func() {
+		_, err := alice.punchConnected(ctx, rawA, bob.SignalingPeerInfo())
+		aliceDone <- err
+	}()
+	time.Sleep(250 * time.Millisecond) // alice's first probes hit a closed NAT
+	if _, err := bob.punchConnected(ctx, rawB, alice.SignalingPeerInfo()); err != nil {
+		t.Fatalf("late peer never received a probe: %v", err)
+	}
+	if err := <-aliceDone; err != nil {
+		t.Fatalf("early peer failed: %v", err)
+	}
+}

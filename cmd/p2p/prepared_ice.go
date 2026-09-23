@@ -443,6 +443,13 @@ func (m *P2PManager) expirePreparedSession(sessionID string, conn *net.UDPConn) 
 	delete(m.preparedICE, sessionID)
 }
 
+// punchConfirmations is how many probes are sent after the peer's probe
+// arrives. Its probe proves the peer's NAT now admits us, but our earlier
+// probes may have been dropped before that mapping existed; without these the
+// peer can keep waiting and fail even though our side succeeded. The peer's
+// consent layer discards the surplus as late punches.
+const punchConfirmations = 3
+
 func (m *P2PManager) punchPrepared(ctx context.Context, conn *net.UDPConn, peer *PeerInfo, candidate Candidate) (net.Conn, error) {
 	remote, err := net.ResolveUDPAddr("udp", candidate.Addr)
 	if err != nil {
@@ -470,6 +477,9 @@ func (m *P2PManager) punchPrepared(ctx context.Context, conn *net.UDPConn, peer 
 		if readErr == nil {
 			if source.IP.Equal(remote.IP) && source.Port == remote.Port && validateAuthenticatedPunch(string(buf[:n]), m.authToken, peer.PeerID, m.sessionID, time.Now(), defaultPunchMaxSkew, m.replay) {
 				_ = conn.SetReadDeadline(time.Time{})
+				for i := 0; i < punchConfirmations; i++ {
+					_, _ = conn.WriteToUDP(probe, remote)
+				}
 				return &UDPConn{conn: conn, remoteAddr: source}, nil
 			}
 		}

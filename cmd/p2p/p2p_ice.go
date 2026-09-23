@@ -194,6 +194,9 @@ func (m *P2PManager) punchConnected(ctx context.Context, conn net.Conn, peer *Pe
 		n, readErr := conn.Read(buf)
 		if readErr == nil && validateAuthenticatedPunch(string(buf[:n]), m.authToken, peer.PeerID, m.sessionID, time.Now(), defaultPunchMaxSkew, m.replay) {
 			_ = conn.SetReadDeadline(time.Time{})
+			for i := 0; i < punchConfirmations; i++ {
+				_, _ = conn.Write(probe)
+			}
 			return conn, nil
 		}
 		select {
