@@ -22,8 +22,12 @@ func NewQUICTransport(tlsConfig *tls.Config) *QUICTransport {
 	return &QUICTransport{
 		tlsConfig: tlsConfig,
 		quicConfig: &quic.Config{
-			MaxIdleTimeout:        5 * time.Minute,
-			KeepAlivePeriod:       30 * time.Second,
+			// Keepalives hold healthy idle tunnels open; a peer that vanished
+			// without CONNECTION_CLOSE (killed, network gone) is detected in
+			// MaxIdleTimeout, which bounds how long the server keeps its
+			// subdomains and how long visitors can hang on a dead connection.
+			MaxIdleTimeout:        45 * time.Second,
+			KeepAlivePeriod:       15 * time.Second,
 			MaxIncomingStreams:    1000,
 			MaxIncomingUniStreams: 1000,
 			EnableDatagrams:       true,

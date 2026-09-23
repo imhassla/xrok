@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -836,7 +837,7 @@ func RunClient(args []string) {
 	var wg sync.WaitGroup
 
 	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		<-stop
@@ -1103,22 +1104,26 @@ func openDynamicStream(target string) (net.Conn, error) {
 func startLocalProxy(ctx context.Context, localAddr string, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	// No overall client timeout: it would cut downloads longer than it.
+	// Only waiting for response headers is bounded.
 	client := &http.Client{
-		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			DisableKeepAlives:   false,
-			MaxIdleConns:        1000,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     120 * time.Second,
+			DisableKeepAlives:     false,
+			MaxIdleConns:          1000,
+			MaxIdleConnsPerHost:   100,
+			IdleConnTimeout:       120 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return openDynamicStream(addr)
 			},
 		},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// A plain handler, not http.ServeMux: ServeMux cannot route CONNECT
+	// requests (their path is empty) and answered 404, so HTTPS through the
+	// proxy never worked.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
 			proxyConn, err := openDynamicStream(r.Host)
 			if err != nil {
@@ -1181,8 +1186,9 @@ func startLocalProxy(ctx context.Context, localAddr string, wg *sync.WaitGroup) 
 	})
 
 	server := &http.Server{
-		Addr:    localAddr,
-		Handler: mux,
+		Addr:              localAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 
 	go func() {
@@ -1312,6 +1318,9 @@ func registerClient(state *clientState, token string) bool {
 			case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
 				clientLog.Error("Registration rejected (%d): %s", response.StatusCode, strings.TrimSpace(string(body)))
 				os.Exit(1)
+			}
+			if response.StatusCode == http.StatusConflict {
+				clientLog.Warn("Registration conflict: %s (retrying)", strings.TrimSpace(string(body)))
 			}
 			clientLog.Debug("Attempt %d: Server error %d: %s", attempt, response.StatusCode, string(body))
 			time.Sleep(backoffFactor * time.Duration(attempt))
@@ -1484,7 +1493,12 @@ func connectQUICWithDisconnect(ctx context.Context, state *clientState, disconne
 	quicTransport := transport.NewQUICTransport(tlsConfig)
 	conn, err := quicTransport.Dial(ctx, addr)
 	if err != nil {
-		clientLog.Error("Failed to establish QUIC connection: %v", err)
+		// UDP is often filtered (cloud firewalls, corporate networks). Fall
+		// back to the TCP/TLS mux for the rest of this process; the reconnect
+		// loop re-registers with connection type "tls". The write happens
+		// before the deferred disconnect signal, which orders it for the loop.
+		clientLog.Warn("QUIC unavailable (%v); falling back to TCP/TLS", err)
+		state.UseQUIC = false
 		return
 	}
 
@@ -1522,6 +1536,10 @@ func connectQUICWithDisconnect(ctx context.Context, state *clientState, disconne
 			stream, err := quicConn.AcceptStream(ctx)
 			if err != nil {
 				clientLog.Debug("QUIC accept error: %v", err)
+				// Send CONNECTION_CLOSE so the server frees this registration
+				// now instead of after its idle timeout (the ctx.Done case
+				// above is rarely reached: AcceptStream returns first).
+				conn.Close()
 				return
 			}
 			go handleQUICStream(ctx, stream, state)

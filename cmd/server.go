@@ -914,6 +914,28 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 	}
 }
 
+// serverAttachTimeout bounds how long a registration may hold its
+// subdomains without the client opening its mux (tls) or QUIC connection.
+var serverAttachTimeout = 30 * time.Second
+
+func reapUnattachedRegistration(ctx context.Context, clientID string, client *serverClientInfo) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(serverAttachTimeout):
+	}
+	client.muxSessionMutex.Lock()
+	hasMux := client.muxSession != nil
+	client.muxSessionMutex.Unlock()
+	client.connMutex.Lock()
+	hasQUIC := client.quicConn != nil
+	client.connMutex.Unlock()
+	if !hasMux && !hasQUIC {
+		log.Printf("Client %s registered but never connected within %s, releasing", clientID, serverAttachTimeout)
+		closeServerClientConnections(clientID, client)
+	}
+}
+
 // monitorServerClientActivity reaps registrations without traffic. It exits
 // with the registration context so shutdown does not wait on its ticker, and
 // never reaps a client whose mux session is still up: yamux keepalives prove
@@ -1147,6 +1169,9 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		defer serverWg.Done()
 		monitorServerClientActivity(ctx, clientID, client)
 	}()
+	if regReq.ConnectionType == "tls" || regReq.ConnectionType == "quic" {
+		go reapUnattachedRegistration(ctx, clientID, client)
+	}
 	saveServerState()
 
 	srvRegistrationSuccess.Inc()
@@ -1540,9 +1565,11 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 	if client.ctx != nil {
 		clientDone = client.ctx.Done()
 	}
+	peerGone := false
 	select {
 	case <-ctx.Done():
 	case <-conn.Connection().Context().Done():
+		peerGone = true
 	case <-clientDone:
 	}
 	conn.Close()
@@ -1552,6 +1579,14 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 		client.quicConn = nil
 	}
 	client.connMutex.Unlock()
+
+	// Like a closed mux session: free the subdomains and ports right away
+	// instead of holding them for the inactivity timeout (a reconnecting
+	// client without a fixed --id was refused with 409 meanwhile).
+	if peerGone {
+		closeServerClientConnections(clientID, client)
+		log.Printf("QUIC connection closed for client %s, resources released", clientID)
+	}
 }
 
 // isUpgradeRequest reports whether r asks to switch protocols, i.e. carries
