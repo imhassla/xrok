@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/base64"
 	"io"
@@ -190,5 +191,36 @@ func TestRelayUpgradeResponseOnlyPipesAfterSwitchingProtocols(t *testing.T) {
 	}
 	if !strings.Contains(got, "200 OK") || !strings.Contains(got, "Connection: close") || !strings.HasSuffix(got, "ok") {
 		t.Fatalf("non-101 answer not relayed as a closing response: %q", got)
+	}
+}
+
+type recordingUpstream struct {
+	io.Reader
+	written bytes.Buffer
+}
+
+func (u *recordingUpstream) Write(p []byte) (int, error) { return u.written.Write(p) }
+
+func TestCompleteUpgradeForwardsWithheldBytesOnlyAfter101(t *testing.T) {
+	run := func(answer string) (bool, string) {
+		server, visitor := net.Pipe()
+		go func() { _, _ = io.Copy(io.Discard, visitor) }()
+		defer server.Close()
+		upstream := &recordingUpstream{Reader: strings.NewReader(answer)}
+		ok := completeUpgrade(server, upstream, httptest.NewRequest(http.MethodGet, "/ws", nil), []byte("pipelined"))
+		return ok, upstream.written.String()
+	}
+	if ok, sent := run("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"); !ok || sent != "pipelined" {
+		t.Fatalf("after 101: ok=%v sent=%q", ok, sent)
+	}
+	if ok, sent := run("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); ok || sent != "" {
+		t.Fatalf("refused upgrade forwarded withheld bytes: ok=%v sent=%q", ok, sent)
+	}
+
+	withBody := httptest.NewRequest(http.MethodPost, "/ws", strings.NewReader("body"))
+	withBody.Header.Set("Connection", "Upgrade")
+	withBody.Header.Set("Upgrade", "websocket")
+	if isUpgradeRequest(withBody) {
+		t.Fatal("request with a body treated as an upgrade handshake")
 	}
 }

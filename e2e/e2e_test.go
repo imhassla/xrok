@@ -188,7 +188,10 @@ func TestWebSocketRelayEndToEnd(t *testing.T) {
 	}
 	defer raw.Close()
 	_ = raw.SetDeadline(time.Now().Add(5 * time.Second))
-	upgrade := "GET /plain HTTP/1.1\r\nHost: ws.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+	// The second request is pipelined in the same write, so it is already
+	// buffered by the server when the upgrade is relayed.
+	upgrade := "GET /plain HTTP/1.1\r\nHost: ws.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n" +
+		"GET /plain HTTP/1.1\r\nHost: ws.localhost\r\n\r\n"
 	if _, err := io.WriteString(raw, upgrade); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +205,6 @@ func TestWebSocketRelayEndToEnd(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || string(body) != "plain" || !resp.Close {
 		t.Fatalf("refused upgrade relayed as %d %q close=%v", resp.StatusCode, body, resp.Close)
 	}
-	_, _ = io.WriteString(raw, "GET /plain HTTP/1.1\r\nHost: ws.localhost\r\n\r\n")
 	if _, err := reader.ReadByte(); err == nil {
 		t.Fatal("socket stayed open after a refused upgrade")
 	}

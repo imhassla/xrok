@@ -1465,7 +1465,9 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 // isUpgradeRequest reports whether r asks to switch protocols, i.e. carries
 // an Upgrade header and lists "upgrade" among its Connection tokens.
 func isUpgradeRequest(r *http.Request) bool {
-	if r.Header.Get("Upgrade") == "" {
+	// A handshake carries no body (RFC 6455 4.1); anything after its head is
+	// held back until the upgrade is confirmed, so a body cannot be relayed.
+	if r.Header.Get("Upgrade") == "" || r.ContentLength != 0 || len(r.TransferEncoding) > 0 {
 		return false
 	}
 	for _, value := range r.Header.Values("Connection") {
@@ -1484,22 +1486,50 @@ func isUpgradeRequest(r *http.Request) bool {
 // reusable socket would carry later requests past Basic Auth, capability
 // checks and header injection.
 func relayUpgradeResponse(conn net.Conn, upstream io.Reader, r *http.Request) bool {
-	var raw bytes.Buffer
-	br := bufio.NewReader(io.TeeReader(upstream, &raw))
+	raw := &headCapture{}
+	br := bufio.NewReader(io.TeeReader(upstream, raw))
 	resp, err := http.ReadResponse(br, r)
+	raw.stop = true // a refused upgrade's body streams without being retained
 	if err != nil {
 		return false
 	}
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		// raw holds the head plus anything read past it; later bytes are
 		// copied straight from upstream.
-		_, err := conn.Write(raw.Bytes())
+		_, err := conn.Write(raw.buf.Bytes())
 		return err == nil
 	}
 	defer resp.Body.Close()
 	resp.Close = true
 	_ = resp.Write(conn)
 	return false
+}
+
+// completeUpgrade relays the upstream answer and, once it is 101, forwards
+// the bytes the visitor sent after the handshake.
+func completeUpgrade(conn net.Conn, upstream io.ReadWriter, r *http.Request, afterUpgrade []byte) bool {
+	if !relayUpgradeResponse(conn, upstream, r) {
+		return false
+	}
+	if len(afterUpgrade) > 0 {
+		if _, err := upstream.Write(afterUpgrade); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// headCapture records bytes until stop is set.
+type headCapture struct {
+	buf  bytes.Buffer
+	stop bool
+}
+
+func (c *headCapture) Write(p []byte) (int, error) {
+	if !c.stop {
+		c.buf.Write(p)
+	}
+	return len(p), nil
 }
 
 // handleHijackedProxyConnection handles a hijacked HTTP connection for proxying
@@ -1513,6 +1543,8 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 	if host, _, err := net.SplitHostPort(clientIP); err == nil {
 		clientIP = host
 	}
+
+	upgrade := isUpgradeRequest(r)
 
 	// Reconstruct the HTTP request
 	var reqBuf bytes.Buffer
@@ -1534,18 +1566,25 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 	}
 	// Protocol upgrades (WebSocket) leave HTTP after the 101 response, so no
 	// further request can reuse the socket; keep their Connection token.
-	if isUpgradeRequest(r) {
+	if upgrade {
 		reqBuf.WriteString("Connection: Upgrade\r\n")
 	} else {
 		reqBuf.WriteString("Connection: close\r\n")
 	}
 	reqBuf.WriteString("\r\n")
 
-	// Read any buffered body data
+	// Read any buffered body data. For an upgrade, bytes after the handshake
+	// are withheld until upstream answers 101: a pipelined request sent with
+	// it would otherwise reach upstream unchecked.
+	var afterUpgrade []byte
 	if buf.Reader.Buffered() > 0 {
 		buffered := make([]byte, buf.Reader.Buffered())
 		buf.Read(buffered)
-		reqBuf.Write(buffered)
+		if upgrade {
+			afterUpgrade = buffered
+		} else {
+			reqBuf.Write(buffered)
+		}
 	}
 
 	initialData := reqBuf.Bytes()
@@ -1613,7 +1652,7 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 			srvBytesSent.Add(float64(len(initialData)))
 		}
 
-		if isUpgradeRequest(r) && !relayUpgradeResponse(conn, stream, r) {
+		if upgrade && !completeUpgrade(conn, stream, r, afterUpgrade) {
 			stream.Close()
 			return
 		}
@@ -1660,7 +1699,7 @@ func handleHijackedProxyConnection(conn net.Conn, buf *bufio.ReadWriter, r *http
 			srvBytesSent.Add(float64(len(initialData)))
 		}
 
-		if isUpgradeRequest(r) && !relayUpgradeResponse(conn, stream, r) {
+		if upgrade && !completeUpgrade(conn, stream, r, afterUpgrade) {
 			(*stream).Close()
 			return
 		}
