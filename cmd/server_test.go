@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVerifyBasicAuth(t *testing.T) {
@@ -181,11 +182,18 @@ func TestRelayUpgradeResponseOnlyPipesAfterSwitchingProtocols(t *testing.T) {
 	}
 
 	switched := "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\nframe"
-	if ok, got := relay(switched); !ok || got != switched {
-		t.Fatalf("101 relay = %v %q; want verbatim head and early frame", ok, got)
+	ok, got := relay(switched)
+	if !ok || !strings.HasPrefix(got, "HTTP/1.1 101 Switching Protocols\r\n") ||
+		!strings.Contains(got, "Upgrade: websocket\r\n") || !strings.HasSuffix(got, "\r\n\r\nframe") {
+		t.Fatalf("101 relay = %v %q; want 101 head followed by the early frame", ok, got)
 	}
 
-	ok, got := relay("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+	hinted := "HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\n" + switched
+	if ok, got := relay(hinted); !ok || !strings.HasPrefix(got, "HTTP/1.1 103 Early Hints\r\n") || !strings.Contains(got, "101 Switching Protocols") {
+		t.Fatalf("informational response ended the upgrade: ok=%v %q", ok, got)
+	}
+
+	ok, got = relay("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
 	if ok {
 		t.Fatal("non-101 answer left the socket reusable")
 	}
@@ -222,5 +230,29 @@ func TestCompleteUpgradeForwardsWithheldBytesOnlyAfter101(t *testing.T) {
 	withBody.Header.Set("Upgrade", "websocket")
 	if isUpgradeRequest(withBody) {
 		t.Fatal("request with a body treated as an upgrade handshake")
+	}
+}
+
+func TestRelayUpgradeResponseTimesOutSilentUpstream(t *testing.T) {
+	old := upgradeHandshakeTimeout
+	upgradeHandshakeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { upgradeHandshakeTimeout = old })
+	server, visitor := net.Pipe()
+	defer server.Close()
+	defer visitor.Close()
+	upstream, peer := net.Pipe() // peer never answers
+	defer upstream.Close()
+	defer peer.Close()
+	done := make(chan bool, 1)
+	go func() {
+		done <- relayUpgradeResponse(server, upstream, httptest.NewRequest(http.MethodGet, "/ws", nil))
+	}()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("silent upstream treated as an accepted upgrade")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("upgrade handshake wait is unbounded")
 	}
 }

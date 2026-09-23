@@ -1480,29 +1480,63 @@ func isUpgradeRequest(r *http.Request) bool {
 	return false
 }
 
+// upgradeHandshakeTimeout bounds the wait for upstream's answer to an
+// upgrade; the visitor relay that would notice a disconnect starts only after.
+var upgradeHandshakeTimeout = 30 * time.Second
+
+// maxInformationalResponses bounds the 1xx responses relayed before the final
+// answer to an upgrade request.
+const maxInformationalResponses = 8
+
 // relayUpgradeResponse forwards the upstream answer to an upgrade request and
 // reports whether the socket may become a raw bidirectional pipe. Only a 101
-// leaves HTTP; any other answer is relayed with Connection: close, because a
-// reusable socket would carry later requests past Basic Auth, capability
-// checks and header injection.
+// leaves HTTP; any other final answer is relayed with Connection: close,
+// because a reusable socket would carry later requests past Basic Auth,
+// capability checks and header injection. Informational responses such as
+// 103 Early Hints are relayed while waiting for the final answer.
 func relayUpgradeResponse(conn net.Conn, upstream io.Reader, r *http.Request) bool {
-	raw := &headCapture{}
-	br := bufio.NewReader(io.TeeReader(upstream, raw))
-	resp, err := http.ReadResponse(br, r)
-	raw.stop = true // a refused upgrade's body streams without being retained
-	if err != nil {
+	if d, ok := upstream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = d.SetReadDeadline(time.Now().Add(upgradeHandshakeTimeout))
+		defer d.SetReadDeadline(time.Time{})
+	}
+	br := bufio.NewReader(upstream)
+	for i := 0; i <= maxInformationalResponses; i++ {
+		resp, err := http.ReadResponse(br, r)
+		if err != nil {
+			return false
+		}
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			if writeResponseHead(conn, resp) != nil {
+				return false
+			}
+			// Frames upstream sent right behind the 101 are already buffered;
+			// later bytes are copied straight from upstream.
+			early, _ := br.Peek(br.Buffered())
+			_, err := conn.Write(early)
+			return err == nil
+		}
+		if resp.StatusCode >= 100 && resp.StatusCode < 200 {
+			if writeResponseHead(conn, resp) != nil {
+				return false
+			}
+			continue
+		}
+		defer resp.Body.Close()
+		resp.Close = true
+		_ = resp.Write(conn)
 		return false
 	}
-	if resp.StatusCode == http.StatusSwitchingProtocols {
-		// raw holds the head plus anything read past it; later bytes are
-		// copied straight from upstream.
-		_, err := conn.Write(raw.buf.Bytes())
-		return err == nil
-	}
-	defer resp.Body.Close()
-	resp.Close = true
-	_ = resp.Write(conn)
 	return false
+}
+
+// writeResponseHead writes a bodiless response's status line and headers.
+func writeResponseHead(w io.Writer, resp *http.Response) error {
+	var head bytes.Buffer
+	fmt.Fprintf(&head, "HTTP/%d.%d %s\r\n", resp.ProtoMajor, resp.ProtoMinor, resp.Status)
+	_ = resp.Header.Write(&head)
+	head.WriteString("\r\n")
+	_, err := w.Write(head.Bytes())
+	return err
 }
 
 // completeUpgrade relays the upstream answer and, once it is 101, forwards
@@ -1517,19 +1551,6 @@ func completeUpgrade(conn net.Conn, upstream io.ReadWriter, r *http.Request, aft
 		}
 	}
 	return true
-}
-
-// headCapture records bytes until stop is set.
-type headCapture struct {
-	buf  bytes.Buffer
-	stop bool
-}
-
-func (c *headCapture) Write(p []byte) (int, error) {
-	if !c.stop {
-		c.buf.Write(p)
-	}
-	return len(p), nil
 }
 
 // handleHijackedProxyConnection handles a hijacked HTTP connection for proxying
