@@ -1,4 +1,4 @@
-.PHONY: build test race vet bench regression e2e e2e-soak fuzz security fault-injection api-compat ci-local soak supply-chain lab-parallel lab-smoke otlp-integration turn-integration check
+.PHONY: install-local build test race vet bench regression e2e e2e-soak fuzz security fault-injection api-compat ci-local soak supply-chain lab-parallel lab-smoke otlp-integration turn-integration check
 
 GOCACHE ?= /tmp/xrok-go-build
 GOMODCACHE ?= /tmp/xrok-go-mod
@@ -76,3 +76,9 @@ e2e-soak:
 	./scripts/e2e-soak.sh
 
 check: test vet race
+
+# Build for this machine and install as `xrok` into ~/.local/bin (on PATH).
+PREFIX ?= $(HOME)/.local
+install-local:
+	$(GO_ENV) go build -trimpath -ldflags "-s -w" -o $(PREFIX)/bin/xrok .
+	@echo "installed $(PREFIX)/bin/xrok"

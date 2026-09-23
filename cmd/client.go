@@ -1303,16 +1303,24 @@ func registerClient(state *clientState, token string) bool {
 			time.Sleep(backoffFactor * time.Duration(attempt))
 			continue
 		}
-		defer response.Body.Close()
-
 		if response.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(response.Body)
+			body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+			response.Body.Close()
+			// A rejected registration (bad token, forbidden -R port, bad
+			// request) will not succeed on retry; say why and stop.
+			switch response.StatusCode {
+			case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+				clientLog.Error("Registration rejected (%d): %s", response.StatusCode, strings.TrimSpace(string(body)))
+				os.Exit(1)
+			}
 			clientLog.Debug("Attempt %d: Server error %d: %s", attempt, response.StatusCode, string(body))
 			time.Sleep(backoffFactor * time.Duration(attempt))
 			continue
 		}
 
-		if err := json.NewDecoder(response.Body).Decode(&res); err != nil {
+		err = json.NewDecoder(response.Body).Decode(&res)
+		response.Body.Close()
+		if err != nil {
 			clientLog.Debug("Attempt %d: Failed to decode response: %v", attempt, err)
 			time.Sleep(backoffFactor * time.Duration(attempt))
 			continue

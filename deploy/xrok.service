@@ -1,0 +1,51 @@
+[Unit]
+Description=xrok tunnel server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xrok
+Group=xrok
+# '+' runs as root: installs the owner-match egress firewall (defense in
+# depth on top of xrok's own egress policy).
+ExecStartPre=+/usr/local/sbin/xrok-egress-fw
+# Soft heap target below MemoryMax so the GC works harder before the OOM killer.
+Environment=GOMEMLIMIT=200MiB
+ExecStart=/opt/xrok/xrok server -config /etc/xrok/server.yaml -pprof 127.0.0.1:6060
+Restart=always
+RestartSec=3
+# Stop cleanly; the server drains then saves state.
+TimeoutStopSec=40
+
+# Resources: stay a good neighbour to the control panel on this 2 vCPU box.
+# CPUQuota is a safety cap (60% of one core = 30% of the instance);
+# CPUWeight/Nice make the panel win under contention.
+CPUQuota=60%
+CPUWeight=50
+Nice=5
+MemoryHigh=256M
+MemoryMax=384M
+TasksMax=4096
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/xrok /var/log/xrok
+ReadOnlyPaths=/etc/xrok
+
+[Install]
+WantedBy=multi-user.target

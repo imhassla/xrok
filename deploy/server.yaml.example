@@ -1,0 +1,23 @@
+# /etc/xrok/server.yaml — xrok on a host shared with other services.
+# The token is filled in by install.sh; keep this file 0640 root:xrok.
+domain: xrok.firestarter.click
+proxy_port: 8443            # TCP (+UDP for QUIC if opened). 80/443 belong to another app.
+
+tls_cert_path: /etc/xrok/tls/fullchain.pem
+tls_key_path: /etc/xrok/tls/privkey.pem
+
+api_token: __TOKEN__
+
+# -R: only this range may be bound; open the same range in the cloud firewall.
+reverse_port_min: 9000
+reverse_port_max: 9019
+reverse_max_per_client: 5
+
+# SOCKS/UDP never reach loopback/private/metadata/host addresses.
+allow_private_egress: false
+
+rate_limit: 20
+state_file: /var/lib/xrok/state.dat
+log_file: /var/log/xrok/server.log
+request_log: false
+debug: false

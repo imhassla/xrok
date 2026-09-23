@@ -1235,12 +1235,14 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 			r = r.WithContext(WithServerDeps(r.Context(), deps))
 		}
 		host := r.Host
-		if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
-			host = host[:colonIdx]
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
 		}
 
-		// Check if this is a request to the main domain (registration/control)
-		if host == serverDomain {
+		// Check if this is a request to the main domain (registration/control).
+		// A bare IP can never name a tunnel, so it is served as the main
+		// domain too (clients connecting by IP, e.g. through an SSH forward).
+		if host == serverDomain || net.ParseIP(strings.Trim(host, "[]")) != nil {
 			if !controlClientCertAccepted(r) {
 				http.Error(w, "Client certificate required", http.StatusForbidden)
 				return

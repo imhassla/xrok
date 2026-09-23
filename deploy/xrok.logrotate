@@ -1,0 +1,11 @@
+/var/log/xrok/*.log {
+	daily
+	rotate 7
+	maxsize 50M
+	compress
+	missingok
+	notifempty
+	# xrok keeps its log fd open (O_APPEND); truncate in place.
+	copytruncate
+	create 0640 xrok xrok
+}
