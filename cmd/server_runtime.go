@@ -325,6 +325,9 @@ func (r *ServerRuntime) args() []string {
 	if c.MASQUE {
 		a = append(a, "--masque")
 	}
+	if c.WebTransport {
+		a = append(a, "--webtransport")
+	}
 	if c.TLSCertPath != "" {
 		a = append(a, "--tls-cert", c.TLSCertPath)
 	}

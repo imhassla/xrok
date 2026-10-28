@@ -10,7 +10,7 @@ func TunnelTransport(value string, quicFlag bool) (string, error) {
 		return "quic", nil
 	}
 	switch value {
-	case "", "legacy", "tcp", "tls", "websocket":
+	case "", "legacy", "tcp", "tls", "non-tls", "websocket":
 		return "legacy", nil
 	case "http2", "wss", "quic", "auto":
 		return value, nil

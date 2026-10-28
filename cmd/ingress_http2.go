@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/yamux"
 	"github.com/quic-go/quic-go"
 	"golang.org/x/net/http2"
 )
@@ -31,17 +32,18 @@ type ingressQUICStream struct {
 
 func (s *ingressQUICStream) LocalAddr() net.Addr  { return s.local }
 func (s *ingressQUICStream) RemoteAddr() net.Addr { return s.remote }
+func (s *ingressQUICStream) CloseWrite() error    { return s.Stream.Close() }
 func (s *ingressQUICStream) Close() error         { s.CancelRead(0); return s.Stream.Close() }
 
 // openIngressStream retains the existing named-stream wire protocol, so HTTP/2
 // ingress also works with older clients and either established tunnel carrier.
-func openIngressStream(ctx context.Context, client *serverClientInfo, name string) (net.Conn, error) {
+func openClientTransportStream(ctx context.Context, client *serverClientInfo) (net.Conn, error) {
 	client.muxSessionMutex.Lock()
 	session := client.muxSession
 	client.muxSessionMutex.Unlock()
 	var conn net.Conn
 	if session != nil && !session.IsClosed() {
-		stream, err := session.Open()
+		stream, err := openYamuxIngress(ctx, client, session)
 		if err != nil {
 			return nil, err
 		}
@@ -59,6 +61,58 @@ func openIngressStream(ctx context.Context, client *serverClientInfo, name strin
 		}
 		conn = &ingressQUICStream{stream, qc.Connection().LocalAddr(), qc.Connection().RemoteAddr()}
 	}
+	return conn, nil
+}
+
+// yamux.Open has no context API. Bound in-flight opens and close a late result
+// when its HTTP/2/WebTransport request was canceled, without killing other RPCs.
+func openYamuxIngress(ctx context.Context, client *serverClientInfo, session *yamux.Session) (net.Conn, error) {
+	client.ingressOpenMu.Lock()
+	if client.ingressOpening == nil {
+		client.ingressOpening = make(chan struct{}, 128)
+	}
+	slots := client.ingressOpening
+	client.ingressOpenMu.Unlock()
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ready := make(chan result)
+	go func() {
+		defer func() { <-slots }()
+		conn, err := session.Open()
+		select {
+		case ready <- result{conn, err}:
+		case <-ctx.Done():
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+	}()
+	select {
+	case r := <-ready:
+		if err := ctx.Err(); err != nil {
+			if r.conn != nil {
+				_ = r.conn.Close()
+			}
+			return nil, err
+		}
+		return r.conn, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func openIngressStream(ctx context.Context, client *serverClientInfo, name string) (net.Conn, error) {
+	conn, err := openClientTransportStream(ctx, client)
+	if err != nil {
+		return nil, err
+	}
 	// Always emit a routing byte. Legacy unnamed clients consume a zero marker.
 	if len(name) > 255 {
 		_ = conn.Close()
@@ -69,7 +123,7 @@ func openIngressStream(ctx context.Context, client *serverClientInfo, name strin
 	}
 	header := append([]byte{byte(len(name))}, []byte(name)...)
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_, err := conn.Write(header)
+	_, err = conn.Write(header)
 	_ = conn.SetWriteDeadline(time.Time{})
 	if err != nil {
 		_ = conn.Close()

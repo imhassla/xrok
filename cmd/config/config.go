@@ -55,11 +55,14 @@ type ClientConfig struct {
 
 // TunnelConfig represents a tunnel configuration
 type TunnelConfig struct {
-	Name               string `yaml:"name"`
-	Target             string `yaml:"target"`
-	BasicAuth          string `yaml:"basic_auth,omitempty"` // user:password
-	Capability         string `yaml:"capability,omitempty"`
-	CapabilityAudience string `yaml:"capability_audience,omitempty"`
+	WebTransport        bool     `yaml:"webtransport,omitempty"`
+	Datagrams           bool     `yaml:"datagrams,omitempty"`
+	WebTransportOrigins []string `yaml:"webtransport_origins,omitempty"`
+	Name                string   `yaml:"name"`
+	Target              string   `yaml:"target"`
+	BasicAuth           string   `yaml:"basic_auth,omitempty"` // user:password
+	Capability          string   `yaml:"capability,omitempty"`
+	CapabilityAudience  string   `yaml:"capability_audience,omitempty"`
 }
 
 // UDPConfig represents UDP tunnel configuration
@@ -112,19 +115,20 @@ type TURNConfig struct {
 
 // ServerConfig represents server configuration
 type ServerConfig struct {
-	MASQUE      bool   `yaml:"masque,omitempty"`
-	Version     int    `yaml:"version,omitempty"`
-	Domain      string `yaml:"domain"`
-	TLSCertPath string `yaml:"tls_cert_path,omitempty"`
-	TLSKeyPath  string `yaml:"tls_key_path,omitempty"`
-	Port        int    `yaml:"port"`
-	ProxyPort   int    `yaml:"proxy_port"`
-	PublicPort  int    `yaml:"public_port,omitempty"`
-	MetricsPort int    `yaml:"metrics_port"`
-	Debug       bool   `yaml:"debug"`
-	Quiet       bool   `yaml:"quiet"`
-	Verbose     bool   `yaml:"verbose"`
-	APIToken    string `yaml:"api_token,omitempty"`
+	WebTransport bool   `yaml:"webtransport,omitempty"`
+	MASQUE       bool   `yaml:"masque,omitempty"`
+	Version      int    `yaml:"version,omitempty"`
+	Domain       string `yaml:"domain"`
+	TLSCertPath  string `yaml:"tls_cert_path,omitempty"`
+	TLSKeyPath   string `yaml:"tls_key_path,omitempty"`
+	Port         int    `yaml:"port"`
+	ProxyPort    int    `yaml:"proxy_port"`
+	PublicPort   int    `yaml:"public_port,omitempty"`
+	MetricsPort  int    `yaml:"metrics_port"`
+	Debug        bool   `yaml:"debug"`
+	Quiet        bool   `yaml:"quiet"`
+	Verbose      bool   `yaml:"verbose"`
+	APIToken     string `yaml:"api_token,omitempty"`
 	// ClientIdentities enables per-client control-plane credentials. APIToken is
 	// retained as an administrator/legacy fallback during migration.
 	ClientIdentities []ClientIdentityConfig `yaml:"client_identities,omitempty"`
@@ -261,6 +265,17 @@ type HealthCheckConfig struct {
 // starting network goroutines. An empty Server remains valid here because CLI
 // flags may supply it after loading the file.
 func (c *ClientConfig) Validate() error {
+	for _, t := range c.Tunnels {
+		if t.Datagrams && !t.WebTransport {
+			return fmt.Errorf("tunnel datagrams require webtransport")
+		}
+		for _, o := range t.WebTransportOrigins {
+			u, err := url.Parse(o)
+			if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+				return fmt.Errorf("invalid WebTransport origin")
+			}
+		}
+	}
 	if _, err := TunnelTransport(c.Transport, false); err != nil {
 		return err
 	}

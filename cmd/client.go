@@ -35,11 +35,14 @@ import (
 
 // TunnelConfig represents a single tunnel configuration
 type TunnelConfig struct {
-	Name               string `json:"name"`                 // Subdomain name (e.g., "app", "api")
-	Target             string `json:"target"`               // Local target (e.g., "localhost:8080")
-	BasicAuth          string `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
-	Capability         string `json:"capability,omitempty"` // optional capability required by the public route
-	CapabilityAudience string `json:"capability_audience,omitempty"`
+	WebTransport        bool     `json:"webtransport,omitempty"`
+	Datagrams           bool     `json:"datagrams,omitempty"`
+	WebTransportOrigins []string `json:"webtransport_origins,omitempty"`
+	Name                string   `json:"name"`                 // Subdomain name (e.g., "app", "api")
+	Target              string   `json:"target"`               // Local target (e.g., "localhost:8080")
+	BasicAuth           string   `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
+	Capability          string   `json:"capability,omitempty"` // optional capability required by the public route
+	CapabilityAudience  string   `json:"capability_audience,omitempty"`
 }
 
 // tunnelFlag implements flag.Value for multiple --tunnel flags
@@ -501,7 +504,7 @@ func RunClient(args []string) {
 		}
 		if len(tunnels) == 0 && len(cfg.Tunnels) > 0 {
 			for _, t := range cfg.Tunnels {
-				tunnels = append(tunnels, TunnelConfig{Name: t.Name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability, CapabilityAudience: t.CapabilityAudience})
+				tunnels = append(tunnels, TunnelConfig{Name: t.Name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability, CapabilityAudience: t.CapabilityAudience, WebTransport: t.WebTransport, Datagrams: t.Datagrams, WebTransportOrigins: t.WebTransportOrigins})
 			}
 		}
 		if len(udpTunnels) == 0 && len(cfg.UDP) > 0 {
@@ -1647,6 +1650,10 @@ func handleQUICStream(ctx context.Context, stream *quic.Stream, state *clientSta
 		clientLog.Debug("Failed to read QUIC stream header: %v", err)
 		return
 	}
+	if lenBuf[0] == 0xFC {
+		handleVisitorUDPStream(ctx, stream, state)
+		return
+	}
 
 	// Check for reverse forwarding marker
 	if lenBuf[0] == 0xFD {
@@ -1682,29 +1689,14 @@ func handleQUICStream(ctx context.Context, stream *quic.Stream, state *clientSta
 		return
 	}
 
-	localConn, err := net.Dial("tcp", target)
+	localConn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", target)
 	if err != nil {
 		clientLog.Debug("Failed to connect to local app %s: %v", target, err)
 		return
 	}
 	defer localConn.Close()
 
-	done := make(chan struct{}, 2)
-
-	go func() {
-		io.Copy(localConn, stream)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		io.Copy(stream, localConn)
-		done <- struct{}{}
-	}()
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-	}
+	relayLocalApplication(ctx, stream, localConn)
 }
 
 func handleQUICReverseForward(ctx context.Context, stream *quic.Stream, state *clientState) {
@@ -1892,6 +1884,10 @@ func handleMuxStream(ctx context.Context, stream net.Conn, state *clientState) {
 		log.Printf("Failed to read stream header: %v", err)
 		return
 	}
+	if lenBuf[0] == 0xFC {
+		handleVisitorUDPStream(ctx, stream, state)
+		return
+	}
 
 	// Check for reverse forwarding marker
 	if lenBuf[0] == 0xFD {
@@ -1975,31 +1971,14 @@ func handleMuxStream(ctx context.Context, stream net.Conn, state *clientState) {
 		return
 	}
 
-	localConn, err := net.Dial("tcp", target)
+	localConn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", target)
 	if err != nil {
 		log.Printf("Failed to connect to local app %s via mux: %v", target, err)
 		return
 	}
 	defer localConn.Close()
 
-	done := make(chan struct{}, 2)
-
-	go func() {
-		defer func() { done <- struct{}{} }()
-		io.Copy(localConn, stream)
-	}()
-
-	go func() {
-		defer func() { done <- struct{}{} }()
-		io.Copy(stream, localConn)
-	}()
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-		stream.Close()
-		localConn.Close()
-	}
+	relayLocalApplication(ctx, stream, localConn)
 }
 
 func connectAndForwardSession(ctx context.Context, state *clientState) {

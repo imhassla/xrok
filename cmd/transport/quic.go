@@ -21,6 +21,8 @@ type QUICTransport struct {
 // Call before Listen/Dial; legacy native QUIC keeps the library default.
 func (t *QUICTransport) SetInitialPacketSize(n uint16) { t.quicConfig.InitialPacketSize = n }
 
+func (t *QUICTransport) EnableWebTransport() { t.quicConfig.EnableStreamResetPartialDelivery = true }
+
 // NewQUICTransport creates a new QUIC transport
 func NewQUICTransport(tlsConfig *tls.Config) *QUICTransport {
 	return &QUICTransport{

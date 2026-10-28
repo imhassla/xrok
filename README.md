@@ -312,6 +312,80 @@ curl http://example.com  # Goes through tunnel server
   -compress
 ```
 
+### Browser WebTransport tunnels (opt-in)
+
+Enable server YAML `webtransport: true` or `xrok server --webtransport` to serve
+WebTransport over HTTP/3 on the existing UDP port. It can coexist with MASQUE and
+native QUIC through ALPN. TCP HTTPS and existing clients retain their routes.
+The pinned implementation is `webtransport-go v0.10.0` (HTTP/3 draft-14 family)
+with `quic-go v0.59.0`, retaining the Go 1.24 baseline. Compatibility with later
+drafts or every browser version is not implied. Integration tests cover the Go
+peer and real Chrome 156, including verified/pinned certificates.
+
+A client must explicitly expose the raw byte service and opt into datagrams:
+
+```yaml
+server: your-xrok.example
+server_port: 8443
+token: YOUR_CONTROL_CREDENTIAL
+transport: auto
+tunnels:
+  - name: realtime
+    target: 127.0.0.1:9000
+    webtransport: true
+    datagrams: true
+    capability: YOUR_PRIVATE_HS256_SIGNING_SECRET
+    capability_audience: browser
+    webtransport_origins:
+      - https://your-ui.example
+```
+
+Keep the profile and signing secret private. The browser receives a short-lived
+HS256 JWT with the matching audience, signed by your application/issuer, rather
+than the signing secret or xrok control credential:
+
+```javascript
+const endpoint = "https://realtime.your-xrok.example:8443/.well-known/xrok/webtransport";
+const tunnel = new WebTransport(endpoint + "?cap=" + encodeURIComponent(shortLivedJWT));
+await tunnel.ready;
+const stream = await tunnel.createBidirectionalStream();
+// stream.readable / stream.writable carry one local TCP connection.
+// tunnel.datagrams carries UDP when explicitly enabled for this tunnel.
+```
+
+Each accepted bidirectional stream opens a new connection to that tunnel's fixed
+local TCP target. Half-close is preserved: finishing a request's writable side does
+not discard its response. Datagrams, when enabled, go to the same configured
+host/port over UDP; run a UDP service there as well. They are limited to 1,200 bytes
+and retain datagram boundaries. Disabled datagrams close the session with a policy
+error. Unidirectional application streams are not exposed by this gateway.
+
+Sessions require an explicit `webtransport` route, a configured capability and an
+allowed Origin (same HTTPS origin or an exact `webtransport_origins` entry). Missing
+Origin is allowed for authenticated non-browser clients. Basic Auth, if configured,
+still applies; normal browser WebTransport APIs cannot supply arbitrary Basic Auth
+headers. Non-browser peers can send a static capability in `X-Xrok-Capability`;
+query-string capabilities must be expiring JWTs. Do not put the signing secret or
+long-lived control token in the URL. Avoid recording JWT-bearing URLs in deployment
+access logs. The server itself does not log WebTransport URLs or credentials.
+
+The gateway caps sessions at 32, bidirectional streams per session at 32, and
+session lifetime at the earlier of five minutes or JWT expiry. UDP bridges expire
+after one idle minute. Session expiry, client disconnect and cancellation close
+backend sockets and tunnel streams. This is a capability-protected raw TCP/UDP
+gateway, not automatic HTTP/gRPC-Web conversion or a WebRTC DataChannel endpoint.
+
+Run the browser integration test with an installed Chrome/Chromium executable:
+
+```bash
+XROK_BROWSER_TEST=1 XROK_CHROME=/path/to/chrome \
+  go test -race ./cmd -run TestWebTransportBrowserChrome -count=1
+```
+
+The test uses a separate temporary headless profile and a short-lived ECDSA leaf
+passed through `serverCertificateHashes`; it does not disable TLS verification or
+modify browser/system certificate stores.
+
 ### MASQUE CONNECT-UDP (opt-in)
 
 Start the server with `--masque` (or YAML `masque: true`) to add an RFC 9298
@@ -385,7 +459,7 @@ carrier and its streams. The byte adapters do not provide a carrier write-deadli
 individual yamux stream deadlines remain available.
 
 The default remains `legacy`: the existing raw byte stream following HTTP Upgrade,
-retained for older deployments. Historical `tcp`, `tls`, and `websocket` profile values
+retained for older deployments. Historical `tcp`, `tls`, `non-tls`, and `websocket` profile values
 remain legacy aliases. `--quic` and `--transport quic` select the existing native QUIC
 carrier. Use explicit `http2` or `wss` with a new server to gain standard intermediary
 compatibility; the legacy carrier does not become framed by renaming it.

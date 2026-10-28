@@ -11,7 +11,8 @@ require (
 	github.com/hashicorp/yamux v0.1.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/quic-go/masque-go v0.3.0
-	github.com/quic-go/quic-go v0.57.1
+	github.com/quic-go/quic-go v0.59.0
+	github.com/quic-go/webtransport-go v0.10.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	golang.org/x/net v0.43.0
 	golang.org/x/time v0.12.0
@@ -22,8 +23,7 @@ require (
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/dunglas/httpsfv v1.0.2 // indirect
-	github.com/kr/text v0.2.0 // indirect
+	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect

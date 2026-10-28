@@ -3,7 +3,7 @@ package config
 import "testing"
 
 func TestTunnelTransportCompatibilityAndValidation(t *testing.T) {
-	for _, s := range []string{"", "legacy", "tcp", "tls", "websocket"} {
+	for _, s := range []string{"", "legacy", "tcp", "tls", "non-tls", "websocket"} {
 		got, err := TunnelTransport(s, false)
 		if err != nil || got != "legacy" {
 			t.Fatalf("legacy alias %q: %q %v", s, got, err)

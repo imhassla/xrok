@@ -74,11 +74,14 @@ type serializableClientInfoForSave struct {
 
 // ServerTunnelConfig represents a tunnel configuration on the server
 type ServerTunnelConfig struct {
-	Name               string `json:"name"`
-	Target             string `json:"target"`
-	BasicAuth          string `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
-	Capability         string `json:"capability,omitempty"`
-	CapabilityAudience string `json:"capability_audience,omitempty"`
+	WebTransport        bool     `json:"webtransport,omitempty"`
+	Datagrams           bool     `json:"datagrams,omitempty"`
+	WebTransportOrigins []string `json:"webtransport_origins,omitempty"`
+	Name                string   `json:"name"`
+	Target              string   `json:"target"`
+	BasicAuth           string   `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
+	Capability          string   `json:"capability,omitempty"`
+	CapabilityAudience  string   `json:"capability_audience,omitempty"`
 }
 
 // ServerTunnelInfo contains server-side tunnel info
@@ -95,6 +98,8 @@ type ServerReverseConfig struct {
 }
 
 type serverClientInfo struct {
+	ingressOpenMu  sync.Mutex
+	ingressOpening chan struct{}
 	serializableClientInfo
 	conn                *websocket.Conn
 	connWriteMutex      sync.Mutex
@@ -136,13 +141,16 @@ func (c *serverClientInfo) validSessionToken(presented string) bool {
 
 // TunnelRoute maps a subdomain to client and tunnel info
 type TunnelRoute struct {
-	ClientID           string
-	TunnelName         string
-	Target             string
-	BasicAuth          string            // user:password for HTTP Basic Auth
-	Headers            map[string]string // Custom headers to inject
-	Capability         string            // Optional capability token required by route
-	CapabilityAudience string            // JWT audience when capability is an HS256 secret
+	WebTransport        bool
+	Datagrams           bool
+	WebTransportOrigins []string
+	ClientID            string
+	TunnelName          string
+	Target              string
+	BasicAuth           string            // user:password for HTTP Basic Auth
+	Headers             map[string]string // Custom headers to inject
+	Capability          string            // Optional capability token required by route
+	CapabilityAudience  string            // JWT audience when capability is an HS256 secret
 }
 
 // Server globals
@@ -324,6 +332,7 @@ func serverConfigPath(args []string) (string, bool) {
 // and rate limits are not lost in the flag translation.
 func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExporter telemetry.Exporter) {
 	serverMASQUE = false
+	serverWebTransport = false
 	serverPublicPort = 0
 	loadedConfig := preset
 	if path, ok := serverConfigPath(args); ok {
@@ -340,6 +349,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	}
 	if loadedConfig != nil {
 		serverMASQUE = loadedConfig.MASQUE
+		serverWebTransport = loadedConfig.WebTransport
 		serverDomain = loadedConfig.Domain
 		serverPort = loadedConfig.ProxyPort
 		serverPublicPort = loadedConfig.PublicPort
@@ -378,6 +388,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	fs.BoolVar(&serverMASQUE, "masque", serverMASQUE, "Enable authenticated RFC 9298 HTTP/3 CONNECT-UDP on the shared UDP port")
+	fs.BoolVar(&serverWebTransport, "webtransport", serverWebTransport, "Enable capability-protected browser WebTransport routes on the shared UDP port")
 	fs.String("config", "", "Path to YAML config file")
 	// Preserve a domain loaded from --config unless the CLI explicitly
 	// overrides it. Registering the flag with an empty default would reset the
@@ -1179,7 +1190,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			tunnels = append(tunnels, ServerTunnelConfig{Name: name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability, CapabilityAudience: t.CapabilityAudience})
+			tunnels = append(tunnels, ServerTunnelConfig{Name: name, Target: t.Target, BasicAuth: t.BasicAuth, Capability: t.Capability, CapabilityAudience: t.CapabilityAudience, WebTransport: t.WebTransport, Datagrams: t.Datagrams, WebTransportOrigins: t.WebTransportOrigins})
 			tunnelMap[name] = t.Target
 
 			url := serverPublicURL(name, serverDomain)
@@ -1230,6 +1241,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			Headers:            regReq.Headers,
 			Capability:         t.Capability,
 			CapabilityAudience: t.CapabilityAudience,
+			WebTransport:       t.WebTransport, Datagrams: t.Datagrams, WebTransportOrigins: t.WebTransportOrigins,
 		})
 	}
 	serverClientLifecycleMu.Unlock()
@@ -1619,7 +1631,7 @@ func waitForQUICConnections(ctx context.Context, port int) {
 		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
 	}
 	var services *http3Services
-	if serverMASQUE {
+	if serverMASQUE || serverWebTransport {
 		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h3")
 		services = newHTTP3Services(tlsConfig)
 		defer services.Close()
@@ -1628,6 +1640,9 @@ func waitForQUICConnections(ctx context.Context, port int) {
 	quicTransport := transport.NewQUICTransport(tlsConfig)
 	if services != nil {
 		quicTransport.SetInitialPacketSize(1350)
+		if serverWebTransport {
+			quicTransport.EnableWebTransport()
+		}
 	}
 	listener, err := quicTransport.Listen(fmt.Sprintf(":%d", port))
 	if err != nil {
@@ -1664,7 +1679,7 @@ func waitForQUICConnections(ctx context.Context, port int) {
 				defer func() { <-serverHTTP3Slots; conn.Close() }()
 				stop := context.AfterFunc(ctx, func() { conn.Close() })
 				defer stop()
-				_ = services.server.ServeQUICConn(conn.(*transport.QUICConn).Connection())
+				_ = services.ServeQUICConn(conn.(*transport.QUICConn).Connection())
 			}()
 			continue
 		}
