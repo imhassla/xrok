@@ -1280,6 +1280,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Build response
 	type regResponse struct {
+		Transports    []string           `json:"transports,omitempty"`
 		UDID          string             `json:"udid"`
 		ClientPortTLS string             `json:"client_port_tls"`
 		ProxyURLNoTLS string             `json:"proxy_url_notls"`
@@ -1290,6 +1291,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := regResponse{
+		Transports:    []string{"legacy", "http2", "wss", "quic"},
 		UDID:          clientID,
 		ClientPortTLS: strconv.Itoa(serverClientRoutingPort(clientPortTLS)),
 		ProxyURLNoTLS: fmt.Sprintf("%s:%d", serverDomain, portNoTLS),
@@ -1385,6 +1387,9 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 				return
 			case "/mux":
 				serverRateLimitMiddleware(serverMuxWebSocketHandler)(w, r)
+				return
+			case "/v2/tunnel", "/v2/tunnel/ws":
+				serverRateLimitMiddleware(serverStandardTunnelHandler)(w, r)
 				return
 			case "/p2p/signal":
 				serverAuthScopeMiddleware(scopeP2PSignal, handleP2PSignaling)(w, r)
@@ -2982,15 +2987,20 @@ func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	srvWsUpgrades.Inc()
 
+	defer wsConn.Close()
+	serveServerMuxCarrier(wsConn.UnderlyingConn(), client, clientID)
+}
+
+func serveServerMuxCarrier(carrier net.Conn, client *serverClientInfo, clientID string) {
 	config := yamux.DefaultConfig()
 	config.AcceptBacklog = 256
 	config.EnableKeepAlive = true
 	config.KeepAliveInterval = 30 * time.Second
 
-	session, err := yamux.Server(wsConn.UnderlyingConn(), config)
+	session, err := yamux.Server(carrier, config)
 	if err != nil {
 		log.Printf("Failed to create yamux session: %v", err)
-		wsConn.Close()
+		carrier.Close()
 		return
 	}
 

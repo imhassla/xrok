@@ -260,6 +260,9 @@ type HealthCheckConfig struct {
 // starting network goroutines. An empty Server remains valid here because CLI
 // flags may supply it after loading the file.
 func (c *ClientConfig) Validate() error {
+	if _, err := TunnelTransport(c.Transport, false); err != nil {
+		return err
+	}
 	session := c.ProxySession
 	if len(session) > 256 || !validProxySession(session) {
 		return fmt.Errorf("invalid proxy session marker")

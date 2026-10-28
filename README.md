@@ -312,6 +312,29 @@ curl http://example.com  # Goes through tunnel server
   -compress
 ```
 
+### Versioned standard tunnel transports
+
+Select `--transport http2` for a full-duplex HTTP/2 POST carrier, or `--transport wss`
+for a real RFC 6455 binary-message carrier. Both carry the existing multiplexed
+streams and work through HTTP-aware reverse proxies; WSS negotiates the `xrok.v2`
+subprotocol. The corresponding YAML setting is `transport: http2` or `transport: wss`.
+The server advertises supported carriers during registration. An explicit unsupported
+choice fails rather than silently choosing a different route or disabling TLS.
+
+These endpoints require a registration's session token in `X-Xrok-Session` and
+`X-Xrok-Tunnel-Version: 2`. They share the existing control-plane TLS/mTLS policy.
+HTTP/HTTPS CONNECT and SOCKS5 upstream proxy settings also apply to these carriers;
+target and proxy TLS remain separately verified. The establishment timeout ends after
+the handshake; it does not cap a healthy carrier's lifetime. Cancellation closes the
+carrier and its streams. The byte adapters do not provide a carrier write-deadline API;
+individual yamux stream deadlines remain available.
+
+The default remains `legacy`: the existing raw byte stream following HTTP Upgrade,
+retained for older deployments. Historical `tcp`, `tls`, and `websocket` profile values
+remain legacy aliases. `--quic` and `--transport quic` select the existing native QUIC
+carrier. Use explicit `http2` or `wss` with a new server to gain standard intermediary
+compatibility; the legacy carrier does not become framed by renaming it.
+
 ### HTTP/2 and gRPC application ingress
 
 The public HTTPS listener negotiates HTTP/2 or HTTP/1.1. A named tunnel can expose

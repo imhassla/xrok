@@ -202,54 +202,56 @@ type TunnelInfo struct {
 }
 
 type clientState struct {
-	ClientID           string
-	ProxyURL           string
-	ClientPort         string
-	ServerAddr         string
-	ServerPort         int    // Registration/QUIC server port
-	LocalPort          string // Legacy single tunnel
-	Tunnels            []TunnelConfig
-	TunnelMap          map[string]string // name -> target mapping
-	UDPTunnels         []UDPTunnelConfig // UDP tunnel configurations
-	ReverseTunnels     []ReverseConfig   // Reverse forwarding configurations
-	ReverseMap         map[string]string // remote -> local mapping
-	UseTLS             bool
-	UseProxy           bool
-	Socks5Addr         string // SOCKS5 proxy address
-	ConnectionID       string
-	MuxSession         *yamux.Session
-	QUICConn           *transport.QUICConn // QUIC connection
-	UseQUIC            bool                // Use QUIC transport
-	Headers            map[string]string   // Custom headers to inject
-	Compress           bool                // Enable compression
-	ConnectTimeout     time.Duration
-	ProxySession       string
-	ProxySessionHeader string
-	ProxyTLSConfig     *tls.Config
-	Multiplexed        bool
-	HTTPProxy          string      // HTTP CONNECT proxy URL
-	ClientCert         string      // Path to client certificate for mTLS
-	ClientKey          string      // Path to client private key for mTLS
-	TLSConfig          *tls.Config // TLS config with mTLS if configured
-	SessionToken       string      // Credential returned by registration
-	APIToken           string      // Control-plane credential
-	StdioMode          bool        // Stdio tunneling mode
-	StdioTarget        string      // Target for stdio mode
-	P2PManager         *p2p.P2PManager
-	P2PEnabled         bool
-	P2PInfo            *p2p.PeerInfo
-	P2PSignalConn      *websocket.Conn           // WebSocket for P2P signaling
-	P2PSignalMutex     sync.Mutex                // Mutex for P2P signaling
-	P2PConnections     map[string]net.Conn       // Active P2P connections (peerID -> conn)
-	P2PConnMutex       sync.RWMutex              // Mutex for P2P connections
-	P2PTunnels         map[string]*p2p.P2PTunnel // P2P tunnels for HTTP traffic (peerID -> tunnel)
-	P2PTunnelsMutex    sync.RWMutex              // Mutex for P2P tunnels
-	P2PNegotiations    *p2p.NegotiationStore
-	P2PPeers           map[string]*p2p.PeerInfo
-	P2PStateMutex      sync.RWMutex
-	P2PStunServer      string
-	P2PTURN            config.TURNConfig
-	P2PActiveSessions  map[string]string
+	ClientID            string
+	ProxyURL            string
+	ClientPort          string
+	ServerAddr          string
+	ServerPort          int    // Registration/QUIC server port
+	LocalPort           string // Legacy single tunnel
+	Tunnels             []TunnelConfig
+	TunnelMap           map[string]string // name -> target mapping
+	UDPTunnels          []UDPTunnelConfig // UDP tunnel configurations
+	ReverseTunnels      []ReverseConfig   // Reverse forwarding configurations
+	ReverseMap          map[string]string // remote -> local mapping
+	UseTLS              bool
+	UseProxy            bool
+	Socks5Addr          string // SOCKS5 proxy address
+	ConnectionID        string
+	MuxSession          *yamux.Session
+	QUICConn            *transport.QUICConn // QUIC connection
+	UseQUIC             bool                // Use QUIC transport
+	Transport           string
+	SupportedTransports []string
+	Headers             map[string]string // Custom headers to inject
+	Compress            bool              // Enable compression
+	ConnectTimeout      time.Duration
+	ProxySession        string
+	ProxySessionHeader  string
+	ProxyTLSConfig      *tls.Config
+	Multiplexed         bool
+	HTTPProxy           string      // HTTP CONNECT proxy URL
+	ClientCert          string      // Path to client certificate for mTLS
+	ClientKey           string      // Path to client private key for mTLS
+	TLSConfig           *tls.Config // TLS config with mTLS if configured
+	SessionToken        string      // Credential returned by registration
+	APIToken            string      // Control-plane credential
+	StdioMode           bool        // Stdio tunneling mode
+	StdioTarget         string      // Target for stdio mode
+	P2PManager          *p2p.P2PManager
+	P2PEnabled          bool
+	P2PInfo             *p2p.PeerInfo
+	P2PSignalConn       *websocket.Conn           // WebSocket for P2P signaling
+	P2PSignalMutex      sync.Mutex                // Mutex for P2P signaling
+	P2PConnections      map[string]net.Conn       // Active P2P connections (peerID -> conn)
+	P2PConnMutex        sync.RWMutex              // Mutex for P2P connections
+	P2PTunnels          map[string]*p2p.P2PTunnel // P2P tunnels for HTTP traffic (peerID -> tunnel)
+	P2PTunnelsMutex     sync.RWMutex              // Mutex for P2P tunnels
+	P2PNegotiations     *p2p.NegotiationStore
+	P2PPeers            map[string]*p2p.PeerInfo
+	P2PStateMutex       sync.RWMutex
+	P2PStunServer       string
+	P2PTURN             config.TURNConfig
+	P2PActiveSessions   map[string]string
 
 	// p2pLookupClient is shared by FetchViaP2P owner lookups.
 	p2pLookupOnce   sync.Once
@@ -332,6 +334,7 @@ func (r *ClientRuntime) Close() {
 }
 
 type registerResponse struct {
+	Transports    []string     `json:"transports,omitempty"`
 	UDID          string       `json:"udid"`
 	ProxyURLTLS   string       `json:"proxy_url_tls"`
 	ProxyURLNoTLS string       `json:"proxy_url_notls"`
@@ -408,6 +411,7 @@ func RunClient(args []string) {
 
 	// Transport selection
 	useQUIC := fs.Bool("quic", false, "Use QUIC transport instead of WebSocket")
+	transportMode := fs.String("transport", "", "Tunnel transport: legacy|http2|wss|quic")
 
 	// HTTP CONNECT proxy (for corporate proxies)
 	httpProxy := fs.String("http-proxy", "", "Upstream proxy URL: http, https, socks5 (local DNS), or socks5h (proxy DNS)")
@@ -518,8 +522,11 @@ func RunClient(args []string) {
 			*enableCompress = cfg.Compress
 		}
 		// Apply transport from config
-		if (cfg.Transport == "quic" || cfg.ConnectionType == "quic") && !*useQUIC {
-			*useQUIC = true
+		if *transportMode == "" && !*useQUIC {
+			*transportMode = cfg.Transport
+			if *transportMode == "" {
+				*transportMode = cfg.ConnectionType
+			}
 		}
 		// Apply TLS setting from config (CLI can override)
 		if !*useTLS && cfg.TLS {
@@ -637,6 +644,16 @@ func RunClient(args []string) {
 
 	if *serverAddr == "" {
 		clientLog.Error("The --server flag or 'server' in config file is required.")
+		os.Exit(1)
+	}
+	mode, modeErr := config.TunnelTransport(*transportMode, *useQUIC)
+	if modeErr != nil {
+		clientLog.Error("%v", modeErr)
+		os.Exit(1)
+	}
+	*useQUIC = mode == "quic"
+	if mode != "legacy" && !*useTLS {
+		clientLog.Error("standard transports require TLS")
 		os.Exit(1)
 	}
 	// Accept --server host:port; every URL is built as host:rp.
@@ -772,6 +789,7 @@ func RunClient(args []string) {
 		ReverseMap:         reverseMap,
 		Socks5Addr:         *socks5Addr,
 		UseQUIC:            *useQUIC,
+		Transport:          mode,
 		Headers:            customHeaders,
 		Compress:           *enableCompress,
 		HTTPProxy:          *httpProxy,
@@ -1391,6 +1409,7 @@ func registerClient(ctx context.Context, state *clientState, token string) bool 
 		adoptAssignedP2PIdentity(state, res.UDID)
 		state.SessionToken = res.SessionToken
 		state.Multiplexed = res.Multiplexed
+		state.SupportedTransports = res.Transports
 		state.ClientPort = res.ClientPortTLS
 
 		if state.UseTLS {
@@ -1719,6 +1738,21 @@ func handleQUICReverseForward(ctx context.Context, stream *quic.Stream, state *c
 }
 
 func connectMuxWithDisconnect(ctx context.Context, state *clientState, disconnected chan<- struct{}) {
+	if state.Transport == "http2" || state.Transport == "wss" {
+		defer func() {
+			select {
+			case disconnected <- struct{}{}:
+			default:
+			}
+		}()
+		carrier, err := state.dialStandardCarrier(ctx, state.Transport)
+		if err != nil {
+			logCarrierError(state, err)
+			return
+		}
+		runClientMuxCarrier(ctx, state, carrier)
+		return
+	}
 	defer func() {
 		select {
 		case disconnected <- struct{}{}:
