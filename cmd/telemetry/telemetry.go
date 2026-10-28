@@ -465,6 +465,8 @@ func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	}
 	return h.Hijack()
 }
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()

@@ -1476,6 +1476,10 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 			}
 		}
 
+		if r.ProtoMajor == 2 {
+			serveHTTP2Tunnel(w, r, client, tunnelName, basicAuth, customHeaders)
+			return
+		}
 		// Hijack connection for raw proxying
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
@@ -1499,7 +1503,7 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 
 	tlsConfig := &tls.Config{
 		GetCertificate: certs.GetCertificate,
-		NextProtos:     []string{"http/1.1"}, // Disable HTTP/2 for hijacking support
+		NextProtos:     []string{"h2", "http/1.1"},
 		MinVersion:     tls.VersionTLS12,
 	}
 
@@ -1530,6 +1534,10 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 		ReadTimeout:  5 * time.Minute,
 		WriteTimeout: 5 * time.Minute,
 		IdleTimeout:  5 * time.Minute,
+	}
+	if err := configureIngressHTTP2(server); err != nil {
+		log.Printf("Configure HTTP/2 ingress: %v", err)
+		return
 	}
 
 	go func() {

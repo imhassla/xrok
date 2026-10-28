@@ -312,6 +312,29 @@ curl http://example.com  # Goes through tunnel server
   -compress
 ```
 
+### HTTP/2 and gRPC application ingress
+
+The public HTTPS listener negotiates HTTP/2 or HTTP/1.1. A named tunnel can expose
+a local plaintext gRPC server without changing the tunnel client's wire protocol:
+
+```bash
+xrok client --tunnel rpc:localhost:50051
+```
+
+Connect a standard TLS gRPC client to the announced `rpc` authority (including its
+port). The public connection uses HTTP/2; the encrypted xrok tunnel carries HTTP/2
+to the local plaintext (`h2c`, prior knowledge) gRPC backend. Unary, server/client
+streaming and bidirectional calls preserve binary metadata, response trailers,
+deadlines and cancellation. Maximum application message sizes remain the gRPC
+client/server's settings; xrok copies streaming bodies instead of buffering them.
+TLS-enabled local gRPC backends are not configured by this mode.
+
+Ordinary HTTP/2 requests can reach existing HTTP/1.1 applications. Existing
+HTTP/1.1 upgrades and legacy tunnel carriers retain their paths. Basic Auth and
+tunnel capability checks still apply. Native gRPC uses `application/grpc` (or a
+`+proto`/`+json` variant); this is not a gRPC-Web translation gateway. An unavailable
+tunnel returns gRPC status `UNAVAILABLE` rather than an HTML success response.
+
 ### Upstream proxy routes
 
 Use `--http-proxy` to route registration, control, mux, data, and stdio connections
