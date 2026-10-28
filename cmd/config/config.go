@@ -41,7 +41,11 @@ type ClientConfig struct {
 	// P2P configuration
 	P2P P2PConfig `yaml:"p2p,omitempty"`
 	// HTTP CONNECT proxy for corporate environments
-	HTTPProxy string `yaml:"http_proxy,omitempty"`
+	HTTPProxy          string        `yaml:"http_proxy,omitempty"`
+	ConnectTimeout     time.Duration `yaml:"connect_timeout,omitempty"`
+	ProxySession       string        `yaml:"proxy_session,omitempty"`
+	ProxySessionHeader string        `yaml:"proxy_session_header,omitempty"`
+	ProxyCACert        string        `yaml:"proxy_ca_cert,omitempty"`
 	// mTLS client certificates
 	ClientCert string `yaml:"client_cert,omitempty"`
 	ClientKey  string `yaml:"client_key,omitempty"`
@@ -114,6 +118,7 @@ type ServerConfig struct {
 	TLSKeyPath  string `yaml:"tls_key_path,omitempty"`
 	Port        int    `yaml:"port"`
 	ProxyPort   int    `yaml:"proxy_port"`
+	PublicPort  int    `yaml:"public_port,omitempty"`
 	MetricsPort int    `yaml:"metrics_port"`
 	Debug       bool   `yaml:"debug"`
 	Quiet       bool   `yaml:"quiet"`
@@ -255,6 +260,18 @@ type HealthCheckConfig struct {
 // starting network goroutines. An empty Server remains valid here because CLI
 // flags may supply it after loading the file.
 func (c *ClientConfig) Validate() error {
+	session := c.ProxySession
+	if len(session) > 256 || !validProxySession(session) {
+		return fmt.Errorf("invalid proxy session marker")
+	}
+	// A profile can hold its private marker while --http-proxy supplies the route.
+	// The resolved CLI configuration enforces that a marker has an actual proxy.
+	if c.HTTPProxy == "" {
+		session = ""
+	}
+	if err := ValidateProxySettings(c.HTTPProxy, session, c.ProxySessionHeader, c.ConnectTimeout, c.Transport == "quic" || c.ConnectionType == "quic", c.P2P.Enabled); err != nil {
+		return err
+	}
 	if c.Version > CurrentVersion {
 		return fmt.Errorf("unsupported client config version %d (current %d)", c.Version, CurrentVersion)
 	}
@@ -304,6 +321,9 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.Domain == "" {
 		return fmt.Errorf("server domain is required")
+	}
+	if c.PublicPort < 0 || c.PublicPort > 65535 {
+		return fmt.Errorf("public_port must be 0 or between 1 and 65535")
 	}
 	if c.ProxyPort < 0 || c.ProxyPort > 65535 {
 		return fmt.Errorf("proxy_port must be between 0 and 65535")
@@ -376,11 +396,13 @@ func (c *ServerConfig) Validate() error {
 // DefaultClientConfig returns default client configuration
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
-		TLS:      true,
-		Debug:    false,
-		Quiet:    false,
-		Verbose:  false,
-		Compress: false,
+		ConnectTimeout:     30 * time.Second,
+		ProxySessionHeader: "X-Proxy-Session",
+		TLS:                true,
+		Debug:              false,
+		Quiet:              false,
+		Verbose:            false,
+		Compress:           false,
 		Reconnect: ReconnectConfig{
 			Enabled:     true,
 			MaxRetries:  0, // unlimited

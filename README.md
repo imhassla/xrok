@@ -312,6 +312,53 @@ curl http://example.com  # Goes through tunnel server
   -compress
 ```
 
+### Upstream proxy routes
+
+Use `--http-proxy` to route registration, control, mux, data, and stdio connections
+through the same upstream. The historical option name accepts HTTP CONNECT,
+HTTPS-to-proxy, and SOCKS5 URLs:
+
+```bash
+./xrok client --server yourdomain.com --tunnel app:localhost:8080 \
+  --http-proxy http://127.0.0.1:3333 --proxy-session app-session \
+  --connect-timeout 15s
+```
+
+With ProxyMachine, configure `selectionPolicy: stable` and
+`stickyHeader: X-Proxy-Session` on the relay. The opaque `--proxy-session` marker is
+sent on each HTTP CONNECT, including registration and reconnects; it is not an origin
+application header or an API token. `--proxy-session-header` selects a different relay
+header when needed. Marker length is limited to 256 printable ASCII bytes. Prefer a
+protected client YAML file for credentials and stable session values.
+
+| Proxy scheme | Proxy hop | Target DNS | Default port |
+| --- | --- | --- | --- |
+| `http` | Plain HTTP CONNECT | Proxy | 80 |
+| `https` | Verified proxy TLS, then CONNECT | Proxy | 443 |
+| `socks5` | SOCKS5 with optional username/password | Local resolver | 1080 |
+| `socks5h` | SOCKS5 with optional username/password | Proxy | 1080 |
+
+Target TLS remains verified inside the proxy tunnel. `--proxy-ca-cert` adds a CA for
+an HTTPS proxy independently of `--ca-cert` for the xrok server; client mTLS identity
+is presented to the xrok server, not to the proxy. Proxy userinfo and known session/API
+secrets are redacted from route logs. Affinity markers require an HTTP CONNECT relay;
+SOCKS5 has no HTTP header channel.
+
+`--connect-timeout` bounds connection establishment, including proxy negotiation and
+target TLS. Successful long-lived connections outlive that budget. Cancellation stops
+pending handshakes and retry waits. A new server advertises its multiplexed protocol,
+so a new client avoids the redundant legacy control connection; older registration
+responses retain the previous fallback behavior.
+
+QUIC and P2P use direct network paths and cannot satisfy this TCP proxy routing
+requirement. xrok rejects an upstream proxy combined with `--quic` or `--p2p` before
+registration instead of silently bypassing the proxy. UDP payloads forwarded through
+an established TCP mux are a separate feature and do not imply proxied QUIC support.
+
+The equivalent client YAML fields are `http_proxy`, `proxy_session`,
+`proxy_session_header`, `connect_timeout`, and `proxy_ca_cert`. For public HTTPS on
+443 behind a shared listener, see the [SNI ingress guide](deploy/ingress.md).
+
 ### Combined Example
 
 ```bash
@@ -341,7 +388,11 @@ curl http://example.com  # Goes through tunnel server
 | `-config` | YAML configuration file | - |
 | `-header` | Add custom header `Name:Value` (repeatable) | - |
 | `-compress` | Enable WebSocket compression | false |
-| `-http-proxy` | HTTP CONNECT proxy URL | - |
+| `-http-proxy` | HTTP/HTTPS CONNECT or SOCKS5 upstream URL | - |
+| `--connect-timeout` | Connection establishment budget | 30s |
+| `--proxy-session` | Opaque HTTP relay affinity marker | - |
+| `--proxy-session-header` | HTTP relay affinity header | X-Proxy-Session |
+| `--proxy-ca-cert` | CA bundle for HTTPS proxy verification | system roots |
 | `-client-cert` | Client certificate for mTLS | - |
 | `-client-key` | Client private key for mTLS | - |
 | `-stdio` | Run in stdio mode for SSH ProxyCommand | false |

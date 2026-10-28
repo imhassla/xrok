@@ -1,0 +1,19 @@
+# Include at nginx's top level, alongside (not inside) the existing http block.
+# Move the existing HTTPS listener from public 443 to loopback 4443 first.
+# xrok keeps its own certificate and mTLS verification on 8443.
+stream {
+    map $ssl_preread_server_name $tls_backend {
+        hostnames;
+        xrok.example.com       127.0.0.1:8443;
+        *.xrok.example.com     127.0.0.1:8443;
+        default                127.0.0.1:4443;
+    }
+
+    server {
+        listen 443;
+        ssl_preread on;
+        proxy_pass $tls_backend;
+        proxy_connect_timeout 5s;
+        proxy_timeout 1h;
+    }
+}

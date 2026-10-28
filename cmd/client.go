@@ -1,11 +1,9 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -204,49 +202,54 @@ type TunnelInfo struct {
 }
 
 type clientState struct {
-	ClientID          string
-	ProxyURL          string
-	ClientPort        string
-	ServerAddr        string
-	ServerPort        int    // Registration/QUIC server port
-	LocalPort         string // Legacy single tunnel
-	Tunnels           []TunnelConfig
-	TunnelMap         map[string]string // name -> target mapping
-	UDPTunnels        []UDPTunnelConfig // UDP tunnel configurations
-	ReverseTunnels    []ReverseConfig   // Reverse forwarding configurations
-	ReverseMap        map[string]string // remote -> local mapping
-	UseTLS            bool
-	UseProxy          bool
-	Socks5Addr        string // SOCKS5 proxy address
-	ConnectionID      string
-	MuxSession        *yamux.Session
-	QUICConn          *transport.QUICConn // QUIC connection
-	UseQUIC           bool                // Use QUIC transport
-	Headers           map[string]string   // Custom headers to inject
-	Compress          bool                // Enable compression
-	HTTPProxy         string              // HTTP CONNECT proxy URL
-	ClientCert        string              // Path to client certificate for mTLS
-	ClientKey         string              // Path to client private key for mTLS
-	TLSConfig         *tls.Config         // TLS config with mTLS if configured
-	SessionToken      string              // Credential returned by registration
-	APIToken          string              // Control-plane credential
-	StdioMode         bool                // Stdio tunneling mode
-	StdioTarget       string              // Target for stdio mode
-	P2PManager        *p2p.P2PManager
-	P2PEnabled        bool
-	P2PInfo           *p2p.PeerInfo
-	P2PSignalConn     *websocket.Conn           // WebSocket for P2P signaling
-	P2PSignalMutex    sync.Mutex                // Mutex for P2P signaling
-	P2PConnections    map[string]net.Conn       // Active P2P connections (peerID -> conn)
-	P2PConnMutex      sync.RWMutex              // Mutex for P2P connections
-	P2PTunnels        map[string]*p2p.P2PTunnel // P2P tunnels for HTTP traffic (peerID -> tunnel)
-	P2PTunnelsMutex   sync.RWMutex              // Mutex for P2P tunnels
-	P2PNegotiations   *p2p.NegotiationStore
-	P2PPeers          map[string]*p2p.PeerInfo
-	P2PStateMutex     sync.RWMutex
-	P2PStunServer     string
-	P2PTURN           config.TURNConfig
-	P2PActiveSessions map[string]string
+	ClientID           string
+	ProxyURL           string
+	ClientPort         string
+	ServerAddr         string
+	ServerPort         int    // Registration/QUIC server port
+	LocalPort          string // Legacy single tunnel
+	Tunnels            []TunnelConfig
+	TunnelMap          map[string]string // name -> target mapping
+	UDPTunnels         []UDPTunnelConfig // UDP tunnel configurations
+	ReverseTunnels     []ReverseConfig   // Reverse forwarding configurations
+	ReverseMap         map[string]string // remote -> local mapping
+	UseTLS             bool
+	UseProxy           bool
+	Socks5Addr         string // SOCKS5 proxy address
+	ConnectionID       string
+	MuxSession         *yamux.Session
+	QUICConn           *transport.QUICConn // QUIC connection
+	UseQUIC            bool                // Use QUIC transport
+	Headers            map[string]string   // Custom headers to inject
+	Compress           bool                // Enable compression
+	ConnectTimeout     time.Duration
+	ProxySession       string
+	ProxySessionHeader string
+	ProxyTLSConfig     *tls.Config
+	Multiplexed        bool
+	HTTPProxy          string      // HTTP CONNECT proxy URL
+	ClientCert         string      // Path to client certificate for mTLS
+	ClientKey          string      // Path to client private key for mTLS
+	TLSConfig          *tls.Config // TLS config with mTLS if configured
+	SessionToken       string      // Credential returned by registration
+	APIToken           string      // Control-plane credential
+	StdioMode          bool        // Stdio tunneling mode
+	StdioTarget        string      // Target for stdio mode
+	P2PManager         *p2p.P2PManager
+	P2PEnabled         bool
+	P2PInfo            *p2p.PeerInfo
+	P2PSignalConn      *websocket.Conn           // WebSocket for P2P signaling
+	P2PSignalMutex     sync.Mutex                // Mutex for P2P signaling
+	P2PConnections     map[string]net.Conn       // Active P2P connections (peerID -> conn)
+	P2PConnMutex       sync.RWMutex              // Mutex for P2P connections
+	P2PTunnels         map[string]*p2p.P2PTunnel // P2P tunnels for HTTP traffic (peerID -> tunnel)
+	P2PTunnelsMutex    sync.RWMutex              // Mutex for P2P tunnels
+	P2PNegotiations    *p2p.NegotiationStore
+	P2PPeers           map[string]*p2p.PeerInfo
+	P2PStateMutex      sync.RWMutex
+	P2PStunServer      string
+	P2PTURN            config.TURNConfig
+	P2PActiveSessions  map[string]string
 
 	// p2pLookupClient is shared by FetchViaP2P owner lookups.
 	p2pLookupOnce   sync.Once
@@ -335,6 +338,7 @@ type registerResponse struct {
 	ClientPortTLS string       `json:"client_port_tls"`
 	Tunnels       []TunnelInfo `json:"tunnels,omitempty"`
 	SessionToken  string       `json:"session_token"`
+	Multiplexed   bool         `json:"multiplexed"`
 }
 
 var (
@@ -406,7 +410,12 @@ func RunClient(args []string) {
 	useQUIC := fs.Bool("quic", false, "Use QUIC transport instead of WebSocket")
 
 	// HTTP CONNECT proxy (for corporate proxies)
-	httpProxy := fs.String("http-proxy", "", "HTTP CONNECT proxy URL (e.g., http://proxy:8080 or http://user:pass@proxy:8080)")
+	httpProxy := fs.String("http-proxy", "", "Upstream proxy URL: http, https, socks5 (local DNS), or socks5h (proxy DNS)")
+
+	connectTimeout := fs.Duration("connect-timeout", 30*time.Second, "Total connection establishment budget")
+	proxySession := fs.String("proxy-session", "", "Opaque relay affinity marker for every HTTP CONNECT")
+	proxySessionHeader := fs.String("proxy-session-header", "X-Proxy-Session", "Relay affinity header name")
+	proxyCACert := fs.String("proxy-ca-cert", "", "CA bundle for HTTPS proxy TLS, separate from target TLS")
 
 	// mTLS client certificates
 	clientCert := fs.String("client-cert", "", "Path to client certificate for mTLS")
@@ -437,7 +446,9 @@ func RunClient(args []string) {
 
 	fs.Parse(args)
 	rpSet := false
+	setFlags := make(map[string]bool)
 	fs.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
 		if f.Name == "rp" {
 			rpSet = true
 		}
@@ -537,8 +548,20 @@ func RunClient(args []string) {
 		*reconnectEnabled = cfg.Reconnect.Enabled
 
 		// Apply HTTP proxy from config
-		if *httpProxy == "" && cfg.HTTPProxy != "" {
+		if !setFlags["http-proxy"] {
 			*httpProxy = cfg.HTTPProxy
+		}
+		if !setFlags["connect-timeout"] && cfg.ConnectTimeout > 0 {
+			*connectTimeout = cfg.ConnectTimeout
+		}
+		if !setFlags["proxy-session"] {
+			*proxySession = cfg.ProxySession
+		}
+		if !setFlags["proxy-session-header"] && cfg.ProxySessionHeader != "" {
+			*proxySessionHeader = cfg.ProxySessionHeader
+		}
+		if !setFlags["proxy-ca-cert"] {
+			*proxyCACert = cfg.ProxyCACert
 		}
 		// Apply mTLS certificates from config
 		if *clientCert == "" && cfg.ClientCert != "" {
@@ -632,6 +655,14 @@ func RunClient(args []string) {
 		*apiToken = os.Getenv("XROK_TOKEN")
 	}
 
+	if *connectTimeout <= 0 {
+		clientLog.Error("connect-timeout must be positive")
+		os.Exit(1)
+	}
+	if err := config.ValidateProxySettings(*httpProxy, *proxySession, *proxySessionHeader, *connectTimeout, *useQUIC, *enableP2P); err != nil {
+		clientLog.Error("Invalid proxy configuration: %v", err)
+		os.Exit(1)
+	}
 	turnRuntimeConfig := config.TURNConfig{
 		Enabled: *turnServer != "", Server: *turnServer, Username: *turnUsername, Password: *turnPassword,
 		Transport: *turnTransport, CACert: *turnCACert, ServerName: *turnServerName,
@@ -729,33 +760,36 @@ func RunClient(args []string) {
 
 	clientStateMutex.Lock()
 	clientState_ = &clientState{
-		ClientID:          clientID,
-		ServerAddr:        *serverAddr,
-		ServerPort:        clientRp,
-		UseTLS:            *useTLS,
-		UseProxy:          *useProxy,
-		Tunnels:           tunnelConfigs,
-		TunnelMap:         tunnelMap,
-		UDPTunnels:        udpTunnels,
-		ReverseTunnels:    reverseTunnels,
-		ReverseMap:        reverseMap,
-		Socks5Addr:        *socks5Addr,
-		UseQUIC:           *useQUIC,
-		Headers:           customHeaders,
-		Compress:          *enableCompress,
-		HTTPProxy:         *httpProxy,
-		ClientCert:        *clientCert,
-		ClientKey:         *clientKey,
-		APIToken:          *apiToken,
-		StdioMode:         *stdioMode,
-		StdioTarget:       *stdioTarget,
-		P2PConnections:    make(map[string]net.Conn),
-		P2PTunnels:        make(map[string]*p2p.P2PTunnel),
-		P2PNegotiations:   p2p.NewNegotiationStore(128, 30*time.Second),
-		P2PPeers:          make(map[string]*p2p.PeerInfo),
-		P2PStunServer:     *p2pStunServer,
-		P2PTURN:           turnRuntimeConfig,
-		P2PActiveSessions: make(map[string]string),
+		ClientID:           clientID,
+		ServerAddr:         *serverAddr,
+		ServerPort:         clientRp,
+		UseTLS:             *useTLS,
+		UseProxy:           *useProxy,
+		Tunnels:            tunnelConfigs,
+		TunnelMap:          tunnelMap,
+		UDPTunnels:         udpTunnels,
+		ReverseTunnels:     reverseTunnels,
+		ReverseMap:         reverseMap,
+		Socks5Addr:         *socks5Addr,
+		UseQUIC:            *useQUIC,
+		Headers:            customHeaders,
+		Compress:           *enableCompress,
+		HTTPProxy:          *httpProxy,
+		ConnectTimeout:     *connectTimeout,
+		ProxySession:       *proxySession,
+		ProxySessionHeader: *proxySessionHeader,
+		ClientCert:         *clientCert,
+		ClientKey:          *clientKey,
+		APIToken:           *apiToken,
+		StdioMode:          *stdioMode,
+		StdioTarget:        *stdioTarget,
+		P2PConnections:     make(map[string]net.Conn),
+		P2PTunnels:         make(map[string]*p2p.P2PTunnel),
+		P2PNegotiations:    p2p.NewNegotiationStore(128, 30*time.Second),
+		P2PPeers:           make(map[string]*p2p.PeerInfo),
+		P2PStunServer:      *p2pStunServer,
+		P2PTURN:            turnRuntimeConfig,
+		P2PActiveSessions:  make(map[string]string),
 	}
 	clientRuntime_.replaceState(clientState_)
 	state := clientRuntime_.State()
@@ -769,6 +803,12 @@ func RunClient(args []string) {
 		clientLog.Error("Failed to load CA certificate: %v", err)
 		os.Exit(1)
 	}
+	proxyRoots, err := loadRootCAs(*proxyCACert)
+	if err != nil {
+		clientLog.Error("Failed to load proxy CA certificate: %v", err)
+		os.Exit(1)
+	}
+	state.ProxyTLSConfig = &tls.Config{RootCAs: proxyRoots, MinVersion: tls.VersionTLS12}
 	baseTLSConfig := &tls.Config{RootCAs: rootCAs, InsecureSkipVerify: *insecureTLS, MinVersion: tls.VersionTLS12}
 	if *insecureTLS {
 		clientLog.Warn("TLS certificate verification is disabled")
@@ -790,7 +830,7 @@ func RunClient(args []string) {
 
 	// Log HTTP proxy if configured
 	if *httpProxy != "" {
-		clientLog.Info("Using HTTP CONNECT proxy: %s", *httpProxy)
+		clientLog.Info("Using upstream proxy: %s", redactedProxy(*httpProxy))
 	}
 	clientStateMutex.Unlock()
 
@@ -1236,7 +1276,11 @@ type registrationRequest struct {
 	P2PInfo        *p2p.PeerInfo       `json:"p2p_info,omitempty"`
 }
 
-func registerClient(state *clientState, token string) bool {
+func registerClient(ctx context.Context, state *clientState, token string) bool {
+	if err := config.ValidateProxySettings(state.HTTPProxy, state.ProxySession, state.ProxySessionHeader, state.ConnectTimeout, state.UseQUIC, state.P2PEnabled); err != nil {
+		clientLog.Error("Invalid proxy configuration: %v", err)
+		return false
+	}
 	const maxRetries = 3
 	const backoffFactor = 500 * time.Millisecond
 
@@ -1271,26 +1315,9 @@ func registerClient(state *clientState, token string) bool {
 		P2PInfo:        state.P2PInfo,
 	}
 
-	// Build HTTP transport with optional proxy support
-	transport := &http.Transport{
-		MaxIdleConns:        1000,
-		MaxIdleConnsPerHost: 1000,
-		IdleConnTimeout:     90 * time.Second,
-		TLSClientConfig:     state.TLSConfig,
-	}
-
-	// Configure HTTP CONNECT proxy if specified
-	if state.HTTPProxy != "" {
-		proxyURL, err := url.Parse(state.HTTPProxy)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-		}
-	}
-
-	client := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: transport,
-	}
+	tr := state.routeTransport()
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Timeout: state.connectionBudget(), Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 	var res registerResponse
 
@@ -1299,16 +1326,20 @@ func registerClient(state *clientState, token string) bool {
 		reqBody, err := json.Marshal(regReq)
 		if err != nil {
 			log.Printf("Attempt %d: Failed to marshal request: %v", attempt, err)
-			time.Sleep(backoffFactor * time.Duration(attempt))
+			if !waitRouteRetry(ctx, backoffFactor*time.Duration(attempt)) {
+				return false
+			}
 			continue
 		}
 
-		clientLog.Debug("Registration request: %s", string(reqBody))
+		clientLog.Debug("Registering %d tunnels and %d reverse mappings", len(regReq.Tunnels), len(regReq.Reverse))
 
-		req, err := http.NewRequest("POST", fullURL, strings.NewReader(string(reqBody)))
+		req, err := http.NewRequestWithContext(ctx, "POST", fullURL, strings.NewReader(string(reqBody)))
 		if err != nil {
 			log.Printf("Attempt %d: Failed to create request: %v", attempt, err)
-			time.Sleep(backoffFactor * time.Duration(attempt))
+			if !waitRouteRetry(ctx, backoffFactor*time.Duration(attempt)) {
+				return false
+			}
 			continue
 		}
 
@@ -1320,7 +1351,9 @@ func registerClient(state *clientState, token string) bool {
 		response, err := client.Do(req)
 		if err != nil {
 			clientLog.Debug("Attempt %d: Registration failed: %v", attempt, err)
-			time.Sleep(backoffFactor * time.Duration(attempt))
+			if !waitRouteRetry(ctx, backoffFactor*time.Duration(attempt)) {
+				return false
+			}
 			continue
 		}
 		if response.StatusCode != http.StatusOK {
@@ -1330,14 +1363,16 @@ func registerClient(state *clientState, token string) bool {
 			// request) will not succeed on retry; say why and stop.
 			switch response.StatusCode {
 			case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-				clientLog.Error("Registration rejected (%d): %s", response.StatusCode, strings.TrimSpace(string(body)))
+				clientLog.Error("Registration rejected (%d): %s", response.StatusCode, state.redactRouteSecrets(strings.TrimSpace(string(body))))
 				os.Exit(1)
 			}
 			if response.StatusCode == http.StatusConflict {
-				clientLog.Warn("Registration conflict: %s (retrying)", strings.TrimSpace(string(body)))
+				clientLog.Warn("Registration conflict: %s (retrying)", state.redactRouteSecrets(strings.TrimSpace(string(body))))
 			}
-			clientLog.Debug("Attempt %d: Server error %d: %s", attempt, response.StatusCode, string(body))
-			time.Sleep(backoffFactor * time.Duration(attempt))
+			clientLog.Debug("Attempt %d: Server error %d: %s", attempt, response.StatusCode, state.redactRouteSecrets(string(body)))
+			if !waitRouteRetry(ctx, backoffFactor*time.Duration(attempt)) {
+				return false
+			}
 			continue
 		}
 
@@ -1345,7 +1380,9 @@ func registerClient(state *clientState, token string) bool {
 		response.Body.Close()
 		if err != nil {
 			clientLog.Debug("Attempt %d: Failed to decode response: %v", attempt, err)
-			time.Sleep(backoffFactor * time.Duration(attempt))
+			if !waitRouteRetry(ctx, backoffFactor*time.Duration(attempt)) {
+				return false
+			}
 			continue
 		}
 
@@ -1353,6 +1390,7 @@ func registerClient(state *clientState, token string) bool {
 		state.ClientID = res.UDID
 		adoptAssignedP2PIdentity(state, res.UDID)
 		state.SessionToken = res.SessionToken
+		state.Multiplexed = res.Multiplexed
 		state.ClientPort = res.ClientPortTLS
 
 		if state.UseTLS {
@@ -1363,7 +1401,9 @@ func registerClient(state *clientState, token string) bool {
 
 		if state.ClientPort == "" {
 			log.Printf("Attempt %d: Received empty client port", attempt)
-			time.Sleep(backoffFactor * time.Duration(attempt))
+			if !waitRouteRetry(ctx, backoffFactor*time.Duration(attempt)) {
+				return false
+			}
 			continue
 		}
 
@@ -1401,7 +1441,7 @@ func runWithReconnect(ctx context.Context, state *clientState, token string, wg 
 			return
 		}
 
-		if !registerClient(state, token) {
+		if !registerClient(ctx, state, token) {
 			attempt++
 			if reconnectConfig.Enabled {
 				wait := reconnectConfig.Backoff(attempt)
@@ -1442,7 +1482,9 @@ func runWithReconnect(ctx context.Context, state *clientState, token string, wg 
 			}()
 		}
 
-		go connectAndForwardSession(sessionCtx, state)
+		if !state.Multiplexed {
+			go connectAndForwardSession(sessionCtx, state)
+		}
 
 		// Connect P2P signaling if P2P is enabled
 		if state.P2PEnabled {
@@ -1498,6 +1540,10 @@ func connectQUICWithDisconnect(ctx context.Context, state *clientState, disconne
 		}
 	}()
 
+	if state.HTTPProxy != "" {
+		clientLog.Error("QUIC cannot bypass a configured upstream proxy")
+		return
+	}
 	port := state.ServerPort
 	if port == 0 {
 		port = 443
@@ -1688,21 +1734,9 @@ func connectMuxWithDisconnect(ctx context.Context, state *clientState, disconnec
 		RawQuery: url.Values{"clientID": {clientID}}.Encode(),
 	}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout:  30 * time.Second,
-		EnableCompression: state.Compress,
-		TLSClientConfig:   state.TLSConfig,
-	}
-
-	// Configure HTTP CONNECT proxy if specified
-	if state.HTTPProxy != "" {
-		proxyURL, _ := url.Parse(state.HTTPProxy)
-		dialer.Proxy = http.ProxyURL(proxyURL)
-	}
-
 	headers := http.Header{}
 	headers.Set("X-Xrok-Session", state.SessionToken)
-	conn, _, err := dialer.Dial(u.String(), headers)
+	conn, _, err := state.dialWebSocket(ctx, u.String(), headers)
 	if err != nil {
 		log.Printf("Failed to establish mux connection: %v", err)
 		return
@@ -1929,7 +1963,6 @@ func handleMuxStream(ctx context.Context, stream net.Conn, state *clientState) {
 func connectAndForwardSession(ctx context.Context, state *clientState) {
 	const (
 		connReadLimit = 1024 * 1024
-		connTimeout   = 30 * time.Second
 	)
 
 	scheme := "wss"
@@ -1941,23 +1974,11 @@ func connectAndForwardSession(ctx context.Context, state *clientState) {
 	default:
 	}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout:  connTimeout,
-		EnableCompression: state.Compress,
-		TLSClientConfig:   state.TLSConfig,
-	}
-
-	// Configure HTTP CONNECT proxy if specified
-	if state.HTTPProxy != "" {
-		proxyURL, _ := url.Parse(state.HTTPProxy)
-		dialer.Proxy = http.ProxyURL(proxyURL)
-	}
-
 	headers := http.Header{}
 	if state.APIToken != "" {
 		headers.Set("X-API-Token", state.APIToken)
 	}
-	conn, resp, err := dialer.Dial(u.String(), headers)
+	conn, resp, err := state.dialWebSocket(ctx, u.String(), headers)
 	if err != nil {
 		if resp != nil {
 			log.Printf("WebSocket connection failed with status: %d %s", resp.StatusCode, resp.Status)
@@ -2039,14 +2060,16 @@ func establishNewWebSocketConnection(ctx context.Context, state *clientState, co
 		case <-ctx.Done():
 			return
 		default:
-			dialer := websocket.Dialer{
-				HandshakeTimeout:  10 * time.Second,
-				EnableCompression: state.Compress,
+			headers := http.Header{}
+			if state.APIToken != "" {
+				headers.Set("X-API-Token", state.APIToken)
 			}
-			wsConn, _, err := dialer.Dial(wsURL.String(), nil)
+			wsConn, _, err := state.dialWebSocket(ctx, wsURL.String(), headers)
 			if err != nil {
 				log.Printf("Failed to establish WebSocket connection for connectionID %s: %v", connectionID, err)
-				time.Sleep(2 * time.Second)
+				if !waitRouteRetry(ctx, 2*time.Second) {
+					return
+				}
 				continue
 			}
 
@@ -2115,114 +2138,12 @@ func isClosedNetworkError(err error) bool {
 	return ok && !netErr.Temporary()
 }
 
-// dialWithProxy creates a connection through an HTTP CONNECT proxy
-func dialWithProxy(proxyURL, target string, tlsConfig *tls.Config) (net.Conn, error) {
-	// Parse proxy URL
-	u, err := url.Parse(proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid proxy URL: %w", err)
-	}
-
-	// Connect to proxy
-	proxyHost := u.Host
-	if u.Port() == "" {
-		proxyHost = u.Host + ":8080"
-	}
-
-	proxyConn, err := net.DialTimeout("tcp", proxyHost, 30*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to proxy: %w", err)
-	}
-
-	// Build CONNECT request
-	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", target, target)
-
-	// Add proxy authentication if provided
-	if u.User != nil {
-		password, _ := u.User.Password()
-		auth := base64.StdEncoding.EncodeToString([]byte(u.User.Username() + ":" + password))
-		connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", auth)
-	}
-	connectReq += "\r\n"
-
-	// Send CONNECT request
-	if _, err := proxyConn.Write([]byte(connectReq)); err != nil {
-		proxyConn.Close()
-		return nil, fmt.Errorf("failed to send CONNECT request: %w", err)
-	}
-
-	// Read response
-	br := bufio.NewReader(proxyConn)
-	resp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		proxyConn.Close()
-		return nil, fmt.Errorf("failed to read proxy response: %w", err)
-	}
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		proxyConn.Close()
-		return nil, fmt.Errorf("proxy CONNECT failed with status: %s", resp.Status)
-	}
-
-	// Upgrade to TLS if needed
-	if tlsConfig != nil {
-		// Extract hostname for SNI
-		host := target
-		if colonIdx := strings.Index(target, ":"); colonIdx != -1 {
-			host = target[:colonIdx]
-		}
-		tlsConfig.ServerName = host
-
-		tlsConn := tls.Client(proxyConn, tlsConfig)
-		if err := tlsConn.Handshake(); err != nil {
-			proxyConn.Close()
-			return nil, fmt.Errorf("TLS handshake failed: %w", err)
-		}
-		return tlsConn, nil
-	}
-
-	return proxyConn, nil
-}
-
-// getDialer returns a dialer function that optionally uses HTTP CONNECT proxy
-func getDialer(state *clientState) func(network, addr string) (net.Conn, error) {
-	if state.HTTPProxy == "" {
-		return func(network, addr string) (net.Conn, error) {
-			conn, err := net.DialTimeout(network, addr, 30*time.Second)
-			if err != nil {
-				return nil, err
-			}
-			if state.UseTLS && state.TLSConfig != nil {
-				host := addr
-				if colonIdx := strings.Index(addr, ":"); colonIdx != -1 {
-					host = addr[:colonIdx]
-				}
-				tlsCfg := state.TLSConfig.Clone()
-				tlsCfg.ServerName = host
-				tlsConn := tls.Client(conn, tlsCfg)
-				if err := tlsConn.Handshake(); err != nil {
-					conn.Close()
-					return nil, err
-				}
-				return tlsConn, nil
-			}
-			return conn, nil
-		}
-	}
-
-	return func(network, addr string) (net.Conn, error) {
-		if state.UseTLS {
-			return dialWithProxy(state.HTTPProxy, addr, state.TLSConfig)
-		}
-		return dialWithProxy(state.HTTPProxy, addr, nil)
-	}
-}
-
 // runStdioMode runs the client in stdio mode for SSH ProxyCommand
 func runStdioMode(state *clientState, token string) {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 	// Register with server first
-	if !registerClient(state, token) {
+	if !registerClient(ctx, state, token) {
 		clientLog.Error("Failed to register with server")
 		os.Exit(1)
 	}
@@ -2240,17 +2161,9 @@ func runStdioMode(state *clientState, token string) {
 		RawQuery: url.Values{"clientID": {clientID}}.Encode(),
 	}
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout:  30 * time.Second,
-		EnableCompression: state.Compress,
-		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return getDialer(state)(network, addr)
-		},
-	}
-
 	headers := http.Header{}
 	headers.Set("X-Xrok-Session", state.SessionToken)
-	conn, _, err := dialer.Dial(u.String(), headers)
+	conn, _, err := state.dialWebSocket(ctx, u.String(), headers)
 	if err != nil {
 		clientLog.Error("Failed to establish mux connection: %v", err)
 		os.Exit(1)
@@ -2455,15 +2368,11 @@ func connectP2PSignaling(ctx context.Context, state *clientState) {
 
 	wsURL := fmt.Sprintf("wss://%s/p2p/ws?client_id=%s", serverAuthority(state.ServerAddr, clientRp), url.QueryEscape(clientID))
 
-	dialer := websocket.Dialer{
-		TLSClientConfig: state.TLSConfig,
-	}
-
 	headers := http.Header{}
 	if state.APIToken != "" {
 		headers.Set("X-API-Token", state.APIToken)
 	}
-	conn, _, err := dialer.DialContext(ctx, wsURL, headers)
+	conn, _, err := state.dialWebSocket(ctx, wsURL, headers)
 	if err != nil {
 		clientLog.Warn("P2P signaling connection failed: %v", err)
 		return
@@ -2848,10 +2757,7 @@ func requestP2PConnection(state *clientState, peerID string) {
 // per request would leak its idle connections and goroutines.
 func (state *clientState) p2pOwnerLookupClient() *http.Client {
 	state.p2pLookupOnce.Do(func() {
-		state.p2pLookupClient = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
-			TLSClientConfig: state.TLSConfig,
-			IdleConnTimeout: 90 * time.Second,
-		}}
+		state.p2pLookupClient = &http.Client{Timeout: 10 * time.Second, Transport: state.routeTransport()}
 	})
 	return state.p2pLookupClient
 }

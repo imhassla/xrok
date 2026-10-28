@@ -154,6 +154,7 @@ var (
 	serverCertFile   string
 	serverKeyFile    string
 	serverPort       = 443
+	serverPublicPort = 0
 	serverUpgrader   = websocket.Upgrader{
 		CheckOrigin:       func(r *http.Request) bool { return true },
 		EnableCompression: true,
@@ -322,6 +323,7 @@ func serverConfigPath(args []string) (string, bool) {
 // runtimes pass their validated config here so authentication, identities
 // and rate limits are not lost in the flag translation.
 func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExporter telemetry.Exporter) {
+	serverPublicPort = 0
 	loadedConfig := preset
 	if path, ok := serverConfigPath(args); ok {
 		cfg, err := config.LoadServerConfig(path)
@@ -338,6 +340,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	if loadedConfig != nil {
 		serverDomain = loadedConfig.Domain
 		serverPort = loadedConfig.ProxyPort
+		serverPublicPort = loadedConfig.PublicPort
 		serverDebug = loadedConfig.Debug
 		serverRequestLog = loadedConfig.RequestLog
 		serverClientCA = loadedConfig.ClientCAPath
@@ -377,6 +380,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	// overrides it. Registering the flag with an empty default would reset the
 	// already-loaded value during FlagSet construction.
 	fs.StringVar(&serverDomain, "domain", serverDomain, "Domain to use in URLs (required)")
+	fs.IntVar(&serverPublicPort, "public-port", serverPublicPort, "Advertised HTTPS port behind ingress (0 = listen port)")
 	fs.IntVar(&serverPort, "port", serverPort, "Unified HTTPS and QUIC port")
 	fs.StringVar(&serverCertFile, "tls-cert", serverCertFile, "Path to TLS certificate")
 	fs.StringVar(&serverKeyFile, "tls-key", serverKeyFile, "Path to TLS private key")
@@ -393,6 +397,10 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	fs.IntVar(&serverReversePortMin, "reverse-port-min", serverReversePortMin, "Lowest port a client may bind with -R")
 	fs.IntVar(&serverReversePortMax, "reverse-port-max", serverReversePortMax, "Highest port a client may bind with -R")
 	fs.Parse(args)
+	if serverPublicPort < 0 || serverPublicPort > 65535 {
+		fmt.Println("Invalid public-port")
+		return
+	}
 	telemetryConfig := config.DefaultServerConfig().Telemetry
 	if loadedConfig != nil {
 		telemetryConfig = loadedConfig.Telemetry
@@ -544,11 +552,24 @@ var serverTrustProxyHeaders bool
 
 // serverPublicURL is the visitor URL of a tunnel; a non-default listen port
 // must be part of it or the printed link is unreachable.
+func serverAdvertisedPort() int {
+	if serverPublicPort > 0 {
+		return serverPublicPort
+	}
+	return serverPort
+}
+func serverClientRoutingPort(legacyPort int) int {
+	if serverLegacyListeners {
+		return legacyPort
+	}
+	return serverAdvertisedPort()
+}
 func serverPublicURL(name, domain string) string {
-	if serverPort == 443 {
+	port := serverAdvertisedPort()
+	if port == 443 {
 		return fmt.Sprintf("https://%s.%s", name, domain)
 	}
-	return fmt.Sprintf("https://%s.%s:%d", name, domain, serverPort)
+	return fmt.Sprintf("https://%s.%s:%d", name, domain, port)
 }
 
 func getServerClientIP(r *http.Request) string {
@@ -1265,14 +1286,16 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		ProxyURLTLS   string             `json:"proxy_url_tls,omitempty"`
 		Tunnels       []ServerTunnelInfo `json:"tunnels,omitempty"`
 		SessionToken  string             `json:"session_token"`
+		Multiplexed   bool               `json:"multiplexed"`
 	}
 
 	response := regResponse{
 		UDID:          clientID,
-		ClientPortTLS: strconv.Itoa(clientPortTLS),
+		ClientPortTLS: strconv.Itoa(serverClientRoutingPort(clientPortTLS)),
 		ProxyURLNoTLS: fmt.Sprintf("%s:%d", serverDomain, portNoTLS),
 		Tunnels:       tunnelInfos,
 		SessionToken:  client.sessionToken,
+		Multiplexed:   regReq.ConnectionType == "tls" || regReq.ConnectionType == "quic",
 	}
 
 	if regReq.ConnectionType == "tls" {

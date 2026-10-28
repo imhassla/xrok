@@ -17,11 +17,12 @@ First run creates the `xrok` system user, `/etc/xrok/server.yaml` (from
 |---|---|---|---|
 | 8443 | TCP | control + HTTPS tunnels `https://<name>.xrok.firestarter.click:8443` | open |
 | 9000-9019 | TCP | `-R` reverse ports (enforced by `reverse_port_min/max`) | open |
-| 8443 | UDP | QUIC transport (optional) | closed |
+| 8443 | UDP | QUIC transport (optional) | reachable in the 2026-10-28 lab; verify current firewall |
 | 4000+, 7000+ | TCP | legacy per-client listeners — not bound (`legacy_listeners: false`) | keep closed |
 | 127.0.0.1:6060 | TCP | pprof (`ssh -L 16060:127.0.0.1:6060`) | n/a |
 
-80/443 belong to the vpn-infra nginx; do not bind them.
+80/443 belong to the vpn-infra nginx; do not bind them directly from xrok.
+For a coordinated public 443 rollout with preserved mTLS, see [Shared HTTPS ingress](ingress.md).
 
 - **TLS**: `xrok.firestarter.click` + `*.xrok.firestarter.click` (Let's Encrypt,
   Route53 DNS-01 via the `vpn-wildcard-cert-manager` container's certbot).

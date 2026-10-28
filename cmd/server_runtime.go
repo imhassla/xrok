@@ -321,7 +321,7 @@ func releaseLegacyServerRuntime(r *ServerRuntime) {
 
 func (r *ServerRuntime) args() []string {
 	c := r.cfg
-	a := []string{"--domain", c.Domain, "--port", strconv.Itoa(c.ProxyPort)}
+	a := []string{"--domain", c.Domain, "--port", strconv.Itoa(c.ProxyPort), "--public-port", strconv.Itoa(c.PublicPort)}
 	if c.TLSCertPath != "" {
 		a = append(a, "--tls-cert", c.TLSCertPath)
 	}

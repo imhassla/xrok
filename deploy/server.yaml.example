@@ -1,6 +1,8 @@
 # /etc/xrok/server.yaml — xrok on a host shared with other services.
 # The token is filled in by install.sh; keep this file 0640 root:xrok.
 domain: xrok.firestarter.click
+# Set public_port: 443 only after configuring a shared SNI ingress; see ingress.md.
+# public_port: 443
 proxy_port: 8443            # TCP (+UDP for QUIC if opened). 80/443 belong to another app.
 
 tls_cert_path: /etc/xrok/tls/fullchain.pem
