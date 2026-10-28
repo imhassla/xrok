@@ -9,7 +9,7 @@ func TestTunnelTransportCompatibilityAndValidation(t *testing.T) {
 			t.Fatalf("legacy alias %q: %q %v", s, got, err)
 		}
 	}
-	for _, s := range []string{"http2", "wss", "quic"} {
+	for _, s := range []string{"http2", "wss", "quic", "auto"} {
 		got, err := TunnelTransport(s, false)
 		if err != nil || got != s {
 			t.Fatal(s, got, err)

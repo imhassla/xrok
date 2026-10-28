@@ -314,6 +314,18 @@ curl http://example.com  # Goes through tunnel server
 
 ### Versioned standard tunnel transports
 
+Use `--transport auto` to try native QUIC, then HTTP/2, then framed WSS at connection
+establishment and reconnection. Each attempt has the configured `--connect-timeout`;
+selection logs report the failed stage and selected carrier with credentials redacted.
+An explicit TCP upstream proxy excludes QUIC entirely: automatic selection then tries
+HTTP/2 and WSS through that proxy. Missing advertised capabilities are skipped; auto
+does not silently downgrade to the legacy carrier on old servers. Configure `legacy`
+explicitly for those deployments. Native QUIC auto-selection uses a bounded,
+versioned, acknowledged registration association. Once a carrier is established,
+failure triggers normal re-registration/reconnection, not replay of application
+requests or seamless migration of active TCP streams. Explicit `quic`, `http2`, and
+`wss` choices remain pinned to the requested carrier.
+
 Select `--transport http2` for a full-duplex HTTP/2 POST carrier, or `--transport wss`
 for a real RFC 6455 binary-message carrier. Both carry the existing multiplexed
 streams and work through HTTP-aware reverse proxies; WSS negotiates the `xrok.v2`

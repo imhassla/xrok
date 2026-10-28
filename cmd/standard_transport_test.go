@@ -56,6 +56,11 @@ func exerciseStandardCarrier(t *testing.T, s *clientState, info *serverClientInf
 	if err != nil {
 		t.Fatal(err)
 	}
+	exerciseMuxCarrier(t, carrier, info)
+}
+
+func exerciseMuxCarrier(t *testing.T, carrier net.Conn, info *serverClientInfo) {
+	t.Helper()
 	defer carrier.Close()
 	cfg := yamux.DefaultConfig()
 	cfg.LogOutput = io.Discard

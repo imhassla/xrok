@@ -411,7 +411,7 @@ func RunClient(args []string) {
 
 	// Transport selection
 	useQUIC := fs.Bool("quic", false, "Use QUIC transport instead of WebSocket")
-	transportMode := fs.String("transport", "", "Tunnel transport: legacy|http2|wss|quic")
+	transportMode := fs.String("transport", "", "Tunnel transport: legacy|auto|http2|wss|quic")
 
 	// HTTP CONNECT proxy (for corporate proxies)
 	httpProxy := fs.String("http-proxy", "", "Upstream proxy URL: http, https, socks5 (local DNS), or socks5h (proxy DNS)")
@@ -1491,7 +1491,9 @@ func runWithReconnect(ctx context.Context, state *clientState, token string, wg 
 		// (e.g. an immediate QUIC failure), leaving the client stuck.
 		disconnected := make(chan struct{}, 1)
 
-		if state.UseQUIC {
+		if state.Transport == "auto" {
+			go connectAutoWithDisconnect(sessionCtx, state, disconnected)
+		} else if state.UseQUIC {
 			go func() {
 				connectQUICWithDisconnect(sessionCtx, state, disconnected)
 			}()
@@ -1573,12 +1575,18 @@ func connectQUICWithDisconnect(ctx context.Context, state *clientState, disconne
 	tlsConfig.NextProtos = []string{"xrok-quic"}
 
 	quicTransport := transport.NewQUICTransport(tlsConfig)
-	conn, err := quicTransport.Dial(ctx, addr)
+	handshake, finishHandshake := context.WithTimeout(ctx, state.connectionBudget())
+	conn, err := quicTransport.Dial(handshake, addr)
+	finishHandshake()
 	if err != nil {
 		// UDP is often filtered (cloud firewalls, corporate networks). Fall
 		// back to the TCP/TLS mux for the rest of this process; the reconnect
 		// loop re-registers with connection type "tls". The write happens
 		// before the deferred disconnect signal, which orders it for the loop.
+		if state.Transport == "quic" {
+			clientLog.Warn("QUIC unavailable: %s", state.redactRouteSecrets(err.Error()))
+			return
+		}
 		clientLog.Warn("QUIC unavailable (%v); falling back to TCP/TLS", err)
 		state.UseQUIC = false
 		return

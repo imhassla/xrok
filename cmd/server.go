@@ -1666,21 +1666,18 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 	regBuf := make([]byte, 256)
 	stream.SetReadDeadline(authDeadline)
 	n, err := stream.Read(regBuf)
-	stream.SetReadDeadline(time.Time{})
-	if err != nil {
+	if err != nil && !(n > 0 && err == io.EOF) {
 		conn.Close()
 		return
 	}
 
-	regMsg := string(regBuf[:n])
-	parts := strings.SplitN(regMsg, ":", 3)
-	if len(parts) != 3 || parts[0] != "XROK" {
+	clientID, sessionToken, version2, parseErr := parseQUICAssociation(regBuf[:n], bufio.NewReader(stream))
+	stream.SetReadDeadline(time.Time{})
+	if parseErr != nil {
 		log.Printf("QUIC: Invalid registration message")
 		conn.Close()
 		return
 	}
-
-	clientID, sessionToken := parts[1], parts[2]
 
 	client, exists := legacyClientRegistry.Get(clientID)
 
@@ -1706,6 +1703,13 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 		return
 	}
 	releasePending()
+	if version2 {
+		_ = stream.SetWriteDeadline(time.Now().Add(serverQUICAuthTimeout))
+		if _, err := stream.Write([]byte("OK\n")); err != nil {
+			conn.Close()
+		}
+		_ = stream.Close()
+	}
 	if displaced != nil {
 		displaced.Close() // its handler sees it is no longer current
 	}

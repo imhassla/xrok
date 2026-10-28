@@ -12,7 +12,7 @@ func TunnelTransport(value string, quicFlag bool) (string, error) {
 	switch value {
 	case "", "legacy", "tcp", "tls", "websocket":
 		return "legacy", nil
-	case "http2", "wss", "quic":
+	case "http2", "wss", "quic", "auto":
 		return value, nil
 	default:
 		return "", fmt.Errorf("unsupported transport %q", value)
