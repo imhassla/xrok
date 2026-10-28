@@ -17,6 +17,10 @@ type QUICTransport struct {
 	quicConfig *quic.Config
 }
 
+// SetInitialPacketSize reserves encapsulation room for HTTP/3 CONNECT-UDP.
+// Call before Listen/Dial; legacy native QUIC keeps the library default.
+func (t *QUICTransport) SetInitialPacketSize(n uint16) { t.quicConfig.InitialPacketSize = n }
+
 // NewQUICTransport creates a new QUIC transport
 func NewQUICTransport(tlsConfig *tls.Config) *QUICTransport {
 	return &QUICTransport{

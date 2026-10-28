@@ -22,6 +22,11 @@ func main() {
 		cmd.RunServer(os.Args[2:])
 	case "client":
 		cmd.RunClient(os.Args[2:])
+	case "masque":
+		if err := cmd.RunMASQUE(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "masque: %v\n", err)
+			os.Exit(1)
+		}
 	case "status":
 		cmd.RunStatus(os.Args[2:])
 	case "http":
@@ -95,6 +100,7 @@ Usage:
 Commands:
   server    Start the xrok server
   client    Start the xrok client
+  masque    Forward local UDP through an authenticated HTTP/3 CONNECT-UDP proxy
   http      Expose a local HTTP port:  xrok http 3000 [name]
   tcp       Expose a local TCP port on a server port:  xrok tcp 22 9001
   socks     Local SOCKS5 proxy through the server:  xrok socks [1080]

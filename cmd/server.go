@@ -323,6 +323,7 @@ func serverConfigPath(args []string) (string, bool) {
 // runtimes pass their validated config here so authentication, identities
 // and rate limits are not lost in the flag translation.
 func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExporter telemetry.Exporter) {
+	serverMASQUE = false
 	serverPublicPort = 0
 	loadedConfig := preset
 	if path, ok := serverConfigPath(args); ok {
@@ -338,6 +339,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 		loadedConfig = cfg
 	}
 	if loadedConfig != nil {
+		serverMASQUE = loadedConfig.MASQUE
 		serverDomain = loadedConfig.Domain
 		serverPort = loadedConfig.ProxyPort
 		serverPublicPort = loadedConfig.PublicPort
@@ -375,6 +377,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	}
 
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
+	fs.BoolVar(&serverMASQUE, "masque", serverMASQUE, "Enable authenticated RFC 9298 HTTP/3 CONNECT-UDP on the shared UDP port")
 	fs.String("config", "", "Path to YAML config file")
 	// Preserve a domain loaded from --config unless the CLI explicitly
 	// overrides it. Registering the flag with an empty default would reset the
@@ -1601,8 +1604,31 @@ func waitForQUICConnections(ctx context.Context, port int) {
 		GetCertificate: certs.GetCertificate,
 		NextProtos:     []string{"xrok-quic"},
 	}
+	if serverClientCA != "" {
+		b, err := os.ReadFile(serverClientCA)
+		if err != nil {
+			log.Printf("Read QUIC client CA: %v", err)
+			return
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(b) {
+			log.Printf("Invalid QUIC client CA")
+			return
+		}
+		tlsConfig.ClientCAs = pool
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+	var services *http3Services
+	if serverMASQUE {
+		tlsConfig.NextProtos = append(tlsConfig.NextProtos, "h3")
+		services = newHTTP3Services(tlsConfig)
+		defer services.Close()
+	}
 
 	quicTransport := transport.NewQUICTransport(tlsConfig)
+	if services != nil {
+		quicTransport.SetInitialPacketSize(1350)
+	}
 	listener, err := quicTransport.Listen(fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Printf("Failed to start QUIC listener: %v", err)
@@ -1627,6 +1653,21 @@ func waitForQUICConnections(ctx context.Context, port int) {
 			continue
 		}
 		backoff.reset()
+		if services != nil && conn.(*transport.QUICConn).Connection().ConnectionState().TLS.NegotiatedProtocol == "h3" {
+			select {
+			case serverHTTP3Slots <- struct{}{}:
+			default:
+				conn.Close()
+				continue
+			}
+			go func() {
+				defer func() { <-serverHTTP3Slots; conn.Close() }()
+				stop := context.AfterFunc(ctx, func() { conn.Close() })
+				defer stop()
+				_ = services.server.ServeQUICConn(conn.(*transport.QUICConn).Connection())
+			}()
+			continue
+		}
 		select {
 		case serverQUICPendingSlots <- struct{}{}:
 		default:
@@ -1649,6 +1690,10 @@ func handleQUICServerConnection(ctx context.Context, conn *transport.QUICConn) {
 		}
 	}
 	defer releasePending()
+	if serverClientCA != "" && len(conn.Connection().ConnectionState().TLS.VerifiedChains) == 0 {
+		conn.Close()
+		return
+	}
 
 	// Accept first stream for registration. Keepalives keep an idle peer
 	// alive forever, so the wait for its first stream must be bounded.

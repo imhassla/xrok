@@ -112,6 +112,7 @@ type TURNConfig struct {
 
 // ServerConfig represents server configuration
 type ServerConfig struct {
+	MASQUE      bool   `yaml:"masque,omitempty"`
 	Version     int    `yaml:"version,omitempty"`
 	Domain      string `yaml:"domain"`
 	TLSCertPath string `yaml:"tls_cert_path,omitempty"`

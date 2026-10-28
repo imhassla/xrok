@@ -312,6 +312,49 @@ curl http://example.com  # Goes through tunnel server
   -compress
 ```
 
+### MASQUE CONNECT-UDP (opt-in)
+
+Start the server with `--masque` (or YAML `masque: true`) to add an RFC 9298
+HTTP/3 CONNECT-UDP endpoint at
+`/.well-known/masque/udp/{target_host}/{target_port}/` on the existing UDP port.
+ALPN selects HTTP/3 or the existing native `xrok-quic` protocol on that listener;
+the TCP HTTPS listener is unchanged. Open the configured UDP port in your own
+deployment before using this feature; xrok does not modify firewalls or listeners
+owned by other applications.
+
+```bash
+xrok server --config server.yaml --masque
+# Client profile supplies the existing server/port, token, CA and optional mTLS identity:
+xrok masque --config client.yaml --listen 127.0.0.1:5353 --target your-dns.example:53
+# Or specify an HTTPS proxy authority explicitly:
+xrok masque --proxy https://proxy.example:8443 --target your-service.example:9000
+```
+
+Use a protected profile or `XROK_TOKEN` for credentials. The proxy requires the
+administrator token or an identity with `proxy:udp` scope. A `client`-only identity
+does not gain UDP proxy access, and an anonymously configured server rejects these
+requests even if the listener is enabled. Existing client-certificate policy and
+private/metadata/local-address egress restrictions also apply. DNS resolution is
+checked at the concrete destination socket, preventing hostname rebinding around
+the egress policy.
+
+The local UDP forwarder separates local peers into at most 32 fixed-target flows,
+with bounded queues and 30-second inactivity cleanup. The server caps concurrent
+flows at 128 and each flow at five minutes. HTTP/3 datagram MTU limits apply; a
+1,200-byte UDP payload and an inner QUIC stream are covered by integration tests.
+HTTP/3 services reserve a 1,350-byte initial packet budget for encapsulation; paths
+that cannot carry it may fail. Oversized datagrams are not fragmented or retried
+as direct traffic. This implementation uses HTTP/3 datagrams; HTTP/1.1/HTTP/2
+capsule-based UDP proxying and CONNECT-IP are outside this mode.
+
+`transport.DialMASQUE` exposes a deadline-aware fixed-target `net.PacketConn` for
+embedding and QUIC-over-MASQUE. Its `RemoteAddr` is a virtual address for that flow,
+not a discovered target IP; target DNS is resolved by the proxy. The `masque` CLI
+is an independent UDP proxy client, not a switch that routes xrok's TCP registration
+through a UDP proxy. Existing `--http-proxy` behavior and TCP transport selection
+remain independent. Cancellation closes the HTTP/3 request, QUIC connection, UDP
+sockets and local flow workers without direct-target fallback.
+
 ### Versioned standard tunnel transports
 
 Use `--transport auto` to try native QUIC, then HTTP/2, then framed WSS at connection
