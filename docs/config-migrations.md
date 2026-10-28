@@ -12,7 +12,8 @@ disabled until explicitly configured. The standard
 the `XROK_OTLP_*` resource-bound overrides are supported by the server CLI.
 
 Migration is deterministic and idempotent. Client v0 files that set the legacy
-`connection_type` field are mapped to `transport`; saving the file writes the
+`connection_type` field are mapped to `transport` (`tls` becomes `auto`,
+`quic` remains `quic`); saving the file writes the
 canonical v2 representation. Server v0 files gain the memory state-backend
 default and the disabled-by-default telemetry resource bounds.
 Both loaders and save paths reject versions newer than the running binary, so

@@ -239,3 +239,33 @@ func TestStandardTransportNegotiationAndAuthentication(t *testing.T) {
 		}
 	}
 }
+
+type carrierWriterFunc func([]byte) (int, error)
+
+func (f carrierWriterFunc) Write(p []byte) (int, error) { return f(p) }
+
+func TestStreamCarrierCloseJoinsWriter(t *testing.T) {
+	entered, release, interrupted := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	carrier := &streamCarrier{writer: carrierWriterFunc(func(p []byte) (int, error) { close(entered); <-release; return len(p), nil }), closeFn: func() { close(interrupted) }}
+	writeDone := make(chan struct{})
+	go func() { defer close(writeDone); _, _ = carrier.Write([]byte("pending")) }()
+	<-entered
+	closed := make(chan struct{})
+	go func() { carrier.Close(); close(closed) }()
+	<-interrupted
+	select {
+	case <-closed:
+		t.Fatal("carrier closed before in-flight response write ended")
+	default:
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("close did not join writer")
+	}
+	<-writeDone
+	if _, err := carrier.Write([]byte("after-handler-return")); err == nil {
+		t.Fatal("write accepted after close")
+	}
+}

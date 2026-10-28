@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,6 +26,7 @@ type streamCarrier struct {
 	writer  io.Writer
 	closeFn func()
 	once    sync.Once
+	closed  atomic.Bool
 	writeMu sync.Mutex
 	remote  net.Addr
 }
@@ -33,9 +35,20 @@ func (c *streamCarrier) Read(p []byte) (int, error) { return c.reader.Read(p) }
 func (c *streamCarrier) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	return c.writer.Write(p)
 }
-func (c *streamCarrier) Close() error        { c.once.Do(c.closeFn); return nil }
+func (c *streamCarrier) Close() error {
+	c.once.Do(func() {
+		c.closed.Store(true)
+		c.closeFn() // Interrupt blocked I/O before joining an in-flight write.
+		c.writeMu.Lock()
+		c.writeMu.Unlock()
+	})
+	return nil
+}
 func (c *streamCarrier) LocalAddr() net.Addr { return &net.TCPAddr{} }
 func (c *streamCarrier) RemoteAddr() net.Addr {
 	if c.remote != nil {
@@ -86,6 +99,7 @@ func serverStandardTunnelHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
+		srvWsUpgrades.Inc()
 		carrier := transport.NewWebSocketConn(ws)
 		defer carrier.Close()
 		serveServerMuxCarrier(carrier, c, id)
@@ -104,7 +118,7 @@ func serverStandardTunnelHandler(w http.ResponseWriter, r *http.Request) {
 	if err := rc.Flush(); err != nil {
 		return
 	}
-	carrier := &streamCarrier{reader: r.Body, writer: flushWriter{w}, closeFn: func() { _ = r.Body.Close() }}
+	carrier := &streamCarrier{reader: r.Body, writer: flushWriter{w}, closeFn: func() { _ = rc.SetWriteDeadline(time.Now()); _ = r.Body.Close() }}
 	defer carrier.Close()
 	serveServerMuxCarrier(carrier, c, id)
 }
@@ -156,7 +170,7 @@ func (s *clientState) dialStandardCarrier(ctx context.Context, mode string) (net
 	}
 	lifetime, cancel := context.WithCancel(ctx)
 	tr := &http2.Transport{DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-		// Independent cloned TLS config keeps h2 ALPN out of legacy carriers.
+		// Keep h2 ALPN local to the HTTP/2 carrier.
 		cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 		if s.TLSConfig != nil {
 			cfg = s.TLSConfig.Clone()

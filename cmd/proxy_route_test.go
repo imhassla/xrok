@@ -477,79 +477,6 @@ func TestRouteSecretRedaction(t *testing.T) {
 	}
 }
 
-func TestLegacyDataChannelUsesProxyAndControlAuthentication(t *testing.T) {
-	oldID := clientID
-	clientID = "controlled-client"
-	defer func() { clientID = oldID }()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	go func() {
-		c, e := ln.Accept()
-		if e == nil {
-			defer c.Close()
-			io.Copy(c, c)
-		}
-	}()
-	result := make(chan error, 1)
-	upgrader := websocket.Upgrader{}
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-API-Token") != "controlled-token" || r.URL.Query().Get("clientID") != "controlled-client" {
-			http.Error(w, "missing auth", 401)
-			result <- fmt.Errorf("data channel missed authentication")
-			return
-		}
-		if r.Header.Get("X-Proxy-Session") != "" {
-			result <- fmt.Errorf("relay marker reached control origin")
-			return
-		}
-		ws, e := upgrader.Upgrade(w, r, nil)
-		if e != nil {
-			result <- e
-			return
-		}
-		defer ws.Close()
-		// This legacy protocol intentionally switches to raw bytes after the
-		// WebSocket HTTP upgrade. It does not exchange WebSocket frames.
-		_, e = ws.UnderlyingConn().Write([]byte("legacy-echo"))
-		p := make([]byte, len("legacy-echo"))
-		if e == nil {
-			_, e = io.ReadFull(ws.UnderlyingConn(), p)
-		}
-		if e == nil && string(p) != "legacy-echo" {
-			e = fmt.Errorf("bad echo %q", p)
-		}
-		result <- e
-	}))
-	defer server.Close()
-	var proxyHits atomic.Int64
-	proxy := connectFixture(t, false, false, func(r *http.Request) {
-		proxyHits.Add(1)
-		if r.Header.Get("X-Proxy-Session") != "legacy-session" {
-			t.Error("data CONNECT lost affinity")
-		}
-	})
-	u, _ := url.Parse(server.URL)
-	host, port, _ := net.SplitHostPort(u.Host)
-	state := &clientState{ServerAddr: host, ClientPort: port, LocalPort: ln.Addr().String(), HTTPProxy: proxy.URL, ProxySession: "legacy-session", APIToken: "controlled-token", ConnectTimeout: time.Second, TLSConfig: server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	establishNewWebSocketConnection(ctx, state, "controlled-connection", true)
-	select {
-	case e := <-result:
-		if e != nil {
-			t.Fatal(e)
-		}
-	case <-ctx.Done():
-		t.Fatal("legacy data did not echo through proxy")
-	}
-	if proxyHits.Load() != 1 {
-		t.Fatal("legacy data bypassed proxy", proxyHits.Load())
-	}
-}
-
 func TestTLSProxyAndSOCKSHandshakesHonorCancellation(t *testing.T) {
 	for _, scheme := range []string{"https", "socks5h"} {
 		t.Run(scheme, func(t *testing.T) {
@@ -593,17 +520,17 @@ func TestTLSProxyAndSOCKSHandshakesHonorCancellation(t *testing.T) {
 	}
 }
 
-func TestRawUpgradeBytesSurviveHTTPResponseReadAhead(t *testing.T) {
+func TestFramedUpgradeBytesSurviveHTTPResponseReadAhead(t *testing.T) {
 	proxy := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, _, e := w.(http.Hijacker).Hijack()
 		if e != nil {
 			return
 		}
 		defer c.Close()
-		// Compute a valid upgrade response and pipeline the raw protocol greeting.
+		// Compute a valid upgrade response and pipeline a complete binary WebSocket greeting.
 		key := r.Header.Get("Sec-WebSocket-Key")
 		hash := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-		fmt.Fprintf(c, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: %s\r\n\r\nraw-greeting", base64.StdEncoding.EncodeToString(hash[:]))
+		fmt.Fprintf(c, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: %s\r\n\r\n\x82\x0craw-greeting", base64.StdEncoding.EncodeToString(hash[:]))
 		io.Copy(c, c)
 	}))
 	defer proxy.Close()
@@ -613,10 +540,9 @@ func TestRawUpgradeBytesSurviveHTTPResponseReadAhead(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer ws.Close()
-	raw := ws.UnderlyingConn()
-	raw.SetDeadline(time.Now().Add(time.Second))
-	p := make([]byte, len("raw-greeting"))
-	if _, e = io.ReadFull(raw, p); e != nil || string(p) != "raw-greeting" {
-		t.Fatal("upgrade bytes lost", string(p), e)
+	ws.SetReadDeadline(time.Now().Add(time.Second))
+	kind, p, e := ws.ReadMessage()
+	if e != nil || kind != websocket.BinaryMessage || string(p) != "raw-greeting" {
+		t.Fatal("upgrade frame lost", string(p), e)
 	}
 }

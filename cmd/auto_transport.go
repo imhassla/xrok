@@ -20,15 +20,15 @@ type selectedCarrier struct {
 
 // Selection happens before application streams exist. Reconnecting selects a new
 // carrier; it never replays application requests or migrates existing TCP streams.
-func selectAutoCarrier(ctx context.Context, supported []string, proxy bool, dial func(context.Context, string) (selectedCarrier, error), report func(string, error)) (selectedCarrier, error) {
+func selectAutoCarrier(ctx context.Context, supported []string, requireTCP bool, dial func(context.Context, string) (selectedCarrier, error), report func(string, error)) (selectedCarrier, error) {
 	var failures []error
 	for _, mode := range []string{"quic", "http2", "wss"} {
 		if err := ctx.Err(); err != nil {
 			return selectedCarrier{}, err
 		}
-		if mode == "quic" && proxy {
+		if mode == "quic" && requireTCP {
 			if report != nil {
-				report(mode, fmt.Errorf("TCP upstream proxy requires TCP carrier"))
+				report(mode, fmt.Errorf("configured proxy or client-initiated streams require TCP carrier"))
 			}
 			continue
 		}
@@ -114,7 +114,7 @@ func connectAutoWithDisconnect(ctx context.Context, state *clientState, disconne
 		default:
 		}
 	}()
-	choice, err := selectAutoCarrier(ctx, state.SupportedTransports, state.HTTPProxy != "", func(ctx context.Context, mode string) (selectedCarrier, error) {
+	choice, err := selectAutoCarrier(ctx, state.SupportedTransports, state.requiresTCPCarrier(), func(ctx context.Context, mode string) (selectedCarrier, error) {
 		if mode == "quic" {
 			conn, err := state.dialNativeQUIC(ctx)
 			return selectedCarrier{QUIC: conn}, err

@@ -101,35 +101,28 @@ type serverClientInfo struct {
 	ingressOpenMu  sync.Mutex
 	ingressOpening chan struct{}
 	serializableClientInfo
-	conn                *websocket.Conn
-	connWriteMutex      sync.Mutex
-	muxSession          *yamux.Session
-	muxSessionMutex     sync.Mutex
-	quicConn            *transport.QUICConn // QUIC connection
-	listenerTLS         net.Listener
-	listenerNoTLS       net.Listener
-	clientListenerTLS   *http.Server
-	clientListenerNoTLS *http.Server
-	cancelFunc          context.CancelFunc
-	ctx                 context.Context // registration lifetime
-	attachMu            sync.Mutex      // orders data-connection attach against the unattached reaper
-	attached            bool
-	reaped              bool
-	connMutex           sync.Mutex
-	wsConnChans         map[string]chan *websocket.Conn
-	tunnels             []ServerTunnelConfig  // Multiple tunnels per client
-	tunnelMap           map[string]string     // name -> target
-	reverseConfigs      []ServerReverseConfig // Reverse forwarding configs
-	reverseListeners    []net.Listener        // Reverse forwarding listeners
-	customHeaders       map[string]string     // Custom headers to inject
-	compress            bool                  // Enable compression
-	p2pInfo             *p2p.PeerInfo         // P2P peer information
-	p2pSignalConn       *websocket.Conn       // WebSocket for P2P signaling
-	p2pSignalMutex      sync.Mutex            // Mutex for P2P signaling
-	p2pConnections      map[string]net.Conn   // Active P2P connections (peerID -> conn)
-	p2pConnMutex        sync.RWMutex          // Mutex for P2P connections
-	sessionToken        string                // Credential for data-plane connections
-	decrementOnce       sync.Once             // Ensure active clients counter only decremented once
+	muxSession       *yamux.Session
+	muxSessionMutex  sync.Mutex
+	quicConn         *transport.QUICConn // QUIC connection
+	cancelFunc       context.CancelFunc
+	ctx              context.Context // registration lifetime
+	attachMu         sync.Mutex      // orders data-connection attach against the unattached reaper
+	attached         bool
+	reaped           bool
+	connMutex        sync.Mutex
+	tunnels          []ServerTunnelConfig  // Multiple tunnels per client
+	tunnelMap        map[string]string     // name -> target
+	reverseConfigs   []ServerReverseConfig // Reverse forwarding configs
+	reverseListeners []net.Listener        // Reverse forwarding listeners
+	customHeaders    map[string]string     // Custom headers to inject
+	compress         bool                  // Enable compression
+	p2pInfo          *p2p.PeerInfo         // P2P peer information
+	p2pSignalConn    *websocket.Conn       // WebSocket for P2P signaling
+	p2pSignalMutex   sync.Mutex            // Mutex for P2P signaling
+	p2pConnections   map[string]net.Conn   // Active P2P connections (peerID -> conn)
+	p2pConnMutex     sync.RWMutex          // Mutex for P2P connections
+	sessionToken     string                // Credential for data-plane connections
+	decrementOnce    sync.Once             // Ensure active clients counter only decremented once
 }
 
 // validSessionToken reports whether presented matches the client's data-plane
@@ -167,26 +160,16 @@ var (
 		CheckOrigin:       func(r *http.Request) bool { return true },
 		EnableCompression: true,
 	}
-	serverMaxConcurrentConnections = 5000
-	serverConnLimiter              = make(chan struct{}, 5000)
-	serverUsedPorts                = make(map[int]bool)
-	serverPortMutex                sync.Mutex
-	serverInactivityTimeout        = 60 * time.Minute
-	serverMaxClientStreams         = 1024
-	// serverLegacyListeners binds the per-client port (7000+) and allows
-	// non-tls registrations (4000+). Current clients use /mux on the main
-	// port; disable on internet-facing hosts to keep the host's port space
-	// out of client reach.
-	serverLegacyListeners = true
+	serverInactivityTimeout = 60 * time.Minute
+	serverMaxClientStreams  = 1024
+	// Retained only to reject retired configuration explicitly.
+	serverLegacyListeners = false
 	// Unauthenticated QUIC connections allowed at once, and how long one
 	// may take to present its registration.
 	serverQUICPendingSlots = make(chan struct{}, 256)
 	serverQUICAuthTimeout  = 10 * time.Second
 	serverStateSaveMu      sync.Mutex
 	serverStartTime        = time.Now()
-
-	serverBasePortNoTLS     = 4000
-	serverBaseClientPortTLS = 7000
 
 	serverStateFile = "state.dat"
 	serverLogFile   = "server.log"
@@ -405,7 +388,7 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 	fs.StringVar(&serverClientCA, "client-ca", serverClientCA, "Path to CA certificate for mTLS client verification")
 	fs.StringVar(&serverPprofAddr, "pprof", serverPprofAddr, "Serve net/http/pprof on this loopback address (e.g. 127.0.0.1:6060)")
 	fs.BoolVar(&serverTrustProxyHeaders, "trust-proxy-headers", serverTrustProxyHeaders, "Key rate limits on X-Forwarded-For/X-Real-IP (only behind a trusted proxy)")
-	fs.BoolVar(&serverLegacyListeners, "legacy-listeners", serverLegacyListeners, "Bind legacy per-client ports (7000+) and allow non-tls registrations (4000+)")
+	fs.BoolVar(&serverLegacyListeners, "legacy-listeners", serverLegacyListeners, "Retired option; must be false (use standard carriers on the public port)")
 	fs.BoolVar(&serverAllowAnonymous, "allow-anonymous", serverAllowAnonymous, "Start without authentication (anyone can register and proxy)")
 	fs.BoolVar(&serverAllowPrivateEgress, "allow-private-egress", serverAllowPrivateEgress, "Let SOCKS/UDP streams reach loopback, private and link-local addresses")
 	fs.IntVar(&serverReversePortMin, "reverse-port-min", serverReversePortMin, "Lowest port a client may bind with -R")
@@ -436,6 +419,10 @@ func runServerWithConfig(args []string, preset *config.ServerConfig, injectedExp
 			_ = telemetryRuntime.drain(ctx)
 			cancel()
 		}()
+	}
+	if serverLegacyListeners {
+		fmt.Fprintln(os.Stderr, "legacy listeners were removed; set legacy_listeners: false and update clients")
+		return
 	}
 	setupServerLogging()
 
@@ -573,9 +560,6 @@ func serverAdvertisedPort() int {
 	return serverPort
 }
 func serverClientRoutingPort(legacyPort int) int {
-	if serverLegacyListeners {
-		return legacyPort
-	}
 	return serverAdvertisedPort()
 }
 func serverPublicURL(name, domain string) string {
@@ -865,45 +849,6 @@ func initServerMetrics() {
 	)
 }
 
-// serverLegacyPortSpan bounds each legacy per-client port range so the
-// allocator can never walk into ports of other services on the host.
-const serverLegacyPortSpan = 1000
-
-var errServerPortsExhausted = errors.New("per-client port range exhausted")
-
-func generateServerPorts() (int, int, error) {
-	serverPortMutex.Lock()
-	defer serverPortMutex.Unlock()
-
-	portNoTLS := findServerAvailablePort(serverBasePortNoTLS, 1)
-	clientPortTLS := findServerAvailablePort(serverBaseClientPortTLS, 1)
-	if portNoTLS < 0 || clientPortTLS < 0 {
-		return 0, 0, errServerPortsExhausted
-	}
-
-	serverUsedPorts[portNoTLS] = true
-	serverUsedPorts[clientPortTLS] = true
-
-	return portNoTLS, clientPortTLS, nil
-}
-
-func findServerAvailablePort(basePort, step int) int {
-	for port := basePort; port < basePort+serverLegacyPortSpan; port += step {
-		if !serverUsedPorts[port] {
-			return port
-		}
-	}
-	return -1
-}
-
-func releaseServerPorts(ports ...int) {
-	serverPortMutex.Lock()
-	defer serverPortMutex.Unlock()
-	for _, port := range ports {
-		delete(serverUsedPorts, port)
-	}
-}
-
 // serverClientLifecycleMu serialises registration with teardown so a stale
 // session cannot interleave with its successor's registration.
 var serverClientLifecycleMu sync.Mutex
@@ -911,9 +856,7 @@ var serverClientLifecycleMu sync.Mutex
 // forgetServerClient removes client's registry entry and routes, but only
 // while it is still the registered instance for clientID, and reports whether
 // it was. After a re-registration the old session closes late; its successor
-// owns the ID, routes and possibly the same ports, so a stale teardown must
-// not touch them. Callers release the ports only when this returns true, and
-// only after the listeners bound to them are closed.
+// owns the ID and routes, so a stale teardown must not touch them.
 func forgetServerClient(clientID string, client *serverClientInfo) bool {
 	serverClientLifecycleMu.Lock()
 	defer serverClientLifecycleMu.Unlock()
@@ -933,7 +876,7 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 		srvActiveClients.Dec()
 	})
 
-	current := forgetServerClient(clientID, client)
+	forgetServerClient(clientID, client)
 
 	client.muxSessionMutex.Lock()
 	if client.muxSession != nil {
@@ -942,35 +885,10 @@ func closeServerClientConnections(clientID string, client *serverClientInfo) {
 	}
 	client.muxSessionMutex.Unlock()
 
-	if client.listenerTLS != nil {
-		client.listenerTLS.Close()
-	}
-	if client.listenerNoTLS != nil {
-		client.listenerNoTLS.Close()
-	}
-
-	if client.clientListenerTLS != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := client.clientListenerTLS.Shutdown(ctx); err != nil {
-			log.Printf("Error shutting down TLS client listener for client %s: %v", clientID, err)
-		}
-	}
-	if client.clientListenerNoTLS != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := client.clientListenerNoTLS.Shutdown(ctx); err != nil {
-			log.Printf("Error shutting down non-TLS client listener for client %s: %v", clientID, err)
-		}
-	}
-
 	if client.cancelFunc != nil {
 		client.cancelFunc()
 	}
 
-	if current {
-		releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
-	}
 	if serverDebug {
 		log.Printf("Resources released for client %s", clientID)
 	}
@@ -1096,7 +1014,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	if regReq.ConnectionType == "" {
 		regReq.ConnectionType = "tls" // default
 	}
-	if regReq.ConnectionType != "tls" && regReq.ConnectionType != "quic" && regReq.ConnectionType != "non-tls" {
+	if regReq.ConnectionType != "tls" && regReq.ConnectionType != "quic" {
 		http.Error(w, "Invalid connection_type parameter", http.StatusBadRequest)
 		return
 	}
@@ -1119,21 +1037,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	regReq.Reverse = reverse
 
-	if regReq.ConnectionType == "non-tls" && !serverLegacyListeners {
-		http.Error(w, "non-tls connections are disabled on this server", http.StatusForbidden)
-		return
-	}
-	// Legacy ports are only reserved when legacy listeners exist; otherwise
-	// they would cap registrations at the range size for nothing. Clients
-	// only require a non-empty client_port_tls, which "0" satisfies.
 	var portNoTLS, clientPortTLS int
-	if serverLegacyListeners {
-		var err error
-		if portNoTLS, clientPortTLS, err = generateServerPorts(); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
-			return
-		}
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	serverClientLifecycleMu.Lock()
@@ -1157,8 +1061,6 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 			oldMux.Close()
 		}
 
-		// Release old ports
-		releaseServerPorts(existing.PortNoTLS, existing.ClientPortTLS, existing.ClientPortNoTLS)
 		legacyClientRegistry.Delete(clientID)
 		existing.decrementOnce.Do(func() {
 			srvActiveClients.Dec()
@@ -1186,7 +1088,6 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 				cancel()
 				// Without this every refused registration leaked its two
 				// port numbers and walked the allocator forward.
-				releaseServerPorts(portNoTLS, clientPortTLS)
 				return
 			}
 
@@ -1216,7 +1117,6 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		},
 		cancelFunc:     cancel,
 		ctx:            ctx,
-		wsConnChans:    make(map[string]chan *websocket.Conn),
 		tunnels:        tunnels,
 		tunnelMap:      tunnelMap,
 		reverseConfigs: regReq.Reverse,
@@ -1257,37 +1157,12 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Started reverse listener on %s -> client local %s for client %s", rc.Remote, rc.Local, clientID)
 	}
 
-	if serverLegacyListeners {
-		serverWg.Add(1)
-		go func() {
-			defer serverWg.Done()
-			waitForServerClientConnection(ctx, client, client.ClientPortTLS, true, clientID)
-		}()
-	}
-
-	switch regReq.ConnectionType {
-	case "tls":
-	case "quic":
-		// QUIC connections are handled by the global QUIC listener
-		// Client will connect via QUIC after registration
-	case "non-tls":
-		serverWg.Add(1)
-		go func() {
-			defer serverWg.Done()
-			waitForProxyConnectionNoTLS(ctx, client, client.PortNoTLS)
-		}()
-	}
-
 	serverWg.Add(1)
 	go func() {
 		defer serverWg.Done()
 		monitorServerClientActivity(ctx, clientID, client)
 	}()
-	// With legacy listeners a "tls" client may attach through the legacy
-	// /ws path, which the reaper cannot see.
-	if !serverLegacyListeners {
-		go reapUnattachedRegistration(ctx, clientID, client)
-	}
+	go reapUnattachedRegistration(ctx, clientID, client)
 	saveServerState()
 
 	srvRegistrationSuccess.Inc()
@@ -1306,7 +1181,7 @@ func registerServerClientHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := regResponse{
-		Transports:    []string{"legacy", "http2", "wss", "quic"},
+		Transports:    []string{"http2", "wss", "quic"},
 		UDID:          clientID,
 		ClientPortTLS: strconv.Itoa(serverClientRoutingPort(clientPortTLS)),
 		ProxyURLNoTLS: fmt.Sprintf("%s:%d", serverDomain, portNoTLS),
@@ -1397,11 +1272,8 @@ func waitForProxyConnectionTLS(ctx context.Context, proxyPort int, exporter tele
 			case "/register_client":
 				serverAuthScopeMiddleware(scopeClient, serverRegRateLimitMiddleware(registerServerClientHandler))(w, r)
 				return
-			case "/client_ws":
-				serverAuthScopeMiddleware(scopeClient, serverRateLimitMiddleware(serverClientWebSocketHandler))(w, r)
-				return
-			case "/mux":
-				serverRateLimitMiddleware(serverMuxWebSocketHandler)(w, r)
+			case "/client_ws", "/mux", "/ws":
+				http.Error(w, "legacy carrier removed; update xrok client and use transport auto", http.StatusGone)
 				return
 			case "/v2/tunnel", "/v2/tunnel/ws":
 				serverRateLimitMiddleware(serverStandardTunnelHandler)(w, r)
@@ -2172,19 +2044,10 @@ func startReverseListener(ctx context.Context, client *serverClientInfo, remoteA
 func handleReverseConnection(ctx context.Context, conn net.Conn, client *serverClientInfo, localTarget string) {
 	defer conn.Close()
 
-	client.muxSessionMutex.Lock()
-	session := client.muxSession
-	client.muxSessionMutex.Unlock()
-
-	if session == nil || session.IsClosed() {
-		log.Printf("No mux session available for reverse forwarding")
-		return
-	}
-
-	// Open stream to client
-	stream, err := session.Open()
+	// Reverse forwarding is ingress too: use the selected QUIC or yamux carrier.
+	stream, err := openClientTransportStream(ctx, client)
 	if err != nil {
-		log.Printf("Failed to open mux stream for reverse forwarding: %v", err)
+		log.Printf("Failed to open reverse forwarding stream: %v", err)
 		return
 	}
 	defer stream.Close()
@@ -2206,364 +2069,7 @@ func handleReverseConnection(ctx context.Context, conn net.Conn, client *serverC
 
 	client.SetLastActivity(time.Now())
 
-	// Bridge the connections
-	done := make(chan struct{}, 2)
-
-	go func() {
-		io.Copy(stream, conn)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		io.Copy(conn, stream)
-		done <- struct{}{}
-	}()
-
-	select {
-	case <-done:
-	case <-ctx.Done():
-	}
-}
-
-func waitForProxyConnectionNoTLS(ctx context.Context, client *serverClientInfo, proxyPort int) {
-	log.Printf("Initializing non-TLS proxy listener on port %d for client %s", proxyPort, client.UDID)
-
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", proxyPort))
-	if err != nil {
-		log.Printf("Error initializing non-TLS listener on port %d: %v", proxyPort, err)
-		return
-	}
-
-	client.listenerNoTLS = listener
-	defer func() {
-		if err := listener.Close(); err != nil {
-			log.Printf("Error closing non-TLS listener on port %d: %v", proxyPort, err)
-		}
-	}()
-
-	log.Printf("Non-TLS proxy server listening on port %d for client %s", proxyPort, client.UDID)
-
-	acceptServerConnections(ctx, listener, client, handleNewProxyConnectionNoTLS)
-}
-
-func acceptServerConnections(ctx context.Context, listener net.Listener, client *serverClientInfo, handleFunc func(net.Conn, *serverClientInfo)) {
-	log.Printf("Starting to accept connections on port %d", listener.Addr().(*net.TCPAddr).Port)
-	var wg sync.WaitGroup
-	var backoff acceptBackoff
-	// Accept blocks, so the ctx check below never runs while idle; close the
-	// listener on cancel so the port is actually unbound.
-	go func() {
-		<-ctx.Done()
-		listener.Close()
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("Shutting down listener on port %d", listener.Addr().(*net.TCPAddr).Port)
-			if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-				log.Printf("Error while closing listener: %v", err)
-			}
-			wg.Wait()
-			return
-
-		default:
-			proxyConn, err := listener.Accept()
-			if err != nil {
-				if !backoff.retry(ctx, err) {
-					return
-				}
-				continue
-			}
-			backoff.reset()
-
-			log.Printf("Accepted connection for client %s", client.UDID)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				handleFunc(proxyConn, client)
-			}()
-		}
-	}
-}
-
-func handleNewProxyConnectionTLS(proxyConn net.Conn, client *serverClientInfo) {
-	handleNewProxyConnectionTLSWithTunnel(proxyConn, client, "", "", nil)
-}
-
-func handleNewProxyConnectionTLSWithTunnel(proxyConn net.Conn, client *serverClientInfo, tunnelName string, basicAuth string, customHeaders map[string]string) {
-	defer proxyConn.Close()
-
-	client.SetLastActivity(time.Now())
-
-	// Get client IP for logging
-	clientIP := proxyConn.RemoteAddr().String()
-	if host, _, err := net.SplitHostPort(clientIP); err == nil {
-		clientIP = host
-	}
-
-	// Check Basic Auth if configured (this reads the request)
-	var initialData []byte
-	needReadRequest := basicAuth != "" || len(customHeaders) > 0 || serverRequestLog
-
-	if needReadRequest {
-		// Read the HTTP request for auth check, header injection, and logging
-		buf := make([]byte, 4096)
-		proxyConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		n, err := proxyConn.Read(buf)
-		if err != nil {
-			log.Printf("Failed to read request: %v", err)
-			return
-		}
-		proxyConn.SetReadDeadline(time.Time{})
-		initialData = buf[:n]
-
-		// Log the request
-		logRequest(initialData, clientIP, tunnelName)
-
-		// Check Basic Auth if required
-		if basicAuth != "" {
-			authOK := verifyBasicAuth(initialData, basicAuth)
-			if !authOK {
-				log.Printf("Basic Auth failed for tunnel %s from %s", tunnelName, clientIP)
-				// Send 401 response
-				response := "HTTP/1.1 401 Unauthorized\r\n" +
-					"WWW-Authenticate: Basic realm=\"Protected\"\r\n" +
-					"Content-Type: text/plain\r\n" +
-					"Content-Length: 12\r\n" +
-					"Connection: close\r\n" +
-					"\r\n" +
-					"Unauthorized"
-				n, err := proxyConn.Write([]byte(response))
-				log.Printf("Sent 401 response: %d bytes, err: %v", n, err)
-				return
-			}
-		}
-
-		// Inject custom headers
-		if len(customHeaders) > 0 {
-			initialData = injectHeaders(initialData, customHeaders)
-		}
-	}
-
-	client.muxSessionMutex.Lock()
-	session := client.muxSession
-	client.muxSessionMutex.Unlock()
-
-	if session != nil && !session.IsClosed() {
-		stream, err := session.Open()
-		if err != nil {
-			log.Printf("Failed to open yamux stream: %v", err)
-		} else {
-			// Send tunnel name header if multi-tunnel mode
-			if len(client.tunnelMap) > 0 && tunnelName != "" {
-				// Write tunnel name as: 1 byte length + name bytes
-				nameBytes := []byte(tunnelName)
-				if len(nameBytes) > 255 {
-					nameBytes = nameBytes[:255]
-				}
-				header := make([]byte, 1+len(nameBytes))
-				header[0] = byte(len(nameBytes))
-				copy(header[1:], nameBytes)
-				if _, err := stream.Write(header); err != nil {
-					log.Printf("Failed to write tunnel header: %v", err)
-					stream.Close()
-					return
-				}
-			}
-			// Write initial data that was read for auth check
-			if len(initialData) > 0 {
-				if _, err := stream.Write(initialData); err != nil {
-					log.Printf("Failed to write initial data: %v", err)
-					stream.Close()
-					return
-				}
-			}
-			handleMuxProxyConnection(proxyConn, stream, client)
-			return
-		}
-	}
-
-	connectionID := uuid.New().String()
-
-	message := map[string]string{
-		"type":         "new_connection",
-		"connectionID": connectionID,
-		"useTLS":       "true",
-	}
-
-	// Add tunnel name to message for WebSocket fallback
-	if tunnelName != "" {
-		message["tunnelName"] = tunnelName
-	}
-
-	ch := make(chan *websocket.Conn)
-
-	client.connMutex.Lock()
-	client.wsConnChans[connectionID] = ch
-	client.connMutex.Unlock()
-
-	if client.conn == nil {
-		log.Printf("WebSocket connection for client %s is not established", client.UDID)
-		client.connMutex.Lock()
-		delete(client.wsConnChans, connectionID)
-		client.connMutex.Unlock()
-		return
-	}
-
-	client.connWriteMutex.Lock()
-	err := client.conn.WriteJSON(message)
-	client.connWriteMutex.Unlock()
-	if err != nil {
-		log.Printf("Failed to send new_connection message: %v", err)
-		client.connMutex.Lock()
-		delete(client.wsConnChans, connectionID)
-		client.connMutex.Unlock()
-		return
-	}
-
-	select {
-	case wsConn := <-ch:
-		if wsConn == nil {
-			client.connMutex.Lock()
-			delete(client.wsConnChans, connectionID)
-			client.connMutex.Unlock()
-			return
-		}
-		handleProxyWebSocketConnection(proxyConn, wsConn, client)
-	case <-time.After(30 * time.Second):
-		log.Printf("Timeout waiting for client WebSocket connection")
-		client.connMutex.Lock()
-		delete(client.wsConnChans, connectionID)
-		client.connMutex.Unlock()
-	}
-}
-
-func handleNewProxyConnectionNoTLS(proxyConn net.Conn, client *serverClientInfo) {
-	connectionID := uuid.New().String()
-	defer proxyConn.Close()
-
-	log.Printf("Setting up new non-TLS proxy connection with ID: %s", connectionID)
-
-	ch := make(chan *websocket.Conn)
-
-	client.connMutex.Lock()
-	if client.conn == nil {
-		client.connMutex.Unlock()
-		log.Printf("WebSocket connection for client %s is not established", client.UDID)
-		return
-	}
-
-	client.wsConnChans[connectionID] = ch
-	client.connMutex.Unlock()
-
-	client.connWriteMutex.Lock()
-	err := client.conn.WriteJSON(map[string]string{
-		"type":         "new_connection",
-		"connectionID": connectionID,
-		"useTLS":       "false",
-	})
-	client.connWriteMutex.Unlock()
-
-	if err != nil {
-		log.Printf("Failed to send new_connection message: %v", err)
-		client.connMutex.Lock()
-		delete(client.wsConnChans, connectionID)
-		client.connMutex.Unlock()
-		return
-	}
-
-	select {
-	case wsConn := <-ch:
-		if wsConn == nil {
-			client.connMutex.Lock()
-			delete(client.wsConnChans, connectionID)
-			client.connMutex.Unlock()
-			return
-		}
-		handleProxyWebSocketConnection(proxyConn, wsConn, client)
-		client.connMutex.Lock()
-		delete(client.wsConnChans, connectionID)
-		client.connMutex.Unlock()
-	case <-time.After(60 * time.Second):
-		client.connMutex.Lock()
-		delete(client.wsConnChans, connectionID)
-		client.connMutex.Unlock()
-	}
-}
-
-func handleProxyWebSocketConnection(proxyConn net.Conn, wsConn *websocket.Conn, client *serverClientInfo) {
-	timer := newSrvConnectionTimer()
-	defer timer.observe()
-
-	srvTotalConnections.Inc()
-	srvActiveProxyConnections.Inc()
-	defer srvActiveProxyConnections.Dec()
-
-	defer wsConn.Close()
-	defer proxyConn.Close()
-
-	done := make(chan struct{}, 2)
-	errChan := make(chan error, 2)
-
-	go func() {
-		bufPtr := serverBufferPool.Get().(*[]byte)
-		buf := *bufPtr
-		defer serverBufferPool.Put(bufPtr)
-
-		for {
-			n, err := wsConn.UnderlyingConn().Read(buf)
-			if n > 0 {
-				srvBytesReceived.Add(float64(n))
-				if _, writeErr := proxyConn.Write(buf[:n]); writeErr != nil {
-					srvConnectionErrors.WithLabelValues("write_proxy").Inc()
-					errChan <- writeErr
-					return
-				}
-				client.SetLastActivity(time.Now())
-			}
-			if err != nil {
-				if err != io.EOF {
-					srvConnectionErrors.WithLabelValues("read_ws").Inc()
-					errChan <- err
-				}
-				break
-			}
-		}
-		done <- struct{}{}
-	}()
-
-	go func() {
-		bufPtr := serverBufferPool.Get().(*[]byte)
-		buf := *bufPtr
-		defer serverBufferPool.Put(bufPtr)
-
-		for {
-			n, err := proxyConn.Read(buf)
-			if n > 0 {
-				srvBytesSent.Add(float64(n))
-				if _, writeErr := wsConn.UnderlyingConn().Write(buf[:n]); writeErr != nil {
-					srvConnectionErrors.WithLabelValues("write_ws").Inc()
-					errChan <- writeErr
-					return
-				}
-				client.SetLastActivity(time.Now())
-			}
-			if err != nil {
-				if err != io.EOF {
-					srvConnectionErrors.WithLabelValues("read_proxy").Inc()
-					errChan <- err
-				}
-				break
-			}
-		}
-		done <- struct{}{}
-	}()
-
-	select {
-	case <-done:
-	case <-errChan:
-	}
+	relayLocalApplication(ctx, stream, conn)
 }
 
 func handleMuxProxyConnection(proxyConn net.Conn, stream net.Conn, client *serverClientInfo) {
@@ -2714,150 +2220,6 @@ func handleQUICProxyConnection(proxyConn net.Conn, stream *quic.Stream, client *
 	}
 }
 
-const (
-	srvPongWait   = 60 * time.Second
-	srvPingPeriod = (srvPongWait * 9) / 10
-)
-
-func waitForServerClientConnection(ctx context.Context, client *serverClientInfo, clientPort int, useTLS bool, udid string) {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Upgrade") != "websocket" {
-			http.Error(w, "400 Bad Request", http.StatusBadRequest)
-			return
-		}
-
-		select {
-		case serverConnLimiter <- struct{}{}:
-			defer func() { <-serverConnLimiter }()
-		default:
-			http.Error(w, "Server too busy", http.StatusServiceUnavailable)
-			return
-		}
-
-		wsConn, err := serverUpgrader.Upgrade(w, r, nil)
-		if err != nil {
-			log.Printf("Failed to upgrade to WebSocket: %v", err)
-			return
-		}
-		srvWsUpgrades.Inc()
-
-		wsConn.SetReadDeadline(time.Now().Add(srvPongWait))
-
-		var pingTimeMutex sync.Mutex
-		var lastPingTime time.Time
-
-		wsConn.SetPongHandler(func(string) error {
-			wsConn.SetReadDeadline(time.Now().Add(srvPongWait))
-			client.SetLastActivity(time.Now())
-
-			pingTimeMutex.Lock()
-			if !lastPingTime.IsZero() {
-				latency := time.Since(lastPingTime).Seconds()
-				srvWsPingPongLatency.Observe(latency)
-			}
-			pingTimeMutex.Unlock()
-
-			return nil
-		})
-
-		client.connMutex.Lock()
-		client.conn = wsConn
-		client.connMutex.Unlock()
-		client.SetLastActivity(time.Now())
-
-		go func() {
-			ticker := time.NewTicker(srvPingPeriod)
-			defer ticker.Stop()
-
-			disconnected := make(chan struct{})
-
-			go func() {
-				for {
-					_, _, err := wsConn.ReadMessage()
-					if err != nil {
-						close(disconnected)
-						return
-					}
-				}
-			}()
-
-			for {
-				select {
-				case <-ticker.C:
-					pingTimeMutex.Lock()
-					lastPingTime = time.Now()
-					pingTimeMutex.Unlock()
-
-					client.connWriteMutex.Lock()
-					err := wsConn.WriteMessage(websocket.PingMessage, nil)
-					client.connWriteMutex.Unlock()
-					if err != nil {
-						wsConn.Close()
-						return
-					}
-				case <-ctx.Done():
-					wsConn.Close()
-					return
-				case <-disconnected:
-					return
-				}
-			}
-		}()
-
-		for {
-			_, _, err := wsConn.ReadMessage()
-			if err != nil {
-				wsConn.Close()
-				return
-			}
-		}
-	})
-
-	mux.HandleFunc("/client_ws", serverRateLimitMiddleware(serverClientWebSocketHandler))
-	mux.HandleFunc("/mux", serverRateLimitMiddleware(serverMuxWebSocketHandler))
-
-	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", clientPort),
-		Handler:      mux,
-		ReadTimeout:  5 * time.Minute,
-		WriteTimeout: 5 * time.Minute,
-		IdleTimeout:  5 * time.Minute,
-	}
-
-	if useTLS {
-		client.clientListenerTLS = server
-	} else {
-		client.clientListenerNoTLS = server
-	}
-
-	go func() {
-		if useTLS {
-			certs, err := serverCertReloader()
-			if err != nil {
-				log.Printf("Failed to load certificate for client port %d: %v", clientPort, err)
-				return
-			}
-			server.TLSConfig = &tls.Config{GetCertificate: certs.GetCertificate, MinVersion: tls.VersionTLS12}
-			log.Printf("Secure WebSocket server listening on port %d", clientPort)
-			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("Failed to start TLS server on port %d: %v", clientPort, err)
-			}
-		} else {
-			log.Printf("WebSocket server listening on port %d", clientPort)
-			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("Failed to start server on port %d: %v", clientPort, err)
-			}
-		}
-	}()
-
-	<-ctx.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	server.Shutdown(shutdownCtx)
-}
-
 func saveServerState() {
 	// Registrations save concurrently; the snapshot+write+rename must not
 	// interleave on the shared temp file.
@@ -2883,12 +2245,6 @@ func saveServerState() {
 			Registered:      client.Registered,
 		}
 	}
-
-	serverPortMutex.Lock()
-	for port, used := range serverUsedPorts {
-		state.UsedPorts[port] = used
-	}
-	serverPortMutex.Unlock()
 
 	// Write to a temp file and rename so a crash mid-write never leaves a
 	// truncated state file behind.
@@ -2936,7 +2292,7 @@ func loadServerState() {
 	}
 
 	for id, clientData := range state.Clients {
-		if !serverLegacyListeners && clientData.ConnectionType == "non-tls" {
+		if clientData.ConnectionType == "non-tls" {
 			continue // disabled on this server; do not reopen its port
 		}
 		client := &serverClientInfo{
@@ -2949,7 +2305,6 @@ func loadServerState() {
 				ConnectionID:    clientData.ConnectionID,
 				Registered:      clientData.Registered,
 			},
-			wsConnChans:    make(map[string]chan *websocket.Conn),
 			p2pConnections: make(map[string]net.Conn),
 		}
 		client.SetLastActivity(clientData.LastActivity)
@@ -2960,27 +2315,7 @@ func loadServerState() {
 		client.cancelFunc = cancel
 		client.ctx = ctx
 
-		if serverLegacyListeners {
-			serverWg.Add(1)
-			go func(ctx context.Context, client *serverClientInfo, id string) {
-				defer serverWg.Done()
-				waitForServerClientConnection(ctx, client, client.ClientPortTLS, true, id)
-			}(ctx, client, id)
-		}
-		// A restored registration whose client never comes back must not
-		// keep its subdomains. Legacy clients attach through /ws, which the
-		// reaper cannot see, so it only runs when legacy listeners are off.
-		if !serverLegacyListeners {
-			go reapUnattachedRegistration(ctx, id, client)
-		}
-
-		if client.ConnectionType == "non-tls" && serverLegacyListeners {
-			serverWg.Add(1)
-			go func(ctx context.Context, client *serverClientInfo) {
-				defer serverWg.Done()
-				waitForProxyConnectionNoTLS(ctx, client, client.PortNoTLS)
-			}(ctx, client)
-		}
+		go reapUnattachedRegistration(ctx, id, client)
 
 		serverWg.Add(1)
 		go func(id string, client *serverClientInfo) {
@@ -2988,13 +2323,7 @@ func loadServerState() {
 			monitorServerClientActivity(ctx, id, client)
 		}(id, client)
 	}
-	serverPortMutex.Lock()
-	if serverLegacyListeners {
-		for port, used := range state.UsedPorts {
-			serverUsedPorts[port] = used
-		}
-	}
-	serverPortMutex.Unlock()
+
 }
 
 func closeServerShutdown(shutdown chan struct{}) {
@@ -3021,38 +2350,6 @@ func gracefulServerShutdown(shutdown chan struct{}) {
 	log.Printf("Received signal %v, initiating graceful shutdown...", sig)
 
 	closeServerShutdown(shutdown)
-}
-
-func serverMuxWebSocketHandler(w http.ResponseWriter, r *http.Request) {
-	clientID := r.URL.Query().Get("clientID")
-	if clientID == "" {
-		http.Error(w, "Missing clientID", http.StatusBadRequest)
-		return
-	}
-
-	client, exists := legacyClientRegistry.Get(clientID)
-	if !exists {
-		http.Error(w, "Unknown client", http.StatusNotFound)
-		return
-	}
-	sessionToken := r.Header.Get("X-Xrok-Session")
-	if sessionToken == "" {
-		sessionToken = r.URL.Query().Get("session_token")
-	}
-	if !client.validSessionToken(sessionToken) {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	wsConn, err := serverUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Failed to upgrade mux WebSocket: %v", err)
-		return
-	}
-	srvWsUpgrades.Inc()
-
-	defer wsConn.Close()
-	serveServerMuxCarrier(wsConn.UnderlyingConn(), client, clientID)
 }
 
 func serveServerMuxCarrier(carrier net.Conn, client *serverClientInfo, clientID string) {
@@ -3154,7 +2451,6 @@ func serveServerMuxCarrier(carrier net.Conn, client *serverClientInfo, clientID 
 		if client.cancelFunc != nil {
 			client.cancelFunc()
 		}
-		releaseServerPorts(client.PortNoTLS, client.ClientPortTLS, client.ClientPortNoTLS)
 	}
 
 	client.decrementOnce.Do(func() {
@@ -3290,47 +2586,6 @@ func handleClientInitiatedStream(stream net.Conn, client *serverClientInfo) {
 
 	// Unknown stream type - close it
 	log.Printf("Unknown stream type marker: 0x%02X", header[0])
-}
-
-func serverClientWebSocketHandler(w http.ResponseWriter, r *http.Request) {
-	connectionID := r.URL.Query().Get("connectionID")
-	clientID := r.URL.Query().Get("clientID")
-	if connectionID == "" || clientID == "" {
-		http.Error(w, "Missing connectionID or clientID", http.StatusBadRequest)
-		return
-	}
-	if _, ok := requirePrincipalClient(w, r, clientID); !ok {
-		return
-	}
-
-	if r.Header.Get("Upgrade") != "websocket" {
-		http.Error(w, "WebSocket upgrade required", http.StatusBadRequest)
-		return
-	}
-
-	wsConn, err := serverUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("Failed to upgrade to WebSocket: %v", err)
-		return
-	}
-	srvWsUpgrades.Inc()
-
-	client, exists := legacyClientRegistry.Get(clientID)
-	if !exists {
-		wsConn.Close()
-		return
-	}
-
-	client.connMutex.Lock()
-	ch, exists := client.wsConnChans[connectionID]
-	client.connMutex.Unlock()
-	if !exists {
-		wsConn.Close()
-		return
-	}
-
-	ch <- wsConn
-	client.SetLastActivity(time.Now())
 }
 
 // handleP2PWebSocket handles P2P signaling WebSocket connections

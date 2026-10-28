@@ -14,12 +14,18 @@ func LegacyServerDepsFallbacks() uint64
 func RunClient(args []string)
     RunClient runs the xrok client with the given arguments
 
+func RunMASQUE(args []string) error
+    RunMASQUE exposes a bounded local UDP forwarder through a fixed-target
+    authenticated HTTP/3 CONNECT-UDP proxy. It is independent of TCP
+    registration.
+
 func RunServer(args []string)
     RunServer runs the xrok server with the given arguments
 
 func RunStatus(args []string)
     RunStatus runs the status command
 
+func ServerDepsFromContext(ctx context.Context) (*ServerDeps, bool)
 func WithServerDeps(ctx context.Context, deps *ServerDeps) context.Context
 
 TYPES
@@ -227,8 +233,6 @@ func NewServerDeps(domain string, start time.Time, logger *log.Logger) *ServerDe
     NewServerDeps constructs an isolated dependency set for an embedded server.
     Registries are created when omitted, making each runtime independent.
 
-func ServerDepsFromContext(ctx context.Context) (*ServerDeps, bool)
-
 type ServerReverseConfig struct {
 	Remote string `json:"remote"` // Port to listen on server
 	Local  string `json:"local"`  // Local target on client
@@ -306,11 +310,14 @@ type ServerStatus struct {
     ServerStatus represents the server status response
 
 type ServerTunnelConfig struct {
-	Name               string `json:"name"`
-	Target             string `json:"target"`
-	BasicAuth          string `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
-	Capability         string `json:"capability,omitempty"`
-	CapabilityAudience string `json:"capability_audience,omitempty"`
+	WebTransport        bool     `json:"webtransport,omitempty"`
+	Datagrams           bool     `json:"datagrams,omitempty"`
+	WebTransportOrigins []string `json:"webtransport_origins,omitempty"`
+	Name                string   `json:"name"`
+	Target              string   `json:"target"`
+	BasicAuth           string   `json:"basic_auth,omitempty"` // user:password for HTTP Basic Auth
+	Capability          string   `json:"capability,omitempty"`
+	CapabilityAudience  string   `json:"capability_audience,omitempty"`
 }
     ServerTunnelConfig represents a tunnel configuration on the server
 
@@ -328,11 +335,14 @@ type StoreFactoryDeps struct {
     embedders to register the driver they use without imposing dependencies.
 
 type TunnelConfig struct {
-	Name               string `json:"name"`                 // Subdomain name (e.g., "app", "api")
-	Target             string `json:"target"`               // Local target (e.g., "localhost:8080")
-	BasicAuth          string `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
-	Capability         string `json:"capability,omitempty"` // optional capability required by the public route
-	CapabilityAudience string `json:"capability_audience,omitempty"`
+	WebTransport        bool     `json:"webtransport,omitempty"`
+	Datagrams           bool     `json:"datagrams,omitempty"`
+	WebTransportOrigins []string `json:"webtransport_origins,omitempty"`
+	Name                string   `json:"name"`                 // Subdomain name (e.g., "app", "api")
+	Target              string   `json:"target"`               // Local target (e.g., "localhost:8080")
+	BasicAuth           string   `json:"basic_auth,omitempty"` // HTTP Basic Auth (user:password)
+	Capability          string   `json:"capability,omitempty"` // optional capability required by the public route
+	CapabilityAudience  string   `json:"capability_audience,omitempty"`
 }
     TunnelConfig represents a single tunnel configuration
 
@@ -344,13 +354,16 @@ type TunnelInfo struct {
     TunnelInfo contains info about a registered tunnel
 
 type TunnelRoute struct {
-	ClientID           string
-	TunnelName         string
-	Target             string
-	BasicAuth          string            // user:password for HTTP Basic Auth
-	Headers            map[string]string // Custom headers to inject
-	Capability         string            // Optional capability token required by route
-	CapabilityAudience string            // JWT audience when capability is an HS256 secret
+	WebTransport        bool
+	Datagrams           bool
+	WebTransportOrigins []string
+	ClientID            string
+	TunnelName          string
+	Target              string
+	BasicAuth           string            // user:password for HTTP Basic Auth
+	Headers             map[string]string // Custom headers to inject
+	Capability          string            // Optional capability token required by route
+	CapabilityAudience  string            // JWT audience when capability is an HS256 secret
 }
     TunnelRoute maps a subdomain to client and tunnel info
 

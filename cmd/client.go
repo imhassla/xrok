@@ -192,11 +192,6 @@ func (r *ReconnectConfig) Backoff(attempt int) time.Duration {
 	return time.Duration(wait + jitter)
 }
 
-type activeConnection struct {
-	WebSocketConn *websocket.Conn
-	LocalConn     net.Conn
-}
-
 // TunnelInfo contains info about a registered tunnel
 type TunnelInfo struct {
 	Name   string `json:"name"`
@@ -348,20 +343,16 @@ type registerResponse struct {
 }
 
 var (
-	clientRp          int
-	clientDebug       bool
-	clientID          string
-	reconnectConfig   *ReconnectConfig
-	clientState_      *clientState
-	clientStateMutex  sync.Mutex
-	clientRuntime_    *ClientRuntime
-	isConnected       atomic.Bool
-	reconnectCount    atomic.Int64
-	clientLog         *logger.Logger
-	activeConnections = struct {
-		sync.RWMutex
-		connections map[string]*activeConnection
-	}{connections: make(map[string]*activeConnection)}
+	clientRp         int
+	clientDebug      bool
+	clientID         string
+	reconnectConfig  *ReconnectConfig
+	clientState_     *clientState
+	clientStateMutex sync.Mutex
+	clientRuntime_   *ClientRuntime
+	isConnected      atomic.Bool
+	reconnectCount   atomic.Int64
+	clientLog        *logger.Logger
 )
 
 // RunClient runs the xrok client with the given arguments
@@ -414,7 +405,7 @@ func RunClient(args []string) {
 
 	// Transport selection
 	useQUIC := fs.Bool("quic", false, "Use QUIC transport instead of WebSocket")
-	transportMode := fs.String("transport", "", "Tunnel transport: legacy|auto|http2|wss|quic")
+	transportMode := fs.String("transport", "", "Tunnel transport: auto (default)|http2|wss|quic")
 
 	// HTTP CONNECT proxy (for corporate proxies)
 	httpProxy := fs.String("http-proxy", "", "Upstream proxy URL: http, https, socks5 (local DNS), or socks5h (proxy DNS)")
@@ -469,6 +460,9 @@ func RunClient(args []string) {
 
 	// Setup logging
 	setupClientLogging()
+	if *stdioMode {
+		clientLog.SetOutput(os.Stderr)
+	}
 	// Keep lifecycle state behind an injectable runtime. Legacy handlers still
 	// access clientState_ during the CLI migration.
 	clientRuntime_ = NewClientRuntime(clientLog)
@@ -486,7 +480,7 @@ func RunClient(args []string) {
 	if *configFile != "" {
 		cfg, err := loadClientConfigFile(*configFile)
 		if err != nil {
-			fmt.Printf("Failed to load config: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
 			os.Exit(1)
 		}
 		// Apply config values (CLI flags override config)
@@ -527,8 +521,8 @@ func RunClient(args []string) {
 		// Apply transport from config
 		if *transportMode == "" && !*useQUIC {
 			*transportMode = cfg.Transport
-			if *transportMode == "" {
-				*transportMode = cfg.ConnectionType
+			if *transportMode == "" && cfg.ConnectionType == "quic" {
+				*transportMode = "quic"
 			}
 		}
 		// Apply TLS setting from config (CLI can override)
@@ -655,7 +649,7 @@ func RunClient(args []string) {
 		os.Exit(1)
 	}
 	*useQUIC = mode == "quic"
-	if mode != "legacy" && !*useTLS {
+	if !*useTLS {
 		clientLog.Error("standard transports require TLS")
 		os.Exit(1)
 	}
@@ -727,7 +721,7 @@ func RunClient(args []string) {
 		}
 	}
 
-	if len(tunnelConfigs) == 0 && *folderPath == "" && !*useProxy && *socks5Addr == "" && len(udpTunnels) == 0 && len(reverseTunnels) == 0 {
+	if len(tunnelConfigs) == 0 && *folderPath == "" && !*useProxy && *socks5Addr == "" && len(udpTunnels) == 0 && len(reverseTunnels) == 0 && !*stdioMode {
 		clientLog.Error("Specify --tunnel, --port, --folder, --socks5, or --udp to expose a service.")
 		clientLog.Info("Examples:")
 		clientLog.Info("  --tunnel app:localhost:8080")
@@ -880,13 +874,21 @@ func RunClient(args []string) {
 		}
 	}
 
+	if state.Transport == "quic" && state.requiresTCPCarrier() {
+		clientLog.Error("QUIC does not support client-initiated proxy, UDP or stdio streams; use --transport auto, http2 or wss")
+		os.Exit(1)
+	}
+
 	// Handle stdio mode
 	if *stdioMode {
 		if *stdioTarget == "" {
 			clientLog.Error("--stdio-target is required when using --stdio mode")
 			os.Exit(1)
 		}
-		runStdioMode(state, *apiToken)
+		if err := runStdioMode(state, *apiToken); err != nil {
+			clientLog.Error("Stdio tunnel: %v", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -1022,7 +1024,7 @@ func setupClientLogging() {
 	// Also log to file
 	logFile := "client.log"
 	if err := clientLog.SetLogFile(logFile); err != nil {
-		fmt.Printf("Warning: Failed to open log file %s: %v\n", logFile, err)
+		fmt.Fprintf(os.Stderr, "Warning: Failed to open log file %s: %v\n", logFile, err)
 	}
 
 	// Set up standard log for library logging
@@ -1506,10 +1508,6 @@ func runWithReconnect(ctx context.Context, state *clientState, token string, wg 
 			}()
 		}
 
-		if !state.Multiplexed {
-			go connectAndForwardSession(sessionCtx, state)
-		}
-
 		// Connect P2P signaling if P2P is enabled
 		if state.P2PEnabled {
 			go connectP2PSignaling(sessionCtx, state)
@@ -1551,91 +1549,6 @@ func runWithReconnect(ctx context.Context, state *clientState, token string, wg 
 				clientLog.Error("Connection lost and reconnect is disabled. Exiting.")
 				return
 			}
-		}
-	}
-}
-
-// connectQUICWithDisconnect establishes QUIC connection to server
-func connectQUICWithDisconnect(ctx context.Context, state *clientState, disconnected chan<- struct{}) {
-	defer func() {
-		select {
-		case disconnected <- struct{}{}:
-		default:
-		}
-	}()
-
-	if state.HTTPProxy != "" {
-		clientLog.Error("QUIC cannot bypass a configured upstream proxy")
-		return
-	}
-	port := state.ServerPort
-	if port == 0 {
-		port = 443
-	}
-	addr := net.JoinHostPort(state.ServerAddr, fmt.Sprint(port))
-
-	tlsConfig := state.TLSConfig.Clone()
-	tlsConfig.NextProtos = []string{"xrok-quic"}
-
-	quicTransport := transport.NewQUICTransport(tlsConfig)
-	handshake, finishHandshake := context.WithTimeout(ctx, state.connectionBudget())
-	conn, err := quicTransport.Dial(handshake, addr)
-	finishHandshake()
-	if err != nil {
-		// UDP is often filtered (cloud firewalls, corporate networks). Fall
-		// back to the TCP/TLS mux for the rest of this process; the reconnect
-		// loop re-registers with connection type "tls". The write happens
-		// before the deferred disconnect signal, which orders it for the loop.
-		if state.Transport == "quic" {
-			clientLog.Warn("QUIC unavailable: %s", state.redactRouteSecrets(err.Error()))
-			return
-		}
-		clientLog.Warn("QUIC unavailable (%v); falling back to TCP/TLS", err)
-		state.UseQUIC = false
-		return
-	}
-
-	quicConn := conn.(*transport.QUICConn)
-
-	// Send registration message on first stream
-	regStream, err := quicConn.OpenStream()
-	if err != nil {
-		clientLog.Error("Failed to open QUIC registration stream: %v", err)
-		conn.Close()
-		return
-	}
-
-	// Send client ID for association
-	regMsg := []byte(fmt.Sprintf("XROK:%s:%s", clientID, state.SessionToken))
-	if _, err := regStream.Write(regMsg); err != nil {
-		clientLog.Error("Failed to send QUIC registration: %v", err)
-		conn.Close()
-		return
-	}
-
-	clientStateMutex.Lock()
-	state.QUICConn = quicConn
-	clientStateMutex.Unlock()
-
-	clientLog.Info("QUIC connection established")
-
-	// Accept streams from server
-	for {
-		select {
-		case <-ctx.Done():
-			conn.Close()
-			return
-		default:
-			stream, err := quicConn.AcceptStream(ctx)
-			if err != nil {
-				clientLog.Debug("QUIC accept error: %v", err)
-				// Send CONNECTION_CLOSE so the server frees this registration
-				// now instead of after its idle timeout (the ctx.Done case
-				// above is rarely reached: AcceptStream returns first).
-				conn.Close()
-				return
-			}
-			go handleQUICStream(ctx, stream, state)
 		}
 	}
 }
@@ -1734,81 +1647,6 @@ func handleQUICReverseForward(ctx context.Context, stream *quic.Stream, state *c
 	select {
 	case <-done:
 	case <-ctx.Done():
-	}
-}
-
-func connectMuxWithDisconnect(ctx context.Context, state *clientState, disconnected chan<- struct{}) {
-	if state.Transport == "http2" || state.Transport == "wss" {
-		defer func() {
-			select {
-			case disconnected <- struct{}{}:
-			default:
-			}
-		}()
-		carrier, err := state.dialStandardCarrier(ctx, state.Transport)
-		if err != nil {
-			logCarrierError(state, err)
-			return
-		}
-		runClientMuxCarrier(ctx, state, carrier)
-		return
-	}
-	defer func() {
-		select {
-		case disconnected <- struct{}{}:
-		default:
-		}
-	}()
-
-	scheme := "wss"
-	u := url.URL{
-		Scheme:   scheme,
-		Host:     serverAuthority(state.ServerAddr, clientRp),
-		Path:     "/mux",
-		RawQuery: url.Values{"clientID": {clientID}}.Encode(),
-	}
-
-	headers := http.Header{}
-	headers.Set("X-Xrok-Session", state.SessionToken)
-	conn, _, err := state.dialWebSocket(ctx, u.String(), headers)
-	if err != nil {
-		log.Printf("Failed to establish mux connection: %v", err)
-		return
-	}
-
-	config := yamux.DefaultConfig()
-	config.AcceptBacklog = 256
-	config.EnableKeepAlive = true
-	config.KeepAliveInterval = 30 * time.Second
-
-	session, err := yamux.Client(conn.UnderlyingConn(), config)
-	if err != nil {
-		log.Printf("Failed to create yamux client session: %v", err)
-		conn.Close()
-		return
-	}
-
-	clientStateMutex.Lock()
-	state.MuxSession = session
-	clientStateMutex.Unlock()
-
-	log.Printf("Yamux multiplexed connection established")
-
-	for {
-		select {
-		case <-ctx.Done():
-			session.Close()
-			return
-		default:
-			stream, err := session.Accept()
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("Yamux session error: %v", err)
-				}
-				return
-			}
-			go handleMuxStream(ctx, stream, state)
-		}
 	}
 }
 
@@ -1979,263 +1817,6 @@ func handleMuxStream(ctx context.Context, stream net.Conn, state *clientState) {
 	defer localConn.Close()
 
 	relayLocalApplication(ctx, stream, localConn)
-}
-
-func connectAndForwardSession(ctx context.Context, state *clientState) {
-	const (
-		connReadLimit = 1024 * 1024
-	)
-
-	scheme := "wss"
-	u := url.URL{Scheme: scheme, Host: serverAuthority(state.ServerAddr, clientRp), Path: "/client_ws"}
-
-	select {
-	case <-ctx.Done():
-		return
-	default:
-	}
-
-	headers := http.Header{}
-	if state.APIToken != "" {
-		headers.Set("X-API-Token", state.APIToken)
-	}
-	conn, resp, err := state.dialWebSocket(ctx, u.String(), headers)
-	if err != nil {
-		if resp != nil {
-			log.Printf("WebSocket connection failed with status: %d %s", resp.StatusCode, resp.Status)
-		} else {
-			log.Printf("WebSocket connection failed: %v", err)
-		}
-		return
-	}
-
-	conn.SetReadLimit(connReadLimit)
-	if clientDebug {
-		log.Printf("Control connection established")
-	}
-
-	handleWebSocketConnection(ctx, conn, state)
-}
-
-func handleWebSocketConnection(ctx context.Context, conn *websocket.Conn, state *clientState) {
-	defer conn.Close()
-
-	const writeWait = 10 * time.Second
-	conn.SetPingHandler(func(appData string) error {
-		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeWait))
-	})
-
-	go func() {
-		for {
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				log.Printf("Error reading from WebSocket: %v", err)
-				return
-			}
-
-			var controlMsg map[string]string
-			if err := json.Unmarshal(msg, &controlMsg); err != nil {
-				log.Printf("Invalid control message: %v", err)
-				continue
-			}
-
-			if controlMsg["type"] == "new_connection" {
-				connectionID := controlMsg["connectionID"]
-				useTLSStr := controlMsg["useTLS"]
-				useTLSConn := useTLSStr == "true"
-
-				go establishNewWebSocketConnection(ctx, state, connectionID, useTLSConn)
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			if err := conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-				log.Printf("Lost control connection, attempting to reconnect...")
-				return
-			}
-			time.Sleep(5 * time.Second)
-		}
-	}
-}
-
-func establishNewWebSocketConnection(ctx context.Context, state *clientState, connectionID string, useTLS bool) {
-	scheme := "wss"
-
-	wsURL := url.URL{
-		Scheme: scheme,
-		Host:   net.JoinHostPort(state.ServerAddr, state.ClientPort),
-		Path:   "/client_ws",
-		RawQuery: url.Values{
-			"connectionID": {connectionID},
-			"clientID":     {clientID},
-		}.Encode(),
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			headers := http.Header{}
-			if state.APIToken != "" {
-				headers.Set("X-API-Token", state.APIToken)
-			}
-			wsConn, _, err := state.dialWebSocket(ctx, wsURL.String(), headers)
-			if err != nil {
-				log.Printf("Failed to establish WebSocket connection for connectionID %s: %v", connectionID, err)
-				if !waitRouteRetry(ctx, 2*time.Second) {
-					return
-				}
-				continue
-			}
-
-			localConn, err := net.Dial("tcp", state.LocalPort)
-			if err != nil {
-				log.Printf("Failed to connect to local application for connectionID %s: %v", connectionID, err)
-				wsConn.Close()
-				return
-			}
-
-			activeConnections.Lock()
-			activeConnections.connections[connectionID] = &activeConnection{
-				WebSocketConn: wsConn,
-				LocalConn:     localConn,
-			}
-			activeConnections.Unlock()
-
-			go handleDataForwarding(ctx, wsConn, localConn, connectionID)
-			return
-		}
-	}
-}
-
-func handleDataForwarding(ctx context.Context, wsConn *websocket.Conn, localConn net.Conn, connectionID string) {
-	defer func() {
-		wsConn.Close()
-		localConn.Close()
-		activeConnections.Lock()
-		delete(activeConnections.connections, connectionID)
-		activeConnections.Unlock()
-		log.Printf("Connection with ID %s closed", connectionID)
-	}()
-
-	done := make(chan struct{}, 2)
-
-	go func() {
-		defer func() { done <- struct{}{} }()
-		if _, err := io.Copy(localConn, wsConn.UnderlyingConn()); err != nil && !isClosedNetworkError(err) {
-			log.Printf("Error during WebSocket to local copy for connectionID %s: %v", connectionID, err)
-		}
-	}()
-
-	go func() {
-		defer func() { done <- struct{}{} }()
-		if _, err := io.Copy(wsConn.UnderlyingConn(), localConn); err != nil && !isClosedNetworkError(err) {
-			log.Printf("Error during local to WebSocket copy for connectionID %s: %v", connectionID, err)
-		}
-	}()
-
-	select {
-	case <-done:
-		log.Printf("Data forwarding completed for connectionID %s", connectionID)
-	case <-ctx.Done():
-		log.Printf("Context canceled for connectionID %s", connectionID)
-	}
-}
-
-func isClosedNetworkError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if err == io.EOF {
-		return true
-	}
-	netErr, ok := err.(*net.OpError)
-	return ok && !netErr.Temporary()
-}
-
-// runStdioMode runs the client in stdio mode for SSH ProxyCommand
-func runStdioMode(state *clientState, token string) {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-	// Register with server first
-	if !registerClient(ctx, state, token) {
-		clientLog.Error("Failed to register with server")
-		os.Exit(1)
-	}
-
-	// Establish mux connection
-	scheme := "wss"
-	if !state.UseTLS {
-		scheme = "ws"
-	}
-
-	u := url.URL{
-		Scheme:   scheme,
-		Host:     serverAuthority(state.ServerAddr, clientRp),
-		Path:     "/mux",
-		RawQuery: url.Values{"clientID": {clientID}}.Encode(),
-	}
-
-	headers := http.Header{}
-	headers.Set("X-Xrok-Session", state.SessionToken)
-	conn, _, err := state.dialWebSocket(ctx, u.String(), headers)
-	if err != nil {
-		clientLog.Error("Failed to establish mux connection: %v", err)
-		os.Exit(1)
-	}
-
-	config := yamux.DefaultConfig()
-	config.AcceptBacklog = 256
-	config.EnableKeepAlive = true
-	config.KeepAliveInterval = 30 * time.Second
-
-	session, err := yamux.Client(conn.UnderlyingConn(), config)
-	if err != nil {
-		clientLog.Error("Failed to create yamux session: %v", err)
-		os.Exit(1)
-	}
-
-	// Open stream for stdio target
-	stream, err := session.Open()
-	if err != nil {
-		clientLog.Error("Failed to open stream: %v", err)
-		os.Exit(1)
-	}
-
-	// Send target header (same format as SOCKS5 dynamic connection)
-	target := state.StdioTarget
-	header := make([]byte, 2+len(target))
-	header[0] = 0xFF // Dynamic connection marker
-	header[1] = byte(len(target))
-	copy(header[2:], target)
-
-	if _, err := stream.Write(header); err != nil {
-		clientLog.Error("Failed to send target header: %v", err)
-		os.Exit(1)
-	}
-
-	// Bridge stdin/stdout to stream
-	done := make(chan struct{}, 2)
-
-	go func() {
-		io.Copy(stream, os.Stdin)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		io.Copy(os.Stdout, stream)
-		done <- struct{}{}
-	}()
-
-	<-done
-	stream.Close()
-	session.Close()
 }
 
 // runUDPTunnel handles UDP tunneling through the mux session

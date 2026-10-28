@@ -10,8 +10,10 @@ func TunnelTransport(value string, quicFlag bool) (string, error) {
 		return "quic", nil
 	}
 	switch value {
-	case "", "legacy", "tcp", "tls", "non-tls", "websocket":
-		return "legacy", nil
+	case "":
+		return "auto", nil
+	case "legacy", "tcp", "tls", "non-tls", "websocket":
+		return "", fmt.Errorf("transport %q was removed; use auto, http2, wss, or quic and update both client and server", value)
 	case "http2", "wss", "quic", "auto":
 		return value, nil
 	default:

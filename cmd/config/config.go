@@ -34,7 +34,7 @@ type ClientConfig struct {
 	Headers    map[string]string `yaml:"headers,omitempty"`
 	Compress   bool              `yaml:"compress"`
 	LogFile    string            `yaml:"log_file,omitempty"`
-	// Transport protocol: "websocket" (default), "quic"
+	// Tunnel carrier: auto (default), http2, wss, or quic.
 	Transport string `yaml:"transport,omitempty"`
 	// ConnectionType is a deprecated alias retained for older examples.
 	ConnectionType string `yaml:"connection_type,omitempty"`
@@ -139,8 +139,7 @@ type ServerConfig struct {
 	// AllowPrivateEgress lets SOCKS/UDP streams reach loopback, private,
 	// link-local (cloud metadata) and the host's own addresses.
 	AllowPrivateEgress bool `yaml:"allow_private_egress,omitempty"`
-	// LegacyListeners binds per-client ports (7000+) and allows non-tls
-	// registrations (4000+). Nil keeps the default (enabled).
+	// LegacyListeners is retired; only false or nil is accepted.
 	LegacyListeners *bool `yaml:"legacy_listeners,omitempty"`
 	// Reverse (-R) listener policy; zero values keep the defaults.
 	ReversePortMin      int               `yaml:"reverse_port_min,omitempty"`
@@ -226,7 +225,11 @@ func migrateTelemetryConfig(c *TelemetryConfig) {
 func MigrateClientConfig(c *ClientConfig) {
 	if c.Version < CurrentVersion {
 		if c.Transport == "" && c.ConnectionType != "" {
-			c.Transport = c.ConnectionType
+			if c.ConnectionType == "tls" {
+				c.Transport = "auto"
+			} else {
+				c.Transport = c.ConnectionType
+			}
 		}
 		c.Version = CurrentVersion
 	}
@@ -335,6 +338,9 @@ func (c *ClientConfig) Validate() error {
 // Validate checks settings that would otherwise fail only after the runtime
 // has started goroutines and opened partial listeners.
 func (c *ServerConfig) Validate() error {
+	if c.LegacyListeners != nil && *c.LegacyListeners {
+		return fmt.Errorf("legacy listeners were removed; use standard carriers on the public port")
+	}
 	if c.Version > CurrentVersion {
 		return fmt.Errorf("unsupported server config version %d (current %d)", c.Version, CurrentVersion)
 	}

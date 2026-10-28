@@ -30,35 +30,47 @@ func SaveClientConfig(cfg *ClientConfig, path string) error
 func SaveServerConfig(cfg *ServerConfig, path string) error
     SaveServerConfig saves server configuration to file
 
+func TunnelTransport(value string, quicFlag bool) (string, error)
+func ValidateProxySettings(raw, session, header string, budget time.Duration, quic, p2p bool) error
+    ValidateProxySettings deliberately omits raw URLs and values from errors
+    because proxy URLs can contain credentials and session markers are
+    relay-private.
+
 
 TYPES
 
 type ClientConfig struct {
 	// Version is the schema version. Zero denotes the legacy unversioned format.
-	Version   int               `yaml:"version,omitempty"`
-	Server    string            `yaml:"server"`
-	ID        string            `yaml:"id,omitempty"`
-	Token     string            `yaml:"token,omitempty"`
-	TLS       bool              `yaml:"tls"`
-	Debug     bool              `yaml:"debug"`
-	Quiet     bool              `yaml:"quiet"`
-	Verbose   bool              `yaml:"verbose"`
-	Tunnels   []TunnelConfig    `yaml:"tunnels,omitempty"`
-	Socks5    string            `yaml:"socks5,omitempty"`
-	UDP       []UDPConfig       `yaml:"udp,omitempty"`
-	Reverse   []ReverseConfig   `yaml:"reverse,omitempty"`
-	Reconnect ReconnectConfig   `yaml:"reconnect"`
-	Headers   map[string]string `yaml:"headers,omitempty"`
-	Compress  bool              `yaml:"compress"`
-	LogFile   string            `yaml:"log_file,omitempty"`
-	// Transport protocol: "websocket" (default), "quic"
+	Version int    `yaml:"version,omitempty"`
+	Server  string `yaml:"server"`
+	// ServerPort is the server's registration/HTTPS port (default 443).
+	ServerPort int               `yaml:"server_port,omitempty"`
+	ID         string            `yaml:"id,omitempty"`
+	Token      string            `yaml:"token,omitempty"`
+	TLS        bool              `yaml:"tls"`
+	Debug      bool              `yaml:"debug"`
+	Quiet      bool              `yaml:"quiet"`
+	Verbose    bool              `yaml:"verbose"`
+	Tunnels    []TunnelConfig    `yaml:"tunnels,omitempty"`
+	Socks5     string            `yaml:"socks5,omitempty"`
+	UDP        []UDPConfig       `yaml:"udp,omitempty"`
+	Reverse    []ReverseConfig   `yaml:"reverse,omitempty"`
+	Reconnect  ReconnectConfig   `yaml:"reconnect"`
+	Headers    map[string]string `yaml:"headers,omitempty"`
+	Compress   bool              `yaml:"compress"`
+	LogFile    string            `yaml:"log_file,omitempty"`
+	// Tunnel carrier: auto (default), http2, wss, or quic.
 	Transport string `yaml:"transport,omitempty"`
 	// ConnectionType is a deprecated alias retained for older examples.
 	ConnectionType string `yaml:"connection_type,omitempty"`
 	// P2P configuration
 	P2P P2PConfig `yaml:"p2p,omitempty"`
 	// HTTP CONNECT proxy for corporate environments
-	HTTPProxy string `yaml:"http_proxy,omitempty"`
+	HTTPProxy          string        `yaml:"http_proxy,omitempty"`
+	ConnectTimeout     time.Duration `yaml:"connect_timeout,omitempty"`
+	ProxySession       string        `yaml:"proxy_session,omitempty"`
+	ProxySessionHeader string        `yaml:"proxy_session_header,omitempty"`
+	ProxyCACert        string        `yaml:"proxy_ca_cert,omitempty"`
 	// mTLS client certificates
 	ClientCert string `yaml:"client_cert,omitempty"`
 	ClientKey  string `yaml:"client_key,omitempty"`
@@ -116,27 +128,42 @@ type ReverseConfig struct {
     ReverseConfig represents reverse port forwarding
 
 type ServerConfig struct {
-	Version     int    `yaml:"version,omitempty"`
-	Domain      string `yaml:"domain"`
-	TLSCertPath string `yaml:"tls_cert_path,omitempty"`
-	TLSKeyPath  string `yaml:"tls_key_path,omitempty"`
-	Port        int    `yaml:"port"`
-	ProxyPort   int    `yaml:"proxy_port"`
-	MetricsPort int    `yaml:"metrics_port"`
-	Debug       bool   `yaml:"debug"`
-	Quiet       bool   `yaml:"quiet"`
-	Verbose     bool   `yaml:"verbose"`
-	APIToken    string `yaml:"api_token,omitempty"`
+	WebTransport bool   `yaml:"webtransport,omitempty"`
+	MASQUE       bool   `yaml:"masque,omitempty"`
+	Version      int    `yaml:"version,omitempty"`
+	Domain       string `yaml:"domain"`
+	TLSCertPath  string `yaml:"tls_cert_path,omitempty"`
+	TLSKeyPath   string `yaml:"tls_key_path,omitempty"`
+	Port         int    `yaml:"port"`
+	ProxyPort    int    `yaml:"proxy_port"`
+	PublicPort   int    `yaml:"public_port,omitempty"`
+	MetricsPort  int    `yaml:"metrics_port"`
+	Debug        bool   `yaml:"debug"`
+	Quiet        bool   `yaml:"quiet"`
+	Verbose      bool   `yaml:"verbose"`
+	APIToken     string `yaml:"api_token,omitempty"`
 	// ClientIdentities enables per-client control-plane credentials. APIToken is
 	// retained as an administrator/legacy fallback during migration.
 	ClientIdentities []ClientIdentityConfig `yaml:"client_identities,omitempty"`
 	RateLimit        int                    `yaml:"rate_limit"`
-	LogFile          string                 `yaml:"log_file,omitempty"`
-	StateFile        string                 `yaml:"state_file,omitempty"`
-	IPWhitelist      []string               `yaml:"ip_whitelist,omitempty"`
-	RequestLog       bool                   `yaml:"request_log"`
-	Compress         bool                   `yaml:"compress"`
-	HealthCheck      HealthCheckConfig      `yaml:"health_check"`
+	// AllowAnonymous permits starting without api_token/client_identities.
+	// Without auth anyone can register tunnels and use the server as a proxy.
+	AllowAnonymous bool `yaml:"allow_anonymous,omitempty"`
+	// AllowPrivateEgress lets SOCKS/UDP streams reach loopback, private,
+	// link-local (cloud metadata) and the host's own addresses.
+	AllowPrivateEgress bool `yaml:"allow_private_egress,omitempty"`
+	// LegacyListeners is retired; only false or nil is accepted.
+	LegacyListeners *bool `yaml:"legacy_listeners,omitempty"`
+	// Reverse (-R) listener policy; zero values keep the defaults.
+	ReversePortMin      int               `yaml:"reverse_port_min,omitempty"`
+	ReversePortMax      int               `yaml:"reverse_port_max,omitempty"`
+	ReverseMaxPerClient int               `yaml:"reverse_max_per_client,omitempty"`
+	LogFile             string            `yaml:"log_file,omitempty"`
+	StateFile           string            `yaml:"state_file,omitempty"`
+	IPWhitelist         []string          `yaml:"ip_whitelist,omitempty"`
+	RequestLog          bool              `yaml:"request_log"`
+	Compress            bool              `yaml:"compress"`
+	HealthCheck         HealthCheckConfig `yaml:"health_check"`
 	// mTLS: CA certificate for verifying client certificates
 	ClientCAPath string `yaml:"client_ca_path,omitempty"`
 	Insecure     bool   `yaml:"insecure,omitempty"`
@@ -195,11 +222,14 @@ type TelemetryConfig struct {
     Durations use Go/YAML duration syntax, for example "250ms" or "5s".
 
 type TunnelConfig struct {
-	Name               string `yaml:"name"`
-	Target             string `yaml:"target"`
-	BasicAuth          string `yaml:"basic_auth,omitempty"` // user:password
-	Capability         string `yaml:"capability,omitempty"`
-	CapabilityAudience string `yaml:"capability_audience,omitempty"`
+	WebTransport        bool     `yaml:"webtransport,omitempty"`
+	Datagrams           bool     `yaml:"datagrams,omitempty"`
+	WebTransportOrigins []string `yaml:"webtransport_origins,omitempty"`
+	Name                string   `yaml:"name"`
+	Target              string   `yaml:"target"`
+	BasicAuth           string   `yaml:"basic_auth,omitempty"` // user:password
+	Capability          string   `yaml:"capability,omitempty"`
+	CapabilityAudience  string   `yaml:"capability_audience,omitempty"`
 }
     TunnelConfig represents a tunnel configuration
 

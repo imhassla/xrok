@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 	"xrok/cmd/transport"
 )
 
-func masqueFixture(t *testing.T) (string, *tls.Config) {
+func masqueFixture(t *testing.T, configure ...func()) (string, *tls.Config) {
 	t.Helper()
 	oldOn, oldPrivate, oldAuth, oldToken, oldPolicy, oldCA := serverMASQUE, serverAllowPrivateEgress, serverAuthEnabled, serverApiToken, serverClientIdentityPolicy, serverClientCA
 	serverMASQUE = true
@@ -30,9 +31,28 @@ func masqueFixture(t *testing.T) (string, *tls.Config) {
 	t.Cleanup(func() {
 		serverMASQUE, serverAllowPrivateEgress, serverAuthEnabled, serverApiToken, serverClientIdentityPolicy, serverClientCA = oldOn, oldPrivate, oldAuth, oldToken, oldPolicy, oldCA
 	})
+	for _, apply := range configure {
+		apply()
+	}
 	certs := httptest.NewTLSServer(http.NotFoundHandler())
 	t.Cleanup(certs.Close)
 	s := newHTTP3Services(certs.TLS)
+	// Drain request handlers before restoring package configuration in cleanup.
+	var handlerMu sync.Mutex
+	var handlers sync.WaitGroup
+	closing := false
+	s.server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerMu.Lock()
+		if closing {
+			handlerMu.Unlock()
+			http.Error(w, "closing", 503)
+			return
+		}
+		handlers.Add(1)
+		handlerMu.Unlock()
+		defer handlers.Done()
+		s.serve(w, r)
+	})
 	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -40,8 +60,12 @@ func masqueFixture(t *testing.T) (string, *tls.Config) {
 	done := make(chan struct{})
 	go func() { defer close(done); _ = s.server.Serve(udp) }()
 	t.Cleanup(func() {
+		handlerMu.Lock()
+		closing = true
+		handlerMu.Unlock()
 		s.Close()
 		udp.Close()
+		handlers.Wait()
 		select {
 		case <-done:
 		case <-time.After(2 * time.Second):
@@ -132,7 +156,12 @@ func TestMASQUERejectsCredentialsTLSAndPrivateEgress(t *testing.T) {
 		conn.Close()
 		t.Fatal("untrusted proxy TLS accepted")
 	}
-	serverAllowPrivateEgress = false
+
+}
+
+func TestMASQUERejectsPrivateEgress(t *testing.T) {
+	proxy, cfg := masqueFixture(t, func() { serverAllowPrivateEgress = false })
+	target := udpEchoFixture(t)
 	if conn, err := transport.DialMASQUE(context.Background(), transport.MASQUEOptions{ProxyURL: proxy, Target: target, Token: "masque-secret", TLSConfig: cfg, Timeout: time.Second}); err == nil {
 		conn.Close()
 		t.Fatal("loopback egress accepted")
@@ -140,25 +169,29 @@ func TestMASQUERejectsCredentialsTLSAndPrivateEgress(t *testing.T) {
 }
 
 func TestMASQUEScopedCredentialsAndAnonymousServerPolicy(t *testing.T) {
-	proxy, cfg := masqueFixture(t)
-	target := udpEchoFixture(t)
-	serverClientIdentityPolicy = newControlIdentityPolicy([]config.ClientIdentityConfig{{ID: "client-only", Token: "client-token", Scopes: []string{"client"}}, {ID: "udp", Token: "udp-token", Scopes: []string{"proxy:udp"}}})
-	if c, err := transport.DialMASQUE(context.Background(), transport.MASQUEOptions{ProxyURL: proxy, Target: target, Token: "client-token", TLSConfig: cfg, Timeout: time.Second}); err == nil {
+	t.Run("scoped", func(t *testing.T) {
+		proxy, cfg := masqueFixture(t, func() {
+			serverClientIdentityPolicy = newControlIdentityPolicy([]config.ClientIdentityConfig{{ID: "client-only", Token: "client-token", Scopes: []string{"client"}}, {ID: "udp", Token: "udp-token", Scopes: []string{"proxy:udp"}}})
+		})
+		target := udpEchoFixture(t)
+		if c, err := transport.DialMASQUE(context.Background(), transport.MASQUEOptions{ProxyURL: proxy, Target: target, Token: "client-token", TLSConfig: cfg, Timeout: time.Second}); err == nil {
+			c.Close()
+			t.Fatal("client-only credential gained UDP proxy scope")
+		}
+		c, err := transport.DialMASQUE(context.Background(), transport.MASQUEOptions{ProxyURL: proxy, Target: target, Token: "udp-token", TLSConfig: cfg, Timeout: time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
 		c.Close()
-		t.Fatal("client-only credential gained UDP proxy scope")
-	}
-	c, err := transport.DialMASQUE(context.Background(), transport.MASQUEOptions{ProxyURL: proxy, Target: target, Token: "udp-token", TLSConfig: cfg, Timeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.Close()
-	serverClientIdentityPolicy = newControlIdentityPolicy(nil)
-	serverApiToken = ""
-	serverAuthEnabled = false
-	if c, err := transport.DialMASQUE(context.Background(), transport.MASQUEOptions{ProxyURL: proxy, Target: target, Token: "anything", TLSConfig: cfg, Timeout: time.Second}); err == nil {
-		c.Close()
-		t.Fatal("anonymous server became an open UDP proxy")
-	}
+	})
+	t.Run("anonymous", func(t *testing.T) {
+		proxy, cfg := masqueFixture(t, func() { serverApiToken = ""; serverAuthEnabled = false })
+		target := udpEchoFixture(t)
+		if c, err := transport.DialMASQUE(context.Background(), transport.MASQUEOptions{ProxyURL: proxy, Target: target, Token: "anything", TLSConfig: cfg, Timeout: time.Second}); err == nil {
+			c.Close()
+			t.Fatal("anonymous server became an open UDP proxy")
+		}
+	})
 }
 
 func TestMASQUELocalMultipleClientsAndShutdown(t *testing.T) {

@@ -431,13 +431,15 @@ sockets and local flow workers without direct-target fallback.
 
 ### Versioned standard tunnel transports
 
-Use `--transport auto` to try native QUIC, then HTTP/2, then framed WSS at connection
+The default `--transport auto` tries native QUIC, then HTTP/2, then framed WSS at connection
 establishment and reconnection. Each attempt has the configured `--connect-timeout`;
 selection logs report the failed stage and selected carrier with credentials redacted.
 An explicit TCP upstream proxy excludes QUIC entirely: automatic selection then tries
-HTTP/2 and WSS through that proxy. Missing advertised capabilities are skipped; auto
-does not silently downgrade to the legacy carrier on old servers. Configure `legacy`
-explicitly for those deployments. Native QUIC auto-selection uses a bounded,
+HTTP/2 and WSS through that proxy. Client-initiated stdio/SSH, HTTP/SOCKS proxy, and
+UDP forwarding also select HTTP/2 then WSS, because native QUIC currently serves
+application ingress only. Explicit QUIC with these modes is rejected. Missing advertised capabilities are skipped; auto
+requires a server advertising standard carriers. Upgrade both endpoints together;
+there is no downgrade to removed carriers. Native QUIC auto-selection uses a bounded,
 versioned, acknowledged registration association. Once a carrier is established,
 failure triggers normal re-registration/reconnection, not replay of application
 requests or seamless migration of active TCP streams. Explicit `quic`, `http2`, and
@@ -458,11 +460,14 @@ the handshake; it does not cap a healthy carrier's lifetime. Cancellation closes
 carrier and its streams. The byte adapters do not provide a carrier write-deadline API;
 individual yamux stream deadlines remain available.
 
-The default remains `legacy`: the existing raw byte stream following HTTP Upgrade,
-retained for older deployments. Historical `tcp`, `tls`, `non-tls`, and `websocket` profile values
-remain legacy aliases. `--quic` and `--transport quic` select the existing native QUIC
-carrier. Use explicit `http2` or `wss` with a new server to gain standard intermediary
-compatibility; the legacy carrier does not become framed by renaming it.
+The raw-after-Upgrade carrier and its `/mux`, `/ws`, and `/client_ws` control
+endpoints have been removed. They return HTTP 410 on the control host. Historical
+`legacy`, `tcp`, `tls`, `non-tls`, and `websocket` transport values now fail with an
+upgrade message. An old `connection_type: tls` field migrates to `transport: auto`;
+explicit `transport` values must use current names. Per-client legacy listeners
+have also been removed: delete `legacy_listeners: true` (false remains accepted).
+Ordinary application WebSocket upgrades and P2P signaling remain supported.
+`--quic` and `--transport quic` pin the native QUIC carrier.
 
 ### HTTP/2 and gRPC application ingress
 
@@ -482,7 +487,7 @@ client/server's settings; xrok copies streaming bodies instead of buffering them
 TLS-enabled local gRPC backends are not configured by this mode.
 
 Ordinary HTTP/2 requests can reach existing HTTP/1.1 applications. Existing
-HTTP/1.1 upgrades and legacy tunnel carriers retain their paths. Basic Auth and
+HTTP/1.1 application upgrades retain their paths. Basic Auth and
 tunnel capability checks still apply. Native gRPC uses `application/grpc` (or a
 `+proto`/`+json` variant); this is not a gRPC-Web translation gateway. An unavailable
 tunnel returns gRPC status `UNAVAILABLE` rather than an HTML success response.
@@ -521,9 +526,8 @@ SOCKS5 has no HTTP header channel.
 
 `--connect-timeout` bounds connection establishment, including proxy negotiation and
 target TLS. Successful long-lived connections outlive that budget. Cancellation stops
-pending handshakes and retry waits. A new server advertises its multiplexed protocol,
-so a new client avoids the redundant legacy control connection; older registration
-responses retain the previous fallback behavior.
+pending handshakes and retry waits. The server advertises its standard carriers during registration;
+clients require a mutually supported carrier and do not open a separate control socket.
 
 QUIC and P2P use direct network paths and cannot satisfy this TCP proxy routing
 requirement. xrok rejects an upstream proxy combined with `--quic` or `--p2p` before

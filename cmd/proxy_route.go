@@ -243,7 +243,7 @@ func (s *clientState) routeTransport() *http.Transport {
 }
 
 func (s *clientState) routeWebSocketDialer() *websocket.Dialer {
-	return &websocket.Dialer{NetDialContext: s.websocketRoute, NetDialTLSContext: s.websocketRouteTLS, TLSClientConfig: s.TLSConfig, HandshakeTimeout: s.connectionBudget(), EnableCompression: s.Compress}
+	return &websocket.Dialer{NetDialContext: s.dialRoute, NetDialTLSContext: s.dialRouteTLS, TLSClientConfig: s.TLSConfig, HandshakeTimeout: s.connectionBudget(), EnableCompression: s.Compress}
 }
 
 func waitRouteRetry(ctx context.Context, d time.Duration) bool {
@@ -317,53 +317,3 @@ func (s *clientState) redactRouteSecrets(text string) string {
 }
 
 // raw mux and legacy data use the byte stream after the WebSocket HTTP upgrade.
-// Do not let gorilla's private response reader prefetch application bytes that its
-// UnderlyingConn accessor cannot return. Our reader retains such bytes instead.
-type upgradeRouteConn struct {
-	net.Conn
-	mu          sync.Mutex
-	reader      *bufio.Reader
-	pending     []byte
-	headersDone bool
-	headerBytes int
-}
-
-func (c *upgradeRouteConn) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.pending) == 0 {
-		if c.headersDone {
-			return c.reader.Read(p)
-		}
-		line, err := c.reader.ReadSlice('\n')
-		c.headerBytes += len(line)
-		if c.headerBytes > 64<<10 {
-			return 0, fmt.Errorf("upgrade headers exceed 64 KiB")
-		}
-		if len(line) == 0 {
-			return 0, err
-		}
-		c.pending = line
-		if string(line) == "\r\n" || string(line) == "\n" {
-			c.headersDone = true
-		}
-	}
-	n := copy(p, c.pending)
-	c.pending = c.pending[n:]
-	return n, nil
-}
-func wrapUpgradeRoute(c net.Conn, err error) (net.Conn, error) {
-	if err != nil {
-		return nil, err
-	}
-	return &upgradeRouteConn{Conn: c, reader: bufio.NewReader(c)}, nil
-}
-func (s *clientState) websocketRoute(ctx context.Context, network, target string) (net.Conn, error) {
-	return wrapUpgradeRoute(s.dialRoute(ctx, network, target))
-}
-func (s *clientState) websocketRouteTLS(ctx context.Context, network, target string) (net.Conn, error) {
-	return wrapUpgradeRoute(s.dialRouteTLS(ctx, network, target))
-}
